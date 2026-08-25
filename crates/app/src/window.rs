@@ -1624,7 +1624,13 @@ impl MainWindow {
                 if Self::window_control(ui, "min-btn", WindowGlyph::Minimize, false, pal) {
                     actions.push(UiAction::MinimizeWindow);
                 }
-                // Theme toggle: crescent-moon glyph (painter-drawn).
+                // Phase 4: theme toggle — modernised "circle + offset
+                // dot" glyph (was the half-moon painter-drawn in
+                // earlier commits). Renders as a small filled disc
+                // with a smaller disc punching out an asymmetric
+                // crescent — reads as a sun/moon icon without the
+                // heavy outline of the previous half-moon, fitting
+                // the Linear minimal language. Behaviour unchanged.
                 let (trect, tresp) = ui.allocate_exact_size(
                     egui::vec2(32.0, 30.0),
                     egui::Sense::click(),
@@ -1636,12 +1642,36 @@ impl MainWindow {
                 let p = ui.painter();
                 p.circle_filled(tc, 7.0, pal.text_secondary);
                 p.circle_filled(
-                    tc + egui::vec2(3.0, -3.0),
-                    5.5,
+                    tc + egui::vec2(3.5, -3.5),
+                    6.0,
                     pal.panel_bg,
                 );
                 if tresp.clicked() {
                     actions.push(UiAction::ToggleTheme);
+                }
+                // Phase 4: `?` keyboard-shortcuts button. Lives in
+                // the title bar (next to the theme toggle) per the
+                // spec — always reachable regardless of whether
+                // the bottom bar is collapsed. Renders as a 32x30
+                // chip with a `?` glyph. Click → UiAction::
+                // ToggleShortcutHelp, which the same handler as
+                // the bottom-bar `?` button dispatches.
+                let (hrect, hresp) = ui.allocate_exact_size(
+                    egui::vec2(32.0, 30.0),
+                    egui::Sense::click(),
+                );
+                if hresp.hovered() {
+                    ui.painter().rect_filled(hrect, 0.0, pal.hover_fill);
+                }
+                ui.painter().text(
+                    hrect.center(),
+                    egui::Align2::CENTER_CENTER,
+                    "?",
+                    egui::FontId::proportional(15.0),
+                    pal.text_secondary,
+                );
+                if hresp.clicked() {
+                    actions.push(UiAction::ToggleShortcutHelp);
                 }
             });
         }
@@ -1722,8 +1752,12 @@ impl MainWindow {
                         .color(pal.text_dim),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // One-click back-to-top for long tree lists.
-                    if ui.small_button("↑").on_hover_text("Back to top").clicked() {
+                    // Phase 4: back-to-top button. The previous
+                    // `↑` (U+2191) read as a stock Unicode arrow.
+                    // Replaced with `▲` (U+25B2) which sits tighter
+                    // visually and pairs better with the Linear
+                    // minimal language. Functionality unchanged.
+                    if ui.small_button("▲").on_hover_text("Back to top").clicked() {
                         tree.state.lock().scroll_to_top = true;
                     }
                 });
