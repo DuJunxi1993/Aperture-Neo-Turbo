@@ -112,33 +112,45 @@ pub fn decode_file(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedP
 }
 
 /// Read only the pixel dimensions of an image (fast — no pixel decode).
+///
+/// NOTE: balances its own CoInitializeEx with CoUninitialize — this runs
+/// on the main thread before winit, whose OleInitialize would otherwise
+/// fail with RPC_E_CHANGED_MODE.
 pub fn probe_image_size(path: &Path) -> Option<(u32, u32)> {
     unsafe {
         use windows::Win32::System::Com::*;
-        if CoInitializeEx(None, COINIT_MULTITHREADED).is_err() {
-            return None;
+        let init = CoInitializeEx(None, COINIT_MULTITHREADED);
+        let result = probe_inner(path);
+        if init.is_ok() {
+            // Balance our init ref (covers both S_OK and S_FALSE).
+            CoUninitialize();
         }
-        let path_str: Vec<u16> = path
-            .as_os_str()
-            .to_string_lossy()
-            .encode_utf16()
-            .chain(std::iter::once(0))
-            .collect();
-        let wic_factory: IWICImagingFactory =
-            CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
-        let decoder = wic_factory
-            .CreateDecoderFromFilename(
-                PCWSTR(path_str.as_ptr()),
-                None,
-                GENERIC_READ,
-                WICDecodeMetadataCacheOnDemand,
-            )
-            .ok()?;
-        let frame = decoder.GetFrame(0).ok()?;
-        let (mut w, mut h) = (0u32, 0u32);
-        frame.GetSize(&mut w, &mut h).ok()?;
-        if w == 0 || h == 0 { None } else { Some((w, h)) }
+        result
     }
+}
+
+unsafe fn probe_inner(path: &Path) -> Option<(u32, u32)> {
+    use windows::Win32::System::Com::*;
+    let path_str: Vec<u16> = path
+        .as_os_str()
+        .to_string_lossy()
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let wic_factory: IWICImagingFactory =
+        CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER).ok()?;
+    let decoder = wic_factory
+        .CreateDecoderFromFilename(
+            PCWSTR(path_str.as_ptr()),
+            None,
+            GENERIC_READ,
+            WICDecodeMetadataCacheOnDemand,
+        )
+        .ok()?;
+    let frame = decoder.GetFrame(0).ok()?;
+    let (mut w, mut h) = (0u32, 0u32);
+    frame.GetSize(&mut w, &mut h).ok()?;
+    if w == 0 || h == 0 { None } else { Some((w, h)) }
 }
 
 fn clamp_target(target_w: u32, target_h: u32, src_w: u32, src_h: u32) -> (u32, u32) {

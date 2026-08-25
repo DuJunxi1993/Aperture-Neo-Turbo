@@ -367,8 +367,8 @@ impl MainWindow {
                 MIN_H as f64,
             )
         } else {
-            // First run: a comfortable fraction of the monitor.
-            ((max_w * 0.75).max(MIN_W as f64), (max_h * 0.75).max(MIN_H as f64), MIN_W as f64, MIN_H as f64)
+            // First run: about two-thirds of the work area.
+            ((max_w / 1.5).max(MIN_W as f64), (max_h / 1.5).max(MIN_H as f64), MIN_W as f64, MIN_H as f64)
         };
 
         let window = event_loop.create_window(
@@ -455,6 +455,11 @@ impl MainWindow {
                 &pref as *const i32 as *const core::ffi::c_void,
                 std::mem::size_of::<i32>() as u32,
             );
+            // Subclass the window for borderless edge-resize: winit does not
+            // hit-test resize borders for undecorated windows, so we handle
+            // WM_NCCALCSIZE (client = full window) and WM_NCHITTEST (edge
+            // zones → HT*) ourselves, forwarding everything else to winit.
+            install_resize_hook(hwnd);
         }
 
         let (cx, cy, cw, ch) = self.compute_viewer_rect(
@@ -1944,6 +1949,7 @@ impl MainWindow {
         self.close_shortcut_help();
         let Some(window) = &self.window else { return; };
         self.is_fullscreen = !self.is_fullscreen;
+        IS_FULLSCREEN.store(self.is_fullscreen, std::sync::atomic::Ordering::Relaxed);
         // Capture the on-screen image rect so the viewport transition can
         // animate from it (path animation into fullscreen).
         if let Some(v) = &self.viewer {
@@ -2374,6 +2380,81 @@ impl ApplicationHandler for MainWindow {
             _ => {}
         }
     }
+}
+
+/// Original winit window procedure — resize hook forwards everything else.
+static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Mirrors MainWindow.is_fullscreen for the resize hook.
+pub static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+unsafe extern "system" fn resize_hook_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    use windows::Win32::UI::WindowsAndMessaging::*;
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    match msg {
+        // Client area covers the entire window (borderless technique).
+        WM_NCCALCSIZE if wparam.0 != 0 => LRESULT(0),
+        WM_NCHITTEST => {
+            // No edge zones while fullscreen (immersive) or maximized.
+            let fullscreen = IS_FULLSCREEN.load(std::sync::atomic::Ordering::Relaxed);
+            let mut wr = windows::Win32::Foundation::RECT::default();
+            let _ = GetWindowRect(hwnd, &mut wr);
+            let ww = (wr.right - wr.left) as f32;
+            let wh = (wr.bottom - wr.top) as f32;
+            if fullscreen || IsZoomed(hwnd).as_bool() || ww <= 0.0 || wh <= 0.0 {
+                return LRESULT(1); // HTCLIENT
+            }
+            let dpi = GetDpiForWindow(hwnd).max(96);
+            let m = 8.0 * (dpi as f32 / 96.0); // edge zone width, physical px
+            let x = ((lparam.0 as usize) & 0xFFFF) as u16 as i16 as i32 as f32;
+            let y = (((lparam.0 as usize) >> 16) & 0xFFFF) as u16 as i16 as i32 as f32;
+            let left = x < wr.left as f32 + m;
+            let right = x > wr.right as f32 - m;
+            let top = y < wr.top as f32 + m;
+            let bottom = y > wr.bottom as f32 - m;
+            // HT* values: LEFT=10 RIGHT=11 TOP=12 TOPLEFT=13 TOPRIGHT=14
+            // BOTTOM=15 BOTTOMLEFT=16 BOTTOMRIGHT=17
+            let ht: i32 = match (left, right, top, bottom) {
+                (true, _, true, _) => 13,
+                (_, true, true, _) => 14,
+                (true, _, _, true) => 16,
+                (_, true, _, true) => 17,
+                (true, _, _, _) => 10,
+                (_, true, _, _) => 11,
+                (_, _, true, _) => 12,
+                (_, _, _, true) => 15,
+                _ => return LRESULT(1),
+            };
+            LRESULT(ht as isize)
+        }
+        _ => {
+            let orig = ORIG_WNDPROC.load(std::sync::atomic::Ordering::Relaxed);
+            if orig != 0 {
+                CallWindowProcW(
+                    Some(std::mem::transmute(orig)),
+                    hwnd, msg, wparam, lparam,
+                )
+            } else {
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+        }
+    }
+}
+
+/// Install the borderless edge-resize hook on the main window.
+unsafe fn install_resize_hook(hwnd: HWND) {
+    use windows::Win32::UI::WindowsAndMessaging::{SetWindowLongPtrW, GWLP_WNDPROC};
+    let prev = SetWindowLongPtrW(
+        hwnd,
+        GWLP_WNDPROC,
+        resize_hook_proc as unsafe extern "system" fn(HWND, u32, WPARAM, LPARAM) -> LRESULT
+            as isize,
+    );
+    ORIG_WNDPROC.store(prev, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn init_wgpu(window: &Window) -> Result<WgpuState> {
