@@ -918,7 +918,7 @@ impl MainWindow {
                         Self::draw_fullscreen_bar(
                             ui, &mut actions, &current_path,
                             nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal,
+                            &pal, true,
                         );
                     });
                 toolbar_rect = Some(resp.response.rect);
@@ -1103,7 +1103,7 @@ impl MainWindow {
                         Self::draw_fullscreen_bar(
                             ui, &mut actions, &current_path,
                             nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal,
+                            &pal, false,
                         );
                     });
             }
@@ -1282,6 +1282,8 @@ impl MainWindow {
     /// Fullscreen overlay control bar (auto-hides; slides up from the
     /// bottom edge — see chrome_anim). Layout: filename left, controls
     /// centered, zoom/res + help toggle right.
+    // Fullscreen flag: true when running as the immersive top bar (label
+    // shows "Exit"), false in the windowed status bar ("Fullscreen").
     #[allow(clippy::too_many_arguments)]
     fn draw_fullscreen_bar(
         ui: &mut egui::Ui,
@@ -1292,6 +1294,7 @@ impl MainWindow {
         current_size: Option<(u32, u32)>,
         zoom_pct: f32,
         pal: &Palette,
+        fullscreen: bool,
     ) {
         let _ = nav_count;
         let bar = ui.max_rect();
@@ -1366,7 +1369,7 @@ impl MainWindow {
         // `horizontal` lays the buttons at normal size.
         center.vertical_centered(|ui| {
             ui.horizontal(|ui| {
-                Self::draw_nav_buttons(ui, actions, true, pal);
+                Self::draw_nav_buttons(ui, actions, fullscreen, pal);
             });
         });
     }
