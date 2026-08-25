@@ -1,0 +1,49 @@
+[package]
+name = "aperture-neo-turbo"
+version = "0.1.0"
+edition = "2021"
+description = "Aperture Neo Turbo — High-performance GPU image viewer"
+
+[[bin]]
+name = "aperture-neo-turbo"
+path = "src/main.rs"
+
+[dependencies]
+aperture-core = { path = "../core" }
+aperture-gpu = { path = "../gpu" }
+aperture-ui = { path = "../ui" }
+
+winit = { workspace = true }
+egui = { workspace = true }
+egui-wgpu = { workspace = true }
+wgpu = { workspace = true }
+raw-window-handle = { workspace = true }
+windows = { version = "0.58", features = [
+    "Win32_Foundation",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Gdi",
+    "Win32_Graphics_Dwm",
+] }
+windows-core = "0.58"
+widestring = "1.2"
+
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+pollster = { workspace = true }
+rfd = { workspace = true }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
+panic = "abort"
+
+[profile.dev]
+opt-level = 1
+debug = true

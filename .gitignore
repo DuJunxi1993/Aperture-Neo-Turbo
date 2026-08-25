@@ -1,0 +1,22 @@
+# Build artifacts
+target/
+
+# IDE
+.vscode/
+.idea/
+*.iml
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cargo lock — keep committed for reproducibility
+!Cargo.lock
+
+# Local config
+.env
+*.local
+# Debug captures
+*.png
+*.log

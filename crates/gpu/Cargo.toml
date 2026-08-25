@@ -1,0 +1,27 @@
+[package]
+name = "aperture-gpu"
+version = "0.1.0"
+edition = "2021"
+description = "Direct2D/D3D11 GPU rendering engine for Aperture Neo Turbo"
+
+[dependencies]
+aperture-core = { path = "../core" }
+windows = { version = "0.58", features = [
+    "Win32_Graphics_Direct2D",
+    "Win32_Graphics_Direct2D_Common",
+    "Win32_Graphics_Direct3D",
+    "Win32_Graphics_Direct3D11",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
+    "Win32_Graphics_Imaging",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Foundation_Numerics",
+] }
+windows-core = "0.58"
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+parking_lot = { workspace = true }
+bytemuck = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

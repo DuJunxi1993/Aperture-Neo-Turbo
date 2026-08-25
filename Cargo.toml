@@ -1,0 +1,57 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/gpu",
+    "crates/ui",
+    "crates/app",
+]
+
+[workspace.dependencies]
+windows = { version = "0.58", features = [
+    "Win32_UI_Input_KeyboardAndMouse",
+    "Win32_UI_WindowsAndMessaging",
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+] }
+winit = "0.30"
+egui = "0.29"
+egui-wgpu = "0.29"
+wgpu = "22"
+skia-safe = "0.78"
+rusqlite = { version = "0.32", features = ["bundled"] }
+notify = "6"
+rayon = "1"
+parking_lot = "0.12"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+bytemuck = { version = "1", features = ["derive"] }
+anyhow = "1"
+thiserror = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+raw-window-handle = "0.6"
+dirs = "5"
+lru = "0.12"
+pollster = "0.3"
+winreg = "0.52"
+rfd = { version = "0.14", default-features = false, features = ["xdg-portal", "tokio"] }
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = "symbols"
+
+[profile.release-lto]
+inherits = "release"
+lto = "thin"
+
+[profile.dev]
+opt-level = 1
+debug = true
+
+[profile.dev.package."*"]
+opt-level = 3
