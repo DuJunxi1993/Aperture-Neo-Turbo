@@ -15,6 +15,10 @@ pub struct RouterState {
     pub cursor_pos: Pos2,
     /// Scale factor used to convert physical px → egui logical points.
     pub pixels_per_point: f32,
+    /// PERSISTENT modifier state — must survive `take_pending`, which
+    /// drains the event batch (and its modifiers) every frame. Without
+    /// this, Ctrl held across a frame boundary reads as released.
+    pub modifiers: egui::Modifiers,
     pub last_click_pos: Option<Pos2>,
     pub last_click_time: std::time::Instant,
     /// Accumulated egui input, consumed once per frame by begin_frame.
@@ -26,6 +30,7 @@ impl RouterState {
         Self {
             cursor_pos: Pos2::ZERO,
             pixels_per_point: 1.0,
+            modifiers: egui::Modifiers::default(),
             last_click_pos: None,
             last_click_time: std::time::Instant::now(),
             pending: RawInput::default(),
@@ -89,17 +94,22 @@ pub fn forward_to_egui(state: &mut RouterState, event: &WindowEvent) {
         }
         WindowEvent::ModifiersChanged(mods) => {
             let m = mods.state();
-            state.pending.modifiers = egui::Modifiers {
+            let em = egui::Modifiers {
                 alt: m.alt_key(),
                 ctrl: m.control_key(),
                 shift: m.shift_key(),
                 mac_cmd: false,
                 command: m.control_key(),
             };
+            // Persistent copy (read by the app between frames) + batch copy
+            // (consumed by egui's begin_frame).
+            state.modifiers = em;
+            state.pending.modifiers = em;
         }
         WindowEvent::Focused(focused) => {
             if !focused {
                 // Drop stale modifier/pointer state when losing focus.
+                state.modifiers = egui::Modifiers::default();
                 state.pending.modifiers = egui::Modifiers::default();
             }
         }

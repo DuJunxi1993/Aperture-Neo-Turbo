@@ -2008,22 +2008,28 @@ impl MainWindow {
     fn set_wallpaper(&self, path: PathBuf) {
         use std::os::windows::ffi::OsStrExt;
         let wide: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
-        unsafe {
-            let _ = SystemParametersInfoW(
+        let ok = unsafe {
+            SystemParametersInfoW(
                 SPI_SETDESKWALLPAPER,
                 0,
                 Some(wide.as_ptr() as *mut _),
                 SPIF_UPDATEINIFILE | SPIF_SENDCHANGE,
-            );
+            )
+        };
+        if ok.is_err() {
+            tracing::warn!("set_wallpaper failed for {}: {:?}", path.display(), ok);
+        } else {
+            tracing::info!("wallpaper set: {}", path.display());
         }
     }
 
-    /// Open the folder containing the current image in Windows Explorer.
+    /// Open the folder containing the current image in Windows Explorer
+    /// (with the image file selected).
     fn open_in_explorer(&self, path: PathBuf) {
         use std::process::Command;
+        // "/select,<path>" must be a SINGLE argument.
         let _ = Command::new("explorer")
-            .arg("/select,")
-            .arg(path)
+            .arg(format!("/select,{}", path.display()))
             .spawn();
     }
 
@@ -2126,7 +2132,10 @@ impl ApplicationHandler for MainWindow {
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
             if matches!(key_event.state, ElementState::Pressed) {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
-                    let ctrl_pressed = self.router.pending.modifiers.ctrl;
+                    // Persistent modifier state — survives frame drains
+                    // (the batch copy is cleared by take_pending).
+                    let ctrl_pressed = self.router.modifiers.ctrl;
+                    tracing::debug!("key {:?} ctrl={}", code, ctrl_pressed);
                     let mut consumed = true;
                     match code {
                         KeyCode::ArrowLeft if ctrl_pressed => self.handle_cycle_folder(-1),
