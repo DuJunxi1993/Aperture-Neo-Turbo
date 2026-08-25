@@ -179,7 +179,7 @@ pub fn light_palette() -> Palette { Palette {
     accent_hover: egui::Color32::from_rgb(0x71, 0x70, 0xff),
     selection_text: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
     hover_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-    button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 8),
+    button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 13),
     card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
     selected_card_stroke: egui::Color32::from_rgb(94, 106, 210),
@@ -1330,25 +1330,30 @@ impl MainWindow {
                 .id_salt("fs-bar-center")
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        Self::draw_nav_buttons(&mut center, actions, true);
+        Self::draw_nav_buttons(&mut center, actions, true, pal);
     }
 
     /// Prev/Next (accent-tinted) + Fit / 1:1 / Fullscreen — shared by the
     /// status bar and the fullscreen overlay bar.
-    fn draw_nav_buttons(ui: &mut egui::Ui, actions: &mut Vec<UiAction>, fullscreen: bool) {
-        let accent = egui::Color32::from_rgb(0x5e, 0x6a, 0xd2);
-        let accent_hover = egui::Color32::from_rgb(0x71, 0x70, 0xff);
+    fn draw_nav_buttons(
+        ui: &mut egui::Ui,
+        actions: &mut Vec<UiAction>,
+        fullscreen: bool,
+        pal: &Palette,
+    ) {
+        // Accent-filled buttons always use white text (both themes).
         let nav_btn = |ui: &mut egui::Ui, label: &str| -> bool {
             ui.add(
-                egui::Button::new(egui::RichText::new(label).size(13.0))
-                    .fill(accent)
-                    .min_size(egui::vec2(0.0, 30.0))
-                    .rounding(6.0),
+                egui::Button::new(
+                    egui::RichText::new(label).size(13.0).strong().color(egui::Color32::WHITE),
+                )
+                .fill(pal.accent)
+                .min_size(egui::vec2(0.0, 30.0))
+                .rounding(6.0),
             )
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
-        let _ = accent_hover;
         if nav_btn(ui, "<  Prev") {
             actions.push(UiAction::Prev);
         }
@@ -1357,28 +1362,29 @@ impl MainWindow {
             actions.push(UiAction::Next);
         }
         ui.add_space(10.0);
-        if ui.add(
-            egui::Button::new(egui::RichText::new("Fit").size(13.0))
-                .min_size(egui::vec2(0.0, 30.0))
-                .rounding(6.0),
-        ).clicked() {
+        // Neutral buttons: theme fill + subtle stroke so they read on both
+        // dark and light backgrounds.
+        let neutral_btn = |ui: &mut egui::Ui, label: &str| -> bool {
+            ui.add(
+                egui::Button::new(egui::RichText::new(label).size(13.0).strong())
+                    .fill(pal.button_fill)
+                    .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                    .min_size(egui::vec2(0.0, 30.0))
+                    .rounding(6.0),
+            )
+            .on_hover_cursor(egui::CursorIcon::PointingHand)
+            .clicked()
+        };
+        if neutral_btn(ui, "Fit") {
             actions.push(UiAction::Fit);
         }
         ui.add_space(6.0);
-        if ui.add(
-            egui::Button::new(egui::RichText::new("1:1").size(13.0))
-                .min_size(egui::vec2(0.0, 30.0))
-                .rounding(6.0),
-        ).clicked() {
+        if neutral_btn(ui, "1:1") {
             actions.push(UiAction::OneToOne);
         }
         ui.add_space(6.0);
         let fs_label = if fullscreen { "Exit" } else { "Fullscreen" };
-        if ui.add(
-            egui::Button::new(egui::RichText::new(fs_label).size(13.0))
-                .min_size(egui::vec2(0.0, 30.0))
-                .rounding(6.0),
-        ).clicked() {
+        if neutral_btn(ui, fs_label) {
             actions.push(UiAction::ToggleFullscreen);
         }
     }
@@ -1419,16 +1425,23 @@ impl MainWindow {
         {
             content.add_space(12.0);
 
-            // Sidebar toggle buttons (macOS-style, active state tinted).
+            // Sidebar toggle buttons (macOS-style, active state tinted —
+            // accent fill always gets white text).
             let toggle_btn = |ui: &mut egui::Ui, label: &str, active: bool| -> bool {
                 let fill = if active {
                     pal.accent
                 } else {
                     pal.button_fill
                 };
+                let text = if active {
+                    egui::Color32::WHITE
+                } else {
+                    pal.text_secondary
+                };
                 ui.add(
-                    egui::Button::new(egui::RichText::new(label).size(13.0).strong())
+                    egui::Button::new(egui::RichText::new(label).size(13.0).strong().color(text))
                         .fill(fill)
+                        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
                         .min_size(egui::vec2(56.0, 30.0))
                         .rounding(6.0),
                 ).clicked()
@@ -1675,10 +1688,28 @@ impl MainWindow {
         let row_w = depth as f32 * 14.0 + 24.0 + node.text_w;
         let mut max_w = row_w;
 
-        // Leaf entries (Favorites / Recent) render as rounded selectable
-        // labels — no expand arrows, click navigates, right-click manages.
+        // Leaf entries (Favorites / Recent): custom-painted rounded
+        // highlight (egui selectable_label's built-in selected color mixes
+        // green/blue with our indigo). Click navigates, right-click manages.
         if is_leaf_entry {
-            let resp = ui.selectable_label(is_current || is_reveal_target, egui::RichText::new(display).size(14.0).color(text_color));
+            let selected = is_current || is_reveal_target;
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), 26.0),
+                egui::Sense::click(),
+            );
+            if selected {
+                ui.painter().rect_filled(rect, 6.0, pal.selected_card_fill);
+            } else if resp.hovered() {
+                ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
+            }
+            ui.painter().text(
+                egui::pos2(rect.left() + 10.0, rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                display,
+                egui::FontId::proportional(14.0),
+                if selected { pal.selection_text } else { pal.text_secondary },
+            );
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
             if is_reveal_target && !*revealed {
                 ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
                 *revealed = true;
@@ -1946,7 +1977,7 @@ impl MainWindow {
             // vertically and clip everything after the first.
             ui.horizontal(|ui| {
                 // Left: navigation + view controls.
-                Self::draw_nav_buttons(ui, actions, false);
+                Self::draw_nav_buttons(ui, actions, false, pal);
 
                 // Right: "?" help toggle (anchoring point for the popover).
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
