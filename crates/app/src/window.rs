@@ -2054,6 +2054,120 @@ impl MainWindow {
         None
     }
 
+    /// Native context menu over the image: copy path / explorer / print /
+    /// wallpaper. Uses Win32 TrackPopupMenu — a real top-level popup, so it
+    /// renders above the D2D child window without any region tricks.
+    fn show_image_context_menu(&mut self, cursor: (i32, i32)) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
+            SetForegroundWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
+        };
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::Foundation::POINT;
+        use windows::core::PCWSTR;
+        let Some(current) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw == 0 { return; }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+
+        unsafe {
+            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let item = |menu: HMENU, id: u32, text: &str| {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
+            };
+            item(menu, 1, "复制图片路径");
+            item(menu, 2, "在资源管理器中打开");
+            item(menu, 3, "打印");
+            item(menu, 4, "设为桌面壁纸");
+
+            // Client → screen coordinates for the popup anchor.
+            let mut pt = POINT { x: cursor.0, y: cursor.1 };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            // The menu needs an active foreground window to dismiss correctly.
+            let _ = SetForegroundWindow(hwnd);
+            // With TPM_RETURNCMD the selected command id is in the LOW word.
+            let ret = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x, pt.y,
+                0,
+                hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            let cmd = (ret.0 & 0xFFFF) as u32;
+            match cmd {
+                1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
+                2 => self.open_in_explorer(current),
+                3 => self.print_image(current),
+                4 => self.set_wallpaper(current),
+                _ => {} // dismissed
+            }
+        }
+    }
+
+    /// Copy text to the clipboard (CF_UNICODETEXT).
+    fn copy_text_to_clipboard(&self, text: &str) {
+        use windows::Win32::System::DataExchange::{
+            OpenClipboard, EmptyClipboard, SetClipboardData, CloseClipboard,
+        };
+        use windows::Win32::System::Memory::{GlobalAlloc, GlobalLock, GlobalUnlock,
+            GMEM_MOVEABLE};
+        use windows::Win32::System::Ole::CF_UNICODETEXT;
+        use windows::Win32::Foundation::HANDLE;
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw == 0 { return; }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        unsafe {
+            if OpenClipboard(hwnd).is_err() {
+                tracing::warn!("clipboard: OpenClipboard failed");
+                return;
+            }
+            let _ = EmptyClipboard();
+            let mut wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+            let bytes = wide.len() * 2;
+            let Some(h) = GlobalAlloc(GMEM_MOVEABLE, bytes).ok() else {
+                let _ = CloseClipboard();
+                return;
+            };
+            let dst = GlobalLock(h);
+            if !dst.is_null() {
+                std::ptr::copy_nonoverlapping(wide.as_mut_ptr(), dst as *mut u16, wide.len());
+                let _ = GlobalUnlock(h);
+                if SetClipboardData(CF_UNICODETEXT.0 as u32, HANDLE(h.0)).is_err() {
+                    tracing::warn!("clipboard: SetClipboardData failed");
+                }
+            }
+            let _ = CloseClipboard();
+        }
+    }
+
+    /// Print via the Shell "print" verb (opens the system photo-print flow).
+    fn print_image(&self, path: PathBuf) {
+        use windows::Win32::UI::Shell::ShellExecuteW;
+        use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
+        use std::os::windows::ffi::OsStrExt;
+        let verb: Vec<u16> = "print".encode_utf16().chain(std::iter::once(0)).collect();
+        let file: Vec<u16> = path.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        let result = unsafe {
+            ShellExecuteW(
+                hwnd,
+                windows::core::PCWSTR(verb.as_ptr()),
+                windows::core::PCWSTR(file.as_ptr()),
+                None,
+                None,
+                SW_SHOWNORMAL,
+            )
+        };
+        if result.0 as isize <= 32 {
+            tracing::warn!("print: ShellExecute failed for {}", path.display());
+        }
+    }
+
     /// Handle a file/folder dropped onto the window: an image navigates to
     /// its parent folder and selects that file; a folder navigates into it.
     fn handle_dropped_file(&mut self, path: PathBuf) {
@@ -2341,6 +2455,15 @@ impl ApplicationHandler for MainWindow {
                 .and_then(|v| v.cursor_to_local(cursor.x as i32, cursor.y as i32))
                 .is_some();
 
+            // Right-click over the image → native context menu.
+            if in_viewer
+                && matches!(button, MouseButton::Right)
+                && matches!(state, ElementState::Pressed)
+            {
+                self.show_image_context_menu((cursor.x as i32, cursor.y as i32));
+                return;
+            }
+
             if in_viewer && matches!(button, MouseButton::Left) {
                 if matches!(state, ElementState::Pressed) {
                     // Start image drag-pan (double-click detection still runs).
@@ -2426,6 +2549,8 @@ impl ApplicationHandler for MainWindow {
 
 /// Original winit window procedure — resize hook forwards everything else.
 static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
+/// Main window HWND (isize) for Win32 calls from app code.
+static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Mirrors MainWindow.is_fullscreen for the resize hook.
 pub static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
