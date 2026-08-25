@@ -1245,7 +1245,16 @@ impl MainWindow {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: pal.canvas_clear.0, g: pal.canvas_clear.1, b: pal.canvas_clear.2, a: 1.0,
+                            // wgpu encodes the sRGB clear through the
+                            // surface's linear→sRGB encoder on store, so
+                            // passing an sRGB fraction (0..1) over-brightens
+                            // the cleared region relative to the authored
+                            // palette. Convert to linear first; see
+                            // `srgb_to_linear` for the formula.
+                            r: srgb_to_linear(pal.canvas_clear.0),
+                            g: srgb_to_linear(pal.canvas_clear.1),
+                            b: srgb_to_linear(pal.canvas_clear.2),
+                            a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -2186,6 +2195,17 @@ impl MainWindow {
             self.chrome_visible = true;
             self.chrome_hide_at = None;
         }
+        // Phase 1: hide / restore the standard resize-grip frame
+        // (WS_THICKFRAME) so DWM doesn't draw a 1–2 px border around
+        // the monitor while in borderless fullscreen. Entering strips
+        // it; exiting restores it so the window can still be resized
+        // from the edges. SWP_FRAMECHANGED forces a redraw of the
+        // non-client area so the change is visible immediately.
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw != 0 {
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            unsafe { set_window_thick_frame(hwnd, !self.is_fullscreen) };
+        }
         window.set_fullscreen(if self.is_fullscreen {
             Some(winit::window::Fullscreen::Borderless(None))
         } else {
@@ -2885,6 +2905,31 @@ fn init_egui(device: &wgpu::Device, format: wgpu::TextureFormat) -> EguiState { 
 
 /// Load a system CJK-capable font so non-Latin folder names render
 /// instead of showing placeholder boxes.
+/// Convert an sRGB-encoded channel value (0.0–1.0) to the linear-light value
+/// that wgpu's `LoadOp::Clear` expects on an sRGB surface. Required because
+/// wgpu passes the clear color through the surface's linear->sRGB encoder
+/// on store; passing the sRGB fraction directly over-brightens dark/light.
+fn srgb_to_linear(c: f64) -> f64 {
+    if c <= 0.04045 { c / 12.92 } else { ((c + 0.055) / 1.055).powf(2.4) }
+}
+
+/// Toggle the standard resize grip frame around the main window. When
+/// entering immersive (borderless fullscreen) we hide it so DWM does
+/// not draw a thin border around the monitor; on exit we restore it.
+unsafe fn set_window_thick_frame(hwnd: HWND, on: bool) {
+    use windows::Win32::UI::WindowsAndMessaging::{
+        GetWindowLongPtrW, SetWindowLongPtrW, GWL_STYLE, WS_THICKFRAME,
+        SetWindowPos, SWP_FRAMECHANGED, SWP_NOMOVE, SWP_NOSIZE, SWP_NOZORDER, SWP_NOACTIVATE,
+    };
+    let prev = GetWindowLongPtrW(hwnd, GWL_STYLE);
+    let new = if on { prev | WS_THICKFRAME.0 as isize } else { prev & !(WS_THICKFRAME.0 as isize) };
+    SetWindowLongPtrW(hwnd, GWL_STYLE, new);
+    let _ = SetWindowPos(
+        hwnd, None, 0, 0, 0, 0,
+        SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
+    );
+}
+
 fn install_fonts(ctx: &egui::Context) {
     let mut fonts = egui::FontDefinitions::default();
     let candidates = [

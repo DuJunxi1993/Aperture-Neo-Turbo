@@ -133,27 +133,32 @@ impl Direct2DViewer {
             };
             self.gpu.d2d_dc.Clear(Some(&bg_color));
 
-            // Aspect adaptation: when the swapchain buffer's aspect differs
-            // from the viewport's (deferred resize during panel drags), the
-            // compositor stretches buffer → HWND. Drawing the image fit to
-            // a same-aspect sub-rect of the buffer keeps it visually
-            // undistorted after the stretch.
+            // STRETCH pre-compensation: when the swapchain buffer's
+            // size differs from the viewport's (deferred ResizeBuffers
+            // during a fullscreen toggle, panel drag, or animation),
+            // DXGI_SCALING_STRETCH non-uniformly stretches the buffer
+            // to fit the HWND. The aspect-sub-rect base we used to use
+            // (draw a same-aspect sub-rect inside the buffer, leaving
+            // letterbox bands) only worked when the buffer/viewport
+            // aspect ratio matched within STRETCH's tolerance — for
+            // large jumps (e.g. fullscreen enter) the OS still
+            // non-uniformly scales the buffer and the letterbox
+            // edges go visibly off-axis.
+            //
+            // New approach: pre-scale the source content by (bw/vw,
+            // bh/vh) so the buffer content, after STRETCH, lands
+            // pixel-perfect on the viewport. buffer==viewport
+            // degenerates to scale(1,1) (identity), so steady state
+            // is unchanged. Combined with the affine-multiply chain
+            // (`base × current_image_transform × rotation_matrix`)
+            // the math composes cleanly and survives arbitrarily
+            // large aspect mismatches.
             let vw = self.viewport_w as f32;
             let vh = self.viewport_h as f32;
             let base = if buffer_w > 0 && buffer_h > 0 && vw > 0.0 && vh > 0.0 {
                 let bw = buffer_w as f32;
                 let bh = buffer_h as f32;
-                let buf_ar = bw / bh;
-                let vp_ar = vw / vh;
-                let (cw, ch) = if vp_ar > buf_ar {
-                    (bw, bw / vp_ar)
-                } else {
-                    (bh * vp_ar, bh)
-                };
-                let ox = (bw - cw) * 0.5;
-                let oy = (bh - ch) * 0.5;
-                AffineTransform::translate(ox, oy)
-                    .mul(AffineTransform::scale(cw / vw))
+                AffineTransform::scale_xy(bw / vw, bh / vh)
             } else {
                 AffineTransform::identity()
             };

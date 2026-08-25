@@ -19,6 +19,13 @@ impl AffineTransform {
         Self { m11: s, m12: 0.0, m21: 0.0, m22: s, dx: 0.0, dy: 0.0 }
     }
 
+    /// Non-uniform scale: m11 = sx, m22 = sy. Used for STRETCH
+    /// pre-compensation in the D2D viewer (Phase 1) where the
+    /// swapchain buffer's aspect differs from the viewport's.
+    pub fn scale_xy(sx: f32, sy: f32) -> Self {
+        Self { m11: sx, m12: 0.0, m21: 0.0, m22: sy, dx: 0.0, dy: 0.0 }
+    }
+
     pub fn translate(x: f32, y: f32) -> Self {
         Self { m11: 1.0, m12: 0.0, m21: 0.0, m22: 1.0, dx: x, dy: y }
     }

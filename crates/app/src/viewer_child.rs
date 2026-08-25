@@ -18,6 +18,14 @@ use windows::{
 use windows_core::PCWSTR;
 use std::sync::Once;
 
+/// Sum of |Δw| + |Δh| above which a resize is treated as a "big jump"
+/// (fullscreen toggle, large window resize). The deferred 150 ms
+/// ResizeBuffers path is too slow for these transitions — the swapchain
+/// buffer stays stale for the whole jump and DXGI_SCALING_STRETCH
+/// non-uniformly scales it, visibly distorting the image. Big jumps
+/// take the immediate path: ResizeBuffers + SetWindowPos in one call.
+const BIG_JUMP_PIXELS: u64 = 200;
+
 pub struct ViewerChildWindow {
     pub hwnd: HWND,
     pub gpu: Arc<GpuContext>,
@@ -104,6 +112,31 @@ impl ViewerChildWindow {
         // DXGI_SCALING_STRETCH displays the old buffer scaled until then,
         // so panel drags stay smooth and gap-free.
         self.viewer.lock().resize(width, height, x as f32, y as f32);
+
+        // Big-jump fast path: when the size delta exceeds 200 px (sum of
+        // |Δw| + |Δh|), a fullscreen toggle or window-resize is in
+        // progress. Deferring the ResizeBuffers call for 150 ms leaves
+        // the swapchain buffer stale for the entire transition, and
+        // STRETCH's non-uniform aspect during that gap visibly distorts
+        // the image (Phase 1's fullscreen aspect bug). Forcing an
+        // immediate ResizeBuffers + SWP_FRAMECHANGED keeps the buffer in
+        // step with the HWND through the whole jump. We still drop the
+        // last_size delta down to 0 first so the deferred path doesn't
+        // immediately re-fire after us.
+        let (old_w, old_h) = self.last_size;
+        let delta = (width as i64 - old_w as i64).unsigned_abs()
+            + (height as i64 - old_h as i64).unsigned_abs();
+        if delta > BIG_JUMP_PIXELS {
+            self.last_size = (width, height);
+            self.pending_resize_since = None;
+            let _ = aperture_gpu::resize_swapchain(&mut self.swapchain, width, height);
+            unsafe {
+                let _ = SetWindowPos(
+                    self.hwnd, HWND_TOP, x, y, width as i32, height as i32,
+                    SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+                );
+            }
+        }
 
         self.hit_rect = RECT {
             left: x, top: y,
