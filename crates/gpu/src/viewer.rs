@@ -124,8 +124,8 @@ impl Direct2DViewer {
         unsafe {
             self.gpu.d2d_dc.BeginDraw();
 
-            // Clear to dark background
-            let bg_color = D2D1_COLOR_F { r: 0.05, g: 0.05, b: 0.06, a: 1.0 };
+            // Clear to the app panel background (#0f1011).
+            let bg_color = D2D1_COLOR_F { r: 0.082, g: 0.086, b: 0.090, a: 1.0 };
             self.gpu.d2d_dc.Clear(Some(&bg_color));
 
             // Aspect adaptation: when the swapchain buffer's aspect differs

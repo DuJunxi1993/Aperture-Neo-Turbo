@@ -1079,9 +1079,8 @@ impl MainWindow {
                 drop(_cmds);
             }
 
-            // Linear dark canvas color (#08090a). Even where the egui panels
-            // don't paint (a 1-2px hairline gap during resize), the surface
-            // itself shows the correct dark color instead of the OS default.
+            // Canvas color matches the panel background (#0f1011) — no
+            // gray seams where egui doesn't paint.
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -1089,7 +1088,7 @@ impl MainWindow {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.031, g: 0.035, b: 0.039, a: 1.0,
+                            r: 0.082, g: 0.086, b: 0.090, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1759,10 +1758,12 @@ impl MainWindow {
             }
             UiAction::ToggleFullscreen => self.action_toggle_fullscreen(),
             UiAction::ToggleTree => {
+                self.close_shortcut_help();
                 self.show_tree = !self.show_tree;
                 self.relayout_viewer();
             }
             UiAction::ToggleThumbs => {
+                self.close_shortcut_help();
                 self.show_thumbs = !self.show_thumbs;
                 self.relayout_viewer();
             }
@@ -1869,16 +1870,22 @@ impl MainWindow {
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
+    /// Close the shortcuts popover (and restore the child window region).
+    /// Required before fullscreen toggles and panel layout changes — the
+    /// popover's hole-punch region cannot track the moving child window.
+    fn close_shortcut_help(&mut self) {
+        self.show_shortcut_help = false;
+    }
+
     fn action_toggle_fullscreen(&mut self) {
+        self.close_shortcut_help();
         let Some(window) = &self.window else { return; };
         self.is_fullscreen = !self.is_fullscreen;
-        tracing::info!("chrome: fullscreen = {}", self.is_fullscreen);
         // Capture the on-screen image rect so the viewport transition can
         // animate from it (path animation into fullscreen).
         if let Some(v) = &self.viewer {
             v.lock().mark_viewport_transition();
         }
-        tracing::info!("chrome: visible = {} anim = {:.2}", self.chrome_visible, self.chrome_anim);
         if self.is_fullscreen {
             // Enter immersive mode: chrome hidden until the mouse moves.
             self.chrome_visible = true;
@@ -2208,6 +2215,9 @@ impl ApplicationHandler for MainWindow {
                 }
                 if matches!(state, ElementState::Pressed) && !self.is_fullscreen {
                     if let Some(edge) = self.panel_edge_at(cursor.x, cursor.y) {
+                        // The popover's hole region can't track the child
+                        // while the layout moves — close it first.
+                        self.close_shortcut_help();
                         self.drag_panel = Some(edge);
                         self.panel_edge_hover = Some(edge);
                         return;
