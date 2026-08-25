@@ -26,6 +26,24 @@ pub struct SettingsData {
     /// Favorite folders (for quick access in tree)
     #[serde(default)]
     pub favorite_folders: Vec<PathBuf>,
+    /// UI theme: "dark" | "light" (None = dark). "system" reserved.
+    #[serde(default)]
+    pub theme: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ThemeSetting {
+    Dark,
+    Light,
+}
+
+impl ThemeSetting {
+    pub fn toggle(self) -> Self {
+        match self {
+            Self::Dark => Self::Light,
+            Self::Light => Self::Dark,
+        }
+    }
 }
 
 pub struct SettingsStore {
@@ -88,6 +106,23 @@ impl SettingsStore {
     /// Get favorite folders.
     pub fn favorite_folders(&self) -> Vec<PathBuf> {
         self.data.lock().favorite_folders.clone()
+    }
+
+    /// UI theme — defaults to dark. "system" is reserved for future
+    /// follow-the-OS support.
+    pub fn theme(&self) -> crate::settings::ThemeSetting {
+        match self.data.lock().theme.as_deref() {
+            Some("light") => ThemeSetting::Light,
+            _ => ThemeSetting::Dark,
+        }
+    }
+
+    pub fn set_theme(&self, theme: ThemeSetting) {
+        self.data.lock().theme = Some(match theme {
+            ThemeSetting::Dark => "dark".into(),
+            ThemeSetting::Light => "light".into(),
+        });
+        let _ = self.save();
     }
 
     /// Add a folder to favorites (dedup, cap 20).

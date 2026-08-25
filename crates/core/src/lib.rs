@@ -20,4 +20,4 @@ pub use decode::{IImageLoader, CodecRoute, ImageLoadResult, DecodedBitmap, Codec
 pub use fs::{SupportedFormats, FileSystemWatcher};
 pub use model::ImageItem;
 pub use nav::{NavigationService, NavigationDirection};
-pub use settings::{SettingsStore, SettingsData};
+pub use settings::{SettingsStore, SettingsData, ThemeSetting};

@@ -32,7 +32,7 @@ use windows::Win32::Graphics::Gdi::{
 
 use aperture_core::{
     NavigationService, NavigationDirection,
-    SettingsStore, ThumbCache, ThumbCacheConfig,
+    SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
 use aperture_gpu::{GpuContext, Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir};
 use aperture_ui::ViewerPanel;
@@ -86,6 +86,8 @@ enum UiAction {
     MinimizeWindow,
     /// Toggle maximize (custom titlebar ❐ / double-click).
     ToggleMaximize,
+    /// Switch between dark and light themes.
+    ToggleTheme,
     /// Set current image as wallpaper.
     SetWallpaper,
     /// Open current image folder in Explorer.
@@ -115,6 +117,78 @@ enum WindowGlyph {
     Minimize,
     Maximize,
     Close,
+}
+
+/// UI theme — Dark (default) and Light, per the Aperture Neo design spec.
+/// `System` is reserved for future follow-the-OS support.
+/// Centralized color palette — every draw path reads from here so both
+/// themes stay consistent.
+#[derive(Debug, Clone, Copy)]
+pub struct Palette {
+    pub panel_bg: egui::Color32,
+    pub text_primary: egui::Color32,
+    pub text_secondary: egui::Color32,
+    pub text_tertiary: egui::Color32,
+    pub text_dim: egui::Color32,
+    pub accent: egui::Color32,
+    pub accent_hover: egui::Color32,
+    pub selection_text: egui::Color32,
+    pub hover_fill: egui::Color32,
+    pub button_fill: egui::Color32,
+    pub card_stroke: egui::Color32,
+    pub selected_card_fill: egui::Color32,
+    pub selected_card_stroke: egui::Color32,
+    pub thumb_placeholder: egui::Color32,
+    pub key_hint: egui::Color32,
+    pub help_desc: egui::Color32,
+    /// egui wgpu-surface clear color.
+    pub canvas_clear: (f64, f64, f64),
+    /// D2D viewer letterbox color.
+    pub d2d_clear: [f32; 3],
+}
+
+pub fn dark_palette() -> Palette { Palette {
+    panel_bg: egui::Color32::from_rgb(15, 16, 17),
+    text_primary: egui::Color32::from_rgb(247, 248, 248),
+    text_secondary: egui::Color32::from_rgb(200, 205, 214),
+    text_tertiary: egui::Color32::from_rgb(138, 143, 152),
+    text_dim: egui::Color32::from_rgb(98, 102, 109),
+    accent: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
+    accent_hover: egui::Color32::from_rgb(0x71, 0x70, 0xff),
+    selection_text: egui::Color32::from_rgb(140, 148, 255),
+    hover_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    button_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+    selected_card_fill: egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38),
+    selected_card_stroke: egui::Color32::from_rgb(95, 106, 210),
+    thumb_placeholder: egui::Color32::from_rgb(28, 30, 36),
+    key_hint: egui::Color32::from_rgb(100, 180, 255),
+    help_desc: egui::Color32::from_rgb(200, 200, 210),
+    canvas_clear: (0.059, 0.063, 0.067),
+    d2d_clear: [0.059, 0.063, 0.067],
+    }
+}
+
+pub fn light_palette() -> Palette { Palette {
+    panel_bg: egui::Color32::from_rgb(243, 244, 245),
+    text_primary: egui::Color32::from_rgb(26, 27, 30),
+    text_secondary: egui::Color32::from_rgb(60, 63, 68),
+    text_tertiary: egui::Color32::from_rgb(107, 112, 120),
+    text_dim: egui::Color32::from_rgb(140, 145, 152),
+    accent: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
+    accent_hover: egui::Color32::from_rgb(0x71, 0x70, 0xff),
+    selection_text: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
+    hover_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
+    button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 8),
+    card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
+    selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
+    selected_card_stroke: egui::Color32::from_rgb(94, 106, 210),
+    thumb_placeholder: egui::Color32::from_rgb(226, 228, 231),
+    key_hint: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
+    help_desc: egui::Color32::from_rgb(60, 63, 68),
+    canvas_clear: (0.953, 0.957, 0.961),
+    d2d_clear: [0.953, 0.957, 0.961],
+    }
 }
 
 /// Animated, user-resizable side-panel width with a content-driven minimum.
@@ -191,6 +265,8 @@ pub struct MainWindow {
     chrome_anim: f32,
     /// Whether the D2D child is currently hidden for the shortcuts popover.
     help_child_hidden: bool,
+    /// Theme whose egui visuals were last applied (re-apply on change).
+    applied_visuals: Option<Theme>,
     /// Image size for single-image launches (physical px) — drives the
     /// initial window size.
     single_image_size: Option<(u32, u32)>,
@@ -208,6 +284,8 @@ pub struct MainWindow {
     /// Image drag-pan state (left button held over the viewer).
     pan_active: bool,
     pan_last: (f32, f32),
+    /// UI theme (Dark default; persisted in settings).
+    theme: Theme,
 
     router: RouterState,
     last_double_click: Option<std::time::Instant>,
@@ -279,6 +357,7 @@ impl MainWindow {
                 .filter(|p| p.is_dir())
                 .inspect(|f| { nav.lock().navigate_folder(f.clone()).ok(); }),
         };
+        let theme_setting = settings.theme();
         let file_tree = crate::file_tree::FileTree::new();
         file_tree.refresh_recent(&settings.recent_folders());
         file_tree.refresh_favorites(&settings.favorite_folders());
@@ -318,14 +397,24 @@ impl MainWindow {
             last_cursor: None,
             chrome_anim: 0.0,
             help_child_hidden: false,
+            applied_visuals: None,
             drag_panel: None,
             panel_edge_hover: None,
             tree_rect_phys: (0.0, 0.0, 0.0, 0.0),
             thumb_rect_phys: (0.0, 0.0, 0.0, 0.0),
             pan_active: false,
             pan_last: (0.0, 0.0),
+            theme: theme_setting,
             single_image_size,
             last_frame: None,
+        }
+    }
+
+    /// Active color palette for the current theme.
+    fn pal(&self) -> Palette {
+        match self.theme {
+            Theme::Dark => dark_palette(),
+            Theme::Light => light_palette(),
         }
     }
 
@@ -639,6 +728,7 @@ impl MainWindow {
     }
 
     fn render_frame(&mut self) -> Result<()> {
+        let pal = self.pal();
         // 1. Poll decode coordinator
         if let Some(coordinator) = &self.coordinator {
             coordinator.poll();
@@ -648,6 +738,10 @@ impl MainWindow {
         // (avoids per-frame ResizeBuffers during panel drags).
         if let Some(child) = &mut self.viewer_child {
             child.flush_pending_resize();
+        }
+        // Keep the viewer background in sync with the theme.
+        if let Some(v) = &self.viewer {
+            v.lock().bg = pal.d2d_clear;
         }
 
         // The shortcuts popover must render above the image. The D2D child
@@ -739,6 +833,29 @@ impl MainWindow {
             );
             egui_state.ctx.begin_frame(raw_input);
 
+            // Apply egui visuals when the theme changes (toggle or startup).
+            if self.applied_visuals != Some(self.theme) {
+                self.applied_visuals = Some(self.theme);
+                let mut visuals = match self.theme {
+                    Theme::Light => {
+                        let mut v = egui::Visuals::light();
+                        v.panel_fill = egui::Color32::from_rgb(243, 244, 245);
+                        v.window_fill = v.panel_fill;
+                        v.override_text_color = Some(egui::Color32::from_rgb(26, 27, 30));
+                        v
+                    }
+                    Theme::Dark => {
+                        let mut v = egui::Visuals::dark();
+                        v.panel_fill = egui::Color32::from_rgb(15, 16, 17);
+                        v.window_fill = v.panel_fill;
+                        v.override_text_color = Some(egui::Color32::from_rgb(247, 248, 248));
+                        v
+                    }
+                };
+                visuals.window_stroke = egui::Stroke::NONE;
+                egui_state.ctx.set_visuals(visuals);
+            }
+
             // Frame delta for UI animations (panel widths, chrome fade).
             let now = std::time::Instant::now();
             let dt = self.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
@@ -751,7 +868,7 @@ impl MainWindow {
                     .exact_height(TOOLBAR_HEIGHT as f32)
                     .frame(
                         egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(15, 16, 17))
+                            .fill(pal.panel_bg)
                             .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
                     )
                     .show(&egui_state.ctx, |ui| {
@@ -759,6 +876,7 @@ impl MainWindow {
                             Self::draw_titlebar(
                                 ui, &mut actions, window,
                                 self.show_tree, self.show_thumbs,
+                                &pal,
                             );
                         }
                     });
@@ -791,6 +909,7 @@ impl MainWindow {
                         Self::draw_fullscreen_bar(
                             ui, &mut actions, &current_path,
                             nav_idx, nav_count2, current_size, zoom_pct,
+                            &pal,
                         );
                     });
                 toolbar_rect = Some(resp.response.rect);
@@ -813,7 +932,7 @@ impl MainWindow {
                     .exact_width(tree_anim)
                     .frame(
                         egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(15, 16, 17))
+                            .fill(pal.panel_bg)
                             .inner_margin(egui::Margin::same(0.0)),
                     )
                     .show(&egui_state.ctx, |ui| {
@@ -823,6 +942,7 @@ impl MainWindow {
                             &folder,
                             nav_count,
                             &mut side_actions,
+                            &pal,
                         );
                         self.tree_panel.content_min = min_w;
                     });
@@ -844,7 +964,7 @@ impl MainWindow {
                     .exact_width(thumb_anim)
                     .frame(
                         egui::Frame::default()
-                            .fill(egui::Color32::from_rgb(15, 16, 17))
+                            .fill(pal.panel_bg)
                             .inner_margin(egui::Margin::same(0.0)),
                     )
                     .show(&egui_state.ctx, |ui| {
@@ -855,6 +975,7 @@ impl MainWindow {
                             cur_idx,
                             force_scroll,
                             &mut side_actions,
+                            &pal,
                         );
                     });
                 let r = resp.response.rect;
@@ -902,12 +1023,12 @@ impl MainWindow {
                                         egui::RichText::new($key)
                                             .monospace()
                                             .size(12.0)
-                                            .color(egui::Color32::from_rgb(100, 180, 255)),
+                                            .color(pal.key_hint),
                                     );
                                     ui.label(
                                         egui::RichText::new($desc)
                                             .size(12.0)
-                                            .color(egui::Color32::from_rgb(200, 200, 210)),
+                                            .color(pal.help_desc),
                                     );
                                     ui.end_row();
                                 };
@@ -960,7 +1081,7 @@ impl MainWindow {
                     .show(&egui_state.ctx, |ui| {
                         Self::draw_status_bar(
                             ui, &current_path, nav_idx, nav_count2,
-                            current_size, zoom_pct, &mut actions,
+                            current_size, zoom_pct, &mut actions, &pal,
                         );
                     });
             }
@@ -1102,7 +1223,7 @@ impl MainWindow {
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
-                            r: 0.082, g: 0.086, b: 0.090, a: 1.0,
+                            r: pal.canvas_clear.0, g: pal.canvas_clear.1, b: pal.canvas_clear.2, a: 1.0,
                         }),
                         store: wgpu::StoreOp::Store,
                     },
@@ -1139,6 +1260,7 @@ impl MainWindow {
     /// Fullscreen overlay control bar (auto-hides; slides up from the
     /// bottom edge — see chrome_anim). Layout: filename left, controls
     /// centered, zoom/res + help toggle right.
+    #[allow(clippy::too_many_arguments)]
     fn draw_fullscreen_bar(
         ui: &mut egui::Ui,
         actions: &mut Vec<UiAction>,
@@ -1147,6 +1269,7 @@ impl MainWindow {
         nav_count: usize,
         current_size: Option<(u32, u32)>,
         zoom_pct: f32,
+        pal: &Palette,
     ) {
         let _ = nav_count;
         let bar = ui.max_rect();
@@ -1167,7 +1290,7 @@ impl MainWindow {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "—".into());
-        left.label(egui::RichText::new(name).size(13.0).strong().color(egui::Color32::from_rgb(210, 214, 222)));
+        left.label(egui::RichText::new(name).size(13.0).strong().color(pal.text_secondary));
 
         // Right: zoom% · resolution + "?" help toggle.
         let mut right = ui.new_child(
@@ -1182,7 +1305,7 @@ impl MainWindow {
         right.add_space(10.0);
         let q = right.add(
             egui::Button::new(egui::RichText::new("?").size(13.0))
-                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+                .fill(pal.button_fill)
                 .min_size(egui::vec2(32.0, 30.0))
                 .rounding(6.0),
         ).on_hover_text("Show shortcuts (Ctrl+/)");
@@ -1195,7 +1318,7 @@ impl MainWindow {
             right.label(
                 egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
                     .size(12.5)
-                    .color(egui::Color32::from_rgb(150, 154, 162)),
+                    .color(pal.text_tertiary),
             );
         }
 
@@ -1262,12 +1385,14 @@ impl MainWindow {
 
     /// Custom-drawn titlebar: drag area + sidebar toggles + centered app
     /// title + vector-drawn window controls. Replaces the native OS frame.
+    #[allow(clippy::too_many_arguments)]
     fn draw_titlebar(
         ui: &mut egui::Ui,
         actions: &mut Vec<UiAction>,
         window: &Window,
         show_tree: bool,
         show_thumbs: bool,
+        pal: &Palette,
     ) {
         // Whole-bar drag/double-click hit area FIRST, so interactive
         // widgets drawn on top steal their own events. allocate_rect
@@ -1297,9 +1422,9 @@ impl MainWindow {
             // Sidebar toggle buttons (macOS-style, active state tinted).
             let toggle_btn = |ui: &mut egui::Ui, label: &str, active: bool| -> bool {
                 let fill = if active {
-                    egui::Color32::from_rgb(0x5e, 0x6a, 0xd2)
+                    pal.accent
                 } else {
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14)
+                    pal.button_fill
                 };
                 ui.add(
                     egui::Button::new(egui::RichText::new(label).size(13.0).strong())
@@ -1310,7 +1435,7 @@ impl MainWindow {
             };
             if content.add(
                 egui::Button::new(egui::RichText::new("Open Folder").size(13.0).strong())
-                    .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+                    .fill(pal.button_fill)
                     .min_size(egui::vec2(0.0, 30.0))
                     .rounding(6.0),
             ).clicked() {
@@ -1328,14 +1453,33 @@ impl MainWindow {
             // Window controls, right-aligned, vertically centered.
             content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(2.0);
-                if Self::window_control(ui, "close-btn", WindowGlyph::Close, true) {
+                if Self::window_control(ui, "close-btn", WindowGlyph::Close, true, pal) {
                     actions.push(UiAction::ExitApp);
                 }
-                if Self::window_control(ui, "max-btn", WindowGlyph::Maximize, false) {
+                if Self::window_control(ui, "max-btn", WindowGlyph::Maximize, false, pal) {
                     actions.push(UiAction::ToggleMaximize);
                 }
-                if Self::window_control(ui, "min-btn", WindowGlyph::Minimize, false) {
+                if Self::window_control(ui, "min-btn", WindowGlyph::Minimize, false, pal) {
                     actions.push(UiAction::MinimizeWindow);
+                }
+                // Theme toggle: crescent-moon glyph (painter-drawn).
+                let (trect, tresp) = ui.allocate_exact_size(
+                    egui::vec2(32.0, 30.0),
+                    egui::Sense::click(),
+                );
+                if tresp.hovered() {
+                    ui.painter().rect_filled(trect, 0.0, pal.hover_fill);
+                }
+                let tc = trect.center();
+                let p = ui.painter();
+                p.circle_filled(tc, 7.0, pal.text_secondary);
+                p.circle_filled(
+                    tc + egui::vec2(3.0, -3.0),
+                    5.5,
+                    pal.panel_bg,
+                );
+                if tresp.clicked() {
+                    actions.push(UiAction::ToggleTheme);
                 }
             });
         }
@@ -1346,13 +1490,13 @@ impl MainWindow {
             egui::Align2::CENTER_CENTER,
             "Aperture Neo Turbo",
             egui::FontId::proportional(15.0),
-            egui::Color32::from_rgb(138, 143, 152),
+            pal.text_tertiary,
         );
     }
 
     /// One caption button with a vector-drawn glyph (immune to font
     /// fallback issues). Returns true when clicked.
-    fn window_control(ui: &mut egui::Ui, id: &str, glyph: WindowGlyph, danger: bool) -> bool {
+    fn window_control(ui: &mut egui::Ui, id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(42.0, 30.0),
             egui::Sense::click(),
@@ -1361,13 +1505,13 @@ impl MainWindow {
             let bg = if danger {
                 egui::Color32::from_rgb(196, 43, 28)
             } else {
-                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22)
+                pal.hover_fill
             };
             ui.painter().rect_filled(rect, 0.0, bg);
         }
         let p = ui.painter();
         let c = rect.center();
-        let stroke = egui::Stroke::new(1.3, egui::Color32::from_rgb(210, 214, 220));
+        let stroke = egui::Stroke::new(1.3, pal.text_secondary);
         match glyph {
             WindowGlyph::Minimize => {
                 p.line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], stroke);
@@ -1402,6 +1546,7 @@ impl MainWindow {
         folder: &Option<PathBuf>,
         nav_count: usize,
         actions: &mut Vec<UiAction>,
+        pal: &Palette,
     ) -> f32 {
         let frame = egui::Frame::default()
             .inner_margin(egui::Margin::same(10.0))
@@ -1411,7 +1556,7 @@ impl MainWindow {
                 egui::RichText::new("FOLDERS")
                     .size(12.0)
                     .strong()
-                    .color(egui::Color32::from_rgb(98, 102, 109)),
+                    .color(pal.text_dim),
             );
             ui.add_space(6.0);
 
@@ -1423,7 +1568,7 @@ impl MainWindow {
                     egui::Label::new(
                         egui::RichText::new(path_short)
                             .size(12.0)
-                            .color(egui::Color32::from_rgb(138, 143, 152)),
+                            .color(pal.text_tertiary),
                     )
                     .truncate(),
                 );
@@ -1431,7 +1576,7 @@ impl MainWindow {
                 ui.label(
                     egui::RichText::new(format!("{} image{}", nav_count, if nav_count == 1 { "" } else { "s" }))
                         .size(12.0)
-                        .color(egui::Color32::from_rgb(98, 102, 109)),
+                        .color(pal.text_dim),
                 );
                 ui.add_space(10.0);
             }
@@ -1449,7 +1594,7 @@ impl MainWindow {
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
                             ui, root, 0, folder, &mut expanded, actions, root_idx,
-                            &reveal, &mut revealed, &mut recent_scroll,
+                            &reveal, &mut revealed, &mut recent_scroll, &pal,
                         ));
                     }
                     state.roots = roots;
@@ -1481,6 +1626,7 @@ impl MainWindow {
         reveal: &Option<PathBuf>,
         revealed: &mut bool,
         recent_scroll: &mut Option<PathBuf>,
+        pal: &Palette,
     ) -> f32 {
         // Nodes are created with `children: Some(vec![])`, so emptiness —
         // not `None` — is the "not loaded yet" signal. `loading` marks
@@ -1513,9 +1659,9 @@ impl MainWindow {
         };
         let is_reveal_target = reveal.as_ref() == Some(&node.path) && root_idx == 2;
         let text_color = if is_current || is_reveal_target {
-            egui::Color32::from_rgb(140, 148, 255)
+            pal.selection_text
         } else {
-            egui::Color32::from_rgb(200, 205, 214)
+            pal.text_secondary
         };
         // Cached text width → content-driven panel minimum.
         if node.text_w <= 0.0 {
@@ -1587,13 +1733,13 @@ impl MainWindow {
                         ui.label(
                             egui::RichText::new("(empty)")
                                 .size(11.0)
-                                .color(egui::Color32::from_rgb(90, 94, 102)),
+                                .color(pal.text_dim),
                         );
                     }
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
                             ui, child, depth + 1, current, expanded, actions, root_idx,
-                            reveal, revealed, recent_scroll,
+                            reveal, revealed, recent_scroll, pal,
                         );
                         max_w = max_w.max(w);
                     }
@@ -1654,23 +1800,24 @@ impl MainWindow {
         cur_idx: usize,
         force_scroll: bool,
         actions: &mut Vec<UiAction>,
+        pal: &Palette,
     ) {
         let frame = egui::Frame::default()
-            .fill(egui::Color32::from_rgb(15, 16, 17))
+            .fill(pal.panel_bg)
             .inner_margin(egui::Margin::same(10.0));
         frame.show(ui, |ui| {
             ui.label(
                 egui::RichText::new("THUMBNAILS")
                     .size(12.0)
                     .strong()
-                    .color(egui::Color32::from_rgb(98, 102, 109)),
+                    .color(pal.text_dim),
             );
             ui.add_space(4.0);
             let nav_count = nav_items.len();
             ui.label(
                 egui::RichText::new(format!("{}/{}", if nav_count == 0 { 0 } else { cur_idx + 1 }, nav_count))
                     .size(11.0)
-                    .color(egui::Color32::from_rgb(138, 143, 152)),
+                    .color(pal.text_tertiary),
             );
             ui.add_space(6.0);
 
@@ -1678,7 +1825,7 @@ impl MainWindow {
                 ui.label(
                     egui::RichText::new("No images in folder.\nUse Open Folder to choose one.")
                         .size(11.0)
-                        .color(egui::Color32::from_rgb(98, 102, 109)),
+                        .color(pal.text_dim),
                 );
                 return;
             }
@@ -1713,14 +1860,14 @@ impl MainWindow {
 
                         let card = egui::Frame::default()
                             .fill(if is_selected {
-                                egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38)
+                                pal.selected_card_fill
                             } else {
                                 egui::Color32::TRANSPARENT
                             })
                             .stroke(if is_selected {
-                                egui::Stroke::new(1.2, egui::Color32::from_rgb(95, 106, 210))
+                                egui::Stroke::new(1.2, pal.selected_card_stroke)
                             } else {
-                                egui::Stroke::new(1.0, egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10))
+                                egui::Stroke::new(1.0, pal.card_stroke)
                             })
                             .rounding(egui::Rounding::same(8.0))
                             .inner_margin(egui::Margin::same(4.0));
@@ -1745,14 +1892,14 @@ impl MainWindow {
                                 ui.painter().rect_filled(
                                     rect,
                                     6.0,
-                                    egui::Color32::from_rgb(28, 30, 36),
+                                    pal.thumb_placeholder,
                                 );
                                 ui.painter().text(
                                     rect.center(),
                                     egui::Align2::CENTER_CENTER,
                                     "···",
                                     egui::FontId::proportional(12.0),
-                                    egui::Color32::from_rgb(98, 102, 109),
+                                    pal.text_dim,
                                 );
                             }
                             ui.add_space(2.0);
@@ -1760,9 +1907,9 @@ impl MainWindow {
                                 egui::RichText::new(name)
                                     .size(10.5)
                                     .color(if is_selected {
-                                        egui::Color32::from_rgb(247, 248, 248)
+                                        pal.text_primary
                                     } else {
-                                        egui::Color32::from_rgb(138, 143, 152)
+                                        pal.text_tertiary
                                     }),
                             );
                         }).response.interact(egui::Sense::click());
@@ -1786,10 +1933,11 @@ impl MainWindow {
         current_size: Option<(u32, u32)>,
         zoom_pct: f32,
         actions: &mut Vec<UiAction>,
+        pal: &Palette,
     ) {        // Transparent, borderless — blends seamlessly with the side panels
         // (no visible seams at the tree/thumbs boundaries).
         let frame = egui::Frame::default()
-            .fill(egui::Color32::from_rgb(15, 16, 17))
+            .fill(pal.panel_bg)
             .inner_margin(egui::Margin::symmetric(10.0, 5.0));
         frame.show(ui, |ui| {
             ui.spacing_mut().item_spacing.x = 10.0;
@@ -1804,7 +1952,7 @@ impl MainWindow {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let q = ui.add(
                         egui::Button::new(egui::RichText::new("?").size(13.0))
-                            .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+                            .fill(pal.button_fill)
                             .min_size(egui::vec2(32.0, 30.0))
                             .rounding(6.0),
                     ).on_hover_text("Show shortcuts (Ctrl+/)");
@@ -1836,7 +1984,7 @@ impl MainWindow {
                     egui::Align2::CENTER_CENTER,
                     info,
                     egui::FontId::proportional(13.0),
-                    egui::Color32::from_rgb(210, 214, 222),
+                    pal.text_secondary,
                 );
             });
         });
@@ -1930,6 +2078,14 @@ impl MainWindow {
                     let maximized = w.is_maximized();
                     w.set_maximized(!maximized);
                 }
+            }
+            UiAction::ToggleTheme => {
+                self.theme = self.theme.toggle();
+                self.settings.set_theme(match self.theme {
+                    Theme::Dark => aperture_core::ThemeSetting::Dark,
+                    Theme::Light => aperture_core::ThemeSetting::Light,
+                });
+                // The D2D child bg follows via render_frame's palette sync.
             }
             UiAction::SetWallpaper => {
                 if let Some(current) = self.nav.lock().current() {

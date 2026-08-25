@@ -40,6 +40,8 @@ pub struct Direct2DViewer {
     pub offset_x: f32,
     pub offset_y: f32,
     pub fit_scale: f32,
+    /// Viewer letterbox/background color (theme-dependent).
+    pub bg: [f32; 3],
     /// In-flight screen-rect transition (window coords: x, y, w, h).
     rect_anim: Option<RectAnim>,
     /// Captured image rect before a viewport change (fullscreen toggle) —
@@ -78,6 +80,7 @@ impl Direct2DViewer {
             offset_x: 0.0,
             offset_y: 0.0,
             fit_scale: 1.0,
+            bg: [0.059, 0.063, 0.067],
             rect_anim: None,
             pending_viewport_anim_from: None,
         }
@@ -124,8 +127,10 @@ impl Direct2DViewer {
         unsafe {
             self.gpu.d2d_dc.BeginDraw();
 
-            // Clear to the app panel background (#0f1011).
-            let bg_color = D2D1_COLOR_F { r: 0.082, g: 0.086, b: 0.090, a: 1.0 };
+            // Clear to the theme background color.
+            let bg_color = D2D1_COLOR_F {
+                r: self.bg[0], g: self.bg[1], b: self.bg[2], a: 1.0,
+            };
             self.gpu.d2d_dc.Clear(Some(&bg_color));
 
             // Aspect adaptation: when the swapchain buffer's aspect differs
