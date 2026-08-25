@@ -246,6 +246,12 @@ pub struct MainWindow {
     file_tree: crate::file_tree::FileTree,
     texture_cache: Arc<crate::texture_cache::TextureCache>,
     actions: Vec<UiAction>,
+    /// Phase 2: a tree node was right-clicked this frame; the egui
+    /// closure can't call show_tree_context_menu (it needs &mut self
+    /// while the egui frame has &mut self borrowed), so we defer
+    /// the popup to right after end_frame(). Drained by
+    /// drain_pending_tree_menu() in render_frame.
+    pending_tree_menu: Option<(PathBuf, usize, usize, (i32, i32))>,
 
     viewport_w: u32,
     viewport_h: u32,
@@ -381,6 +387,7 @@ impl MainWindow {
                 crate::texture_cache::TextureCache::new(thumb_cache.clone())
             ),
             actions: Vec::new(),
+            pending_tree_menu: None,
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
             viewport_h: last.1.saturating_sub(TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT),
             show_tree,
@@ -1285,6 +1292,19 @@ impl MainWindow {
             self.apply_action(action);
         }
 
+        // Phase 2: a tree node was right-clicked during the egui frame.
+        // The egui closure couldn't call show_tree_context_menu (it
+        // requires &mut self while the egui frame holds &mut self);
+        // drain the deferred request now that the egui borrows are
+        // released. The chosen action(s) are pushed straight into
+        // self.actions so they go through the same apply_action loop
+        // below in the *next* frame (this frame's loop already
+        // completed above).
+        if let Some((path, root_idx, depth, cursor)) = self.pending_tree_menu.take() {
+            let new_actions = self.show_tree_context_menu(cursor, path, root_idx, depth);
+            self.actions.extend(new_actions);
+        }
+
         Ok(())
     }
 
@@ -1668,11 +1688,17 @@ impl MainWindow {
                     let reveal = state.reveal_target.take();
                     let mut revealed = false;
                     let mut recent_scroll = state.recent_scroll_target.take();
+                    // Phase 2: out-param for the deferred tree
+                    // context menu; one slot shared across the
+                    // whole tree (only the most recent right-click
+                    // survives, which is fine — multi-right-click
+                    // isn't a real interaction).
+                    let mut pending: Option<(PathBuf, usize, usize, (i32, i32))> = None;
                     let mut max_w: f32 = 0.0;
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
                             ui, root, 0, folder, &mut expanded, actions, root_idx,
-                            &reveal, &mut revealed, &mut recent_scroll, &pal,
+                            &reveal, &mut revealed, &mut pending, &mut recent_scroll, &pal,
                         ));
                     }
                     state.roots = roots;
@@ -1703,6 +1729,12 @@ impl MainWindow {
         root_idx: usize,
         reveal: &Option<PathBuf>,
         revealed: &mut bool,
+        // Phase 2: out-param to defer the native context menu show
+        // until after the egui frame ends. None = no right-click
+        // pending. Some(...) = the egui closure captured a
+        // secondary-click on this node; the render_frame will
+        // drain it and call show_tree_context_menu.
+        pending: &mut Option<(PathBuf, usize, usize, (i32, i32))>,
         recent_scroll: &mut Option<PathBuf>,
         pal: &Palette,
     ) -> f32 {
@@ -1791,32 +1823,18 @@ impl MainWindow {
             if resp.clicked() {
                 actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
             }
-            resp.context_menu(|ui| {
-                if ui.button("在资源管理器中打开").clicked() {
-                    actions.push(UiAction::RevealInExplorer(path_clone.clone()));
-                    ui.close_menu();
+            // Phase 2: native context menu (replaces the previous
+            // egui resp.context_menu closure). secondary_clicked()
+            // fires once on right-button-down; capture the cursor
+            // position and defer the actual popup show to
+            // render_frame()'s drain step (the egui closure can't
+            // safely call show_tree_context_menu which needs
+            // &mut self while the egui frame has &mut self borrowed).
+            if resp.secondary_clicked() {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                    *pending = Some((path_clone.clone(), root_idx, depth, (pos.x as i32, pos.y as i32)));
                 }
-                if ui.button("浏览图片").clicked() {
-                    actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
-                    ui.close_menu();
-                }
-                if root_idx == 1 && ui.button("添加到收藏").clicked() {
-                    actions.push(UiAction::AddFavorite(path_clone.clone()));
-                    ui.close_menu();
-                }
-                if root_idx == 0 && ui.button("取消收藏").clicked() {
-                    actions.push(UiAction::RemoveFavorite(path_clone.clone()));
-                    ui.close_menu();
-                }
-                if root_idx == 1 && ui.button("从 Recent 移除").clicked() {
-                    actions.push(UiAction::RemoveRecent(path_clone.clone()));
-                    ui.close_menu();
-                }
-                if ui.button("在目录树中定位").clicked() {
-                    actions.push(UiAction::RevealInTree(path_clone.clone()));
-                    ui.close_menu();
-                }
-            });
+            }
         } else {
             let header = egui::CollapsingHeader::new(
                 egui::RichText::new(display).size(14.0).color(text_color)
@@ -1838,7 +1856,7 @@ impl MainWindow {
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
                             ui, child, depth + 1, current, expanded, actions, root_idx,
-                            reveal, revealed, recent_scroll, pal,
+                            reveal, revealed, pending, recent_scroll, pal,
                         );
                         max_w = max_w.max(w);
                     }
@@ -1869,25 +1887,18 @@ impl MainWindow {
                     actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
                 }
             }
-            // Right-click context menu: open / favorite management.
-            header.header_response.context_menu(|ui| {
-                if depth > 0 && ui.button("在资源管理器中打开").clicked() {
-                    actions.push(UiAction::RevealInExplorer(path_clone.clone()));
-                    ui.close_menu();
+            // Phase 2: native context menu (replaces the previous
+            // egui context_menu closure). The popup is deferred
+            // to render_frame() so the egui borrow is released
+            // before show_tree_context_menu is called. show_tree_context_menu
+            // already filters out items that don't apply (e.g.
+            // virtual roots get nothing; root 0 favorites get
+            // "取消收藏" but not "添加到收藏" etc.).
+            if header.header_response.secondary_clicked() {
+                if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                    *pending = Some((path_clone.clone(), root_idx, depth, (pos.x as i32, pos.y as i32)));
                 }
-                if depth > 0 && ui.button("浏览图片").clicked() {
-                    actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
-                    ui.close_menu();
-                }
-                if depth > 0 && ui.button("添加到收藏").clicked() {
-                    actions.push(UiAction::AddFavorite(path_clone.clone()));
-                    ui.close_menu();
-                }
-                if depth > 0 && ui.button("取消收藏").clicked() {
-                    actions.push(UiAction::RemoveFavorite(path_clone.clone()));
-                    ui.close_menu();
-                }
-            });
+            }
         }
         max_w
     }
@@ -2271,7 +2282,12 @@ impl MainWindow {
     /// Native context menu over the image: copy path / explorer / print /
     /// wallpaper. Uses Win32 TrackPopupMenu — a real top-level popup, so it
     /// renders above the D2D child window without any region tricks.
-    fn show_image_context_menu(&mut self, cursor: (i32, i32)) {
+    ///
+    /// Phase 2: also surfaces "在目录树中定位" so the user can jump from
+    /// the current image to its parent folder in the This PC tree. This
+    /// is the same UiAction::RevealInTree that the tree right-click
+    /// already exposes, just entered from the image side.
+    fn show_image_context_menu(&mut self, cursor: (i32, i32)) -> Vec<UiAction> {
         use windows::Win32::UI::WindowsAndMessaging::{
             CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
             SetForegroundWindow,
@@ -2280,12 +2296,20 @@ impl MainWindow {
         use windows::Win32::Graphics::Gdi::ClientToScreen;
         use windows::Win32::Foundation::POINT;
         use windows::core::PCWSTR;
-        let Some(current) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
+        let Some(current) = self.nav.lock().current().map(|i| i.path.clone()) else { return Vec::new() };
         let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-        if hwnd_raw == 0 { return; }
+        if hwnd_raw == 0 { return Vec::new(); }
         let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
 
-        unsafe {
+        // Capture the parent directory for "在目录树中定位" so we can
+        // push a UiAction::RevealInTree at the end (the existing
+        // show_image_context_menu was fire-and-forget; the Phase 2
+        // refactor turns it into an action-returning helper so the
+        // action flows through the same Vec<UiAction> path as every
+        // other control).
+        let parent = current.parent().map(|p| p.to_path_buf());
+
+        let cmd = unsafe {
             let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
             let item = |menu: HMENU, id: u32, text: &str| {
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
@@ -2295,6 +2319,7 @@ impl MainWindow {
             item(menu, 2, "在资源管理器中打开");
             item(menu, 3, "打印");
             item(menu, 4, "设为桌面壁纸");
+            item(menu, 5, "在目录树中定位");
 
             // Client → screen coordinates for the popup anchor.
             let mut pt = POINT { x: cursor.0, y: cursor.1 };
@@ -2311,15 +2336,123 @@ impl MainWindow {
                 None,
             );
             let _ = DestroyMenu(menu);
-            let cmd = (ret.0 & 0xFFFF) as u32;
-            match cmd {
-                1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
-                2 => self.reveal_in_explorer(&current),
-                3 => self.print_image(current),
-                4 => self.set_wallpaper(current),
-                _ => {} // dismissed
+            (ret.0 & 0xFFFF) as u32
+        };
+
+        let mut out = Vec::new();
+        match cmd {
+            1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
+            2 => self.reveal_in_explorer(&current),
+            3 => self.print_image(current),
+            4 => self.set_wallpaper(current),
+            5 => {
+                if let Some(p) = parent {
+                    out.push(UiAction::RevealInTree(p));
+                }
             }
+            _ => {} // dismissed
         }
+        out
+    }
+
+    /// Native context menu for a tree node. Mirrors the image menu
+    /// mechanism but is parameterised by the node's depth / root so
+    /// each context shows the right subset of items (e.g. Recent
+    /// entries get "添加到收藏"; Favorites get "取消收藏"; only
+    /// This PC entries get "在目录树中定位"). Returns the actions
+    /// the caller should push onto its own Vec<UiAction>.
+    ///
+    /// Phase 2: replaces the two `resp.context_menu(|ui| { ... })`
+    /// blocks in draw_tree_node with this single helper.
+    fn show_tree_context_menu(
+        &mut self,
+        cursor: (i32, i32),
+        path: PathBuf,
+        root_idx: usize,
+        depth: usize,
+    ) -> Vec<UiAction> {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
+            SetForegroundWindow,
+            TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
+        };
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::Foundation::POINT;
+        use windows::core::PCWSTR;
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw == 0 { return Vec::new(); }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+
+        // Item id → UiAction discriminator. Use small u32 constants so
+        // the match arm below stays readable. ids 1..=6 are reserved
+        // for the tree menu.
+        const ID_OPEN_EXPLORER: u32 = 1;
+        const ID_BROWSE: u32 = 2;
+        const ID_ADD_FAVORITE: u32 = 3;
+        const ID_REMOVE_FAVORITE: u32 = 4;
+        const ID_REMOVE_RECENT: u32 = 5;
+        const ID_REVEAL_IN_TREE: u32 = 6;
+
+        let cmd = unsafe {
+            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let item = |menu: HMENU, id: u32, text: &str| {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
+            };
+            // Virtual roots (Favorites/Recent/ThisPC at depth 0) and
+            // empty paths don't get any of the per-folder actions —
+            // only ThisPC (root 2) children get the full set.
+            if depth > 0 {
+                item(menu, ID_OPEN_EXPLORER, "在资源管理器中打开");
+                item(menu, ID_BROWSE, "浏览图片");
+            }
+            // Favorites root (0) shows "取消收藏"; Recent root (1)
+            // shows "添加到收藏" + "从 Recent 移除"; This PC (2)
+            // shows neither (regular folders can't be favorited from
+            // there directly — the user adds via the Recent list).
+            if root_idx == 1 && depth > 0 {
+                item(menu, ID_ADD_FAVORITE, "添加到收藏");
+            }
+            if root_idx == 0 && depth > 0 {
+                item(menu, ID_REMOVE_FAVORITE, "取消收藏");
+            }
+            if root_idx == 1 && depth > 0 {
+                item(menu, ID_REMOVE_RECENT, "从 Recent 移除");
+            }
+            if depth > 0 {
+                item(menu, ID_REVEAL_IN_TREE, "在目录树中定位");
+            }
+
+            // Client → screen coordinates for the popup anchor.
+            let mut pt = POINT { x: cursor.0, y: cursor.1 };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            // The menu needs an active foreground window to dismiss correctly.
+            let _ = SetForegroundWindow(hwnd);
+            // With TPM_RETURNCMD the selected command id is in the LOW word.
+            let ret = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x, pt.y,
+                0,
+                hwnd,
+                None,
+            );
+            let _ = DestroyMenu(menu);
+            (ret.0 & 0xFFFF) as u32
+        };
+
+        let mut out = Vec::new();
+        if cmd == 0 { return out; }
+        match cmd {
+            ID_OPEN_EXPLORER => out.push(UiAction::RevealInExplorer(path.clone())),
+            ID_BROWSE => out.push(UiAction::FolderChosen(path.clone(), root_idx)),
+            ID_ADD_FAVORITE => out.push(UiAction::AddFavorite(path.clone())),
+            ID_REMOVE_FAVORITE => out.push(UiAction::RemoveFavorite(path.clone())),
+            ID_REMOVE_RECENT => out.push(UiAction::RemoveRecent(path.clone())),
+            ID_REVEAL_IN_TREE => out.push(UiAction::RevealInTree(path)),
+            _ => {}
+        }
+        out
     }
 
     /// Copy text to the clipboard (CF_UNICODETEXT).
@@ -2674,7 +2807,13 @@ impl ApplicationHandler for MainWindow {
                 && matches!(button, MouseButton::Right)
                 && matches!(state, ElementState::Pressed)
             {
-                self.show_image_context_menu((cursor.x as i32, cursor.y as i32));
+                // Phase 2: the menu now returns the chosen action (it
+                // used to be fire-and-forget). The "在目录树中定位"
+                // item pushes UiAction::RevealInTree which needs to
+                // flow through the same Vec<UiAction> path as every
+                // other control.
+                let new_actions = self.show_image_context_menu((cursor.x as i32, cursor.y as i32));
+                self.actions.extend(new_actions);
                 return;
             }
 
