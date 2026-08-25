@@ -528,6 +528,16 @@ impl MainWindow {
     }
 
     fn navigate_to_folder(&mut self, path: PathBuf) {
+        // Keep the current image + thumbnails when the target folder has
+        // no images — the viewer always reflects the displayed image's
+        // own folder.
+        if !Self::folder_has_images(&path) {
+            tracing::debug!(
+                "navigate_to_folder: {} has no images — keeping current view",
+                path.display()
+            );
+            return;
+        }
         if let Err(e) = self.nav.lock().navigate_folder(path.clone()) {
             tracing::error!("navigate_to_folder({}) failed: {:#}", path.display(), e);
             return;
@@ -1434,11 +1444,12 @@ impl MainWindow {
                     let mut expanded = std::mem::take(&mut state.expanded);
                     let reveal = state.reveal_target.take();
                     let mut revealed = false;
+                    let mut recent_scroll = state.recent_scroll_target.take();
                     let mut max_w: f32 = 0.0;
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
                             ui, root, 0, folder, &mut expanded, actions, root_idx,
-                            &reveal, &mut revealed,
+                            &reveal, &mut revealed, &mut recent_scroll,
                         ));
                     }
                     state.roots = roots;
@@ -1448,6 +1459,7 @@ impl MainWindow {
                         // retry next frame.
                         state.reveal_target = reveal;
                     }
+                    state.recent_scroll_target = recent_scroll;
                     max_w
                 }).inner
         });
@@ -1468,6 +1480,7 @@ impl MainWindow {
         root_idx: usize,
         reveal: &Option<PathBuf>,
         revealed: &mut bool,
+        recent_scroll: &mut Option<PathBuf>,
     ) -> f32 {
         // Nodes are created with `children: Some(vec![])`, so emptiness —
         // not `None` — is the "not loaded yet" signal. `loading` marks
@@ -1482,7 +1495,9 @@ impl MainWindow {
             crate::file_tree::FileTree::load_children(node);
             node.loading = true;
         }
-        let is_open = depth == 0 || expanded[root_idx].contains(&node.path);
+        // Roots (depth 0, empty path) now use the expanded set too, so
+        // their triangles collapse properly.
+        let is_open = expanded[root_idx].contains(&node.path);
         let is_current = current
             .as_ref()
             .map(|c| c == &node.path)
@@ -1521,6 +1536,12 @@ impl MainWindow {
             if is_reveal_target && !*revealed {
                 ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
                 *revealed = true;
+            }
+            // Scroll a Recent entry into view (e.g. after a This PC
+            // collapse hid the current folder).
+            if root_idx == 1 && recent_scroll.as_ref() == Some(&node.path) {
+                ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
+                *recent_scroll = None;
             }
             if resp.clicked() {
                 actions.push(UiAction::FolderChosen(path_clone.clone()));
@@ -1572,7 +1593,7 @@ impl MainWindow {
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
                             ui, child, depth + 1, current, expanded, actions, root_idx,
-                            reveal, revealed,
+                            reveal, revealed, recent_scroll,
                         );
                         max_w = max_w.max(w);
                     }
@@ -1582,14 +1603,26 @@ impl MainWindow {
                 ui.scroll_to_rect(header.header_response.rect, Some(egui::Align::Center));
                 *revealed = true;
             }
-            // Single click toggles expansion AND navigates into the folder.
-            if header.header_response.clicked() && depth > 0 {
+            // Click toggles expansion; non-root nodes also navigate.
+            if header.header_response.clicked() {
                 if is_open {
                     expanded[root_idx].remove(&path_clone);
                 } else {
                     expanded[root_idx].insert(path_clone.clone());
                 }
-                actions.push(UiAction::FolderChosen(path_clone.clone()));
+                // Collapsing an ancestor of the current folder (inside
+                // This PC) hides the current node — scroll the matching
+                // Recent entry into view so the selection keeps a home.
+                if is_open && root_idx == 2 {
+                    if let Some(cur) = current {
+                        if cur != &path_clone && cur.starts_with(&path_clone) {
+                            *recent_scroll = Some(cur.clone());
+                        }
+                    }
+                }
+                if depth > 0 {
+                    actions.push(UiAction::FolderChosen(path_clone.clone()));
+                }
             }
             // Right-click context menu: open / favorite management.
             header.header_response.context_menu(|ui| {

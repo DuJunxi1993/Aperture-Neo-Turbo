@@ -44,24 +44,29 @@ pub struct TreeTreeState {
     /// Fixed roots (Favorites, Recent, This PC).
     pub roots: Vec<TreeNode>,
     /// Currently expanded paths per root (for restore on redraw).
-    /// Index 0 = Favorites, 1 = Recent, 2 = This PC
+    /// Index 0 = Favorites, 1 = Recent, 2 = This PC. Roots themselves use
+    /// the empty path as their key (all start expanded).
     pub expanded: [std::collections::HashSet<PathBuf>; 3],
     /// When set, scroll the This PC tree to this node on the next draw
     /// (and highlight it), then clear.
     pub reveal_target: Option<PathBuf>,
+    /// When set, scroll the Recent list to this entry on the next draw,
+    /// then clear (used when a This PC collapse hides the current folder).
+    pub recent_scroll_target: Option<PathBuf>,
 }
 
 impl FileTree {
     pub fn new() -> Self {
         let mut state = TreeTreeState {
             roots: Vec::new(),
-            expanded: [
-                std::collections::HashSet::new(),
-                std::collections::HashSet::new(),
-                std::collections::HashSet::new(),
-            ],
+            expanded: [Default::default(), Default::default(), Default::default()],
             reveal_target: None,
+            recent_scroll_target: None,
         };
+        // All roots start expanded (empty path = the root's own key).
+        for set in &mut state.expanded {
+            set.insert(PathBuf::new());
+        }
 
         // Favorites - load from settings if available
         let mut fav = TreeNode::root(PathBuf::from(""), "★ Favorites");
