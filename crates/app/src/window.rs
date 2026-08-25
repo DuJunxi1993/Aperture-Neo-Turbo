@@ -850,7 +850,17 @@ impl MainWindow {
                         v
                     }
                 };
+                // Kill egui's default light-gray chrome:
+                //  * panel separators (1px line between Side/Central/TopBottom
+                //    panels) come from `noninteractive.bg_stroke` — transparent
+                //    makes panels blend seamlessly.
+                //  * `window_shadow`/`popup_shadow` give the shortcuts Window
+                //    a light halo below it.
                 visuals.window_stroke = egui::Stroke::NONE;
+                visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
+                visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+                visuals.window_shadow = egui::epaint::Shadow::NONE;
+                visuals.popup_shadow = egui::epaint::Shadow::NONE;
                 egui_state.ctx.set_visuals(visuals);
             }
 
@@ -1343,7 +1353,7 @@ impl MainWindow {
             );
         }
 
-        // Center: navigation + view controls — truly centered.
+        // Center: navigation + view controls — truly centered as a row.
         let center_rect = egui::Rect::from_center_size(bar.center(), egui::vec2(480.0, bar.height()));
         let mut center = ui.new_child(
             egui::UiBuilder::new()
@@ -1351,8 +1361,13 @@ impl MainWindow {
                 .id_salt("fs-bar-center")
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        center.centered_and_justified(|ui| {
-            Self::draw_nav_buttons(ui, actions, true, pal);
+        // `centered_and_justified` STRETCHES children (one giant button);
+        // `vertical_centered` centers the row horizontally, the inner
+        // `horizontal` lays the buttons at normal size.
+        center.vertical_centered(|ui| {
+            ui.horizontal(|ui| {
+                Self::draw_nav_buttons(ui, actions, true, pal);
+            });
         });
     }
 
@@ -2937,9 +2952,9 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
 
     // Buttons
     visuals.widgets.noninteractive.bg_fill = bg_panel;
+    // No 1px light separator between panels — panels blend seamlessly.
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_secondary);
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, border_subtle);
 
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8);
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_subtle);
@@ -2968,8 +2983,8 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     visuals.error_fg_color = egui::Color32::from_rgb(255, 90, 90);
     visuals.code_bg_color = bg_elevated;
 
-    visuals.window_shadow = egui::epaint::Shadow::default(); // off
-    visuals.popup_shadow = egui::epaint::Shadow::default();
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow::NONE;
 
     style.visuals = visuals;
 
