@@ -761,23 +761,22 @@ impl MainWindow {
             if self.is_fullscreen && self.chrome_anim > 0.02 {
                 // ----- OVERLAY CONTROL BAR (slides up from bottom) -----
                 let a = self.chrome_anim;
-                let bar_h = 60.0 * a;
+                let bar_h = 48.0 * a;
                 let resp = egui::TopBottomPanel::bottom("overlay_toolbar")
                     .frame(
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgba_unmultiplied(
                                 18, 18, 24, (235.0 * a) as u8,
                             ))
-                            .inner_margin(egui::Margin::symmetric(8.0, 8.0 * a)),
+                            .inner_margin(egui::Margin::symmetric(0.0, 8.0 * a)),
                     )
                     .exact_height(bar_h)
                     .show(&egui_state.ctx, |ui| {
                         ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                        ui.horizontal(|ui| {
-                            ui.add_space(12.0);
-                            ui.set_min_height(bar_h);
-                            Self::draw_nav_buttons(ui, &mut actions, true);
-                        });
+                        Self::draw_fullscreen_bar(
+                            ui, &mut actions, &current_path,
+                            nav_idx, nav_count2, current_size, zoom_pct,
+                        );
                     });
                 toolbar_rect = Some(resp.response.rect);
             }
@@ -1123,13 +1122,77 @@ impl MainWindow {
     }
 
     /// Fullscreen overlay control bar (auto-hides; slides up from the
-    /// bottom edge — see chrome_anim).
-    fn draw_toolbar(ui: &mut egui::Ui, actions: &mut Vec<UiAction>) {
-        ui.horizontal(|ui| {
-            ui.add_space(12.0);
-            ui.set_min_height(ui.available_height());
-            Self::draw_nav_buttons(ui, actions, true);
-        });
+    /// bottom edge — see chrome_anim). Layout: filename left, controls
+    /// centered, zoom/res + help toggle right.
+    fn draw_fullscreen_bar(
+        ui: &mut egui::Ui,
+        actions: &mut Vec<UiAction>,
+        current_path: &Option<PathBuf>,
+        nav_idx: usize,
+        nav_count: usize,
+        current_size: Option<(u32, u32)>,
+        zoom_pct: f32,
+    ) {
+        let _ = nav_count;
+        let bar = ui.max_rect();
+
+        // Left: file name.
+        let mut left = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    bar.min,
+                    egui::pos2(bar.left() + 340.0, bar.bottom()),
+                ))
+                .id_salt("fs-bar-left")
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        left.add_space(14.0);
+        let name = current_path
+            .as_ref()
+            .and_then(|p| p.file_name())
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "—".into());
+        left.label(egui::RichText::new(name).size(13.0).strong().color(egui::Color32::from_rgb(210, 214, 222)));
+
+        // Right: zoom% · resolution + "?" help toggle.
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(egui::Rect::from_min_max(
+                    egui::pos2(bar.right() - 340.0, bar.top()),
+                    bar.max,
+                ))
+                .id_salt("fs-bar-right")
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        right.add_space(10.0);
+        let q = right.add(
+            egui::Button::new(egui::RichText::new("?").size(13.0))
+                .fill(egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14))
+                .min_size(egui::vec2(32.0, 30.0))
+                .rounding(6.0),
+        ).on_hover_text("Show shortcuts (Ctrl+/)");
+        HELP_ANCHOR.with(|c| c.set(q.rect));
+        if q.clicked() {
+            actions.push(UiAction::ToggleShortcutHelp);
+        }
+        right.add_space(10.0);
+        if let Some((w, h)) = current_size {
+            right.label(
+                egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
+                    .size(12.5)
+                    .color(egui::Color32::from_rgb(150, 154, 162)),
+            );
+        }
+
+        // Center: navigation + view controls.
+        let center_rect = egui::Rect::from_center_size(bar.center(), egui::vec2(480.0, bar.height()));
+        let mut center = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(center_rect)
+                .id_salt("fs-bar-center")
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        Self::draw_nav_buttons(&mut center, actions, true);
     }
 
     /// Prev/Next (accent-tinted) + Fit / 1:1 / Fullscreen — shared by the
