@@ -1588,12 +1588,20 @@ impl MainWindow {
             .inner_margin(egui::Margin::same(10.0))
             .stroke(egui::Stroke::new(0.0, egui::Color32::TRANSPARENT));
         let inner = frame.show(ui, |ui| {
-            ui.label(
-                egui::RichText::new("FOLDERS")
-                    .size(12.0)
-                    .strong()
-                    .color(pal.text_dim),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new("FOLDERS")
+                        .size(12.0)
+                        .strong()
+                        .color(pal.text_dim),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    // One-click back-to-top for long tree lists.
+                    if ui.small_button("↑").on_hover_text("Back to top").clicked() {
+                        tree.state.lock().scroll_to_top = true;
+                    }
+                });
+            });
             ui.add_space(6.0);
 
             if let Some(p) = folder {
@@ -1621,6 +1629,13 @@ impl MainWindow {
                 .auto_shrink([false; 2])
                 .show(ui, |ui| {
                     let mut state = tree.state.lock();
+                    if state.scroll_to_top {
+                        state.scroll_to_top = false;
+                        ui.scroll_to_rect(
+                            egui::Rect::from_min_size(ui.min_rect().min, egui::Vec2::ZERO),
+                            None,
+                        );
+                    }
                     let mut roots = std::mem::take(&mut state.roots);
                     let mut expanded = std::mem::take(&mut state.expanded);
                     let reveal = state.reveal_target.take();
@@ -1890,9 +1905,19 @@ impl MainWindow {
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    // Kick off background decodes for any thumb we don't
-                    // have yet. Cheap if already requested/in-flight.
-                    for item in nav_items {
+                    // Thumbnail decode virtualization: only request decodes
+                    // for cards near the visible range (±buffer), not all
+                    // images in the folder. Cards are ~200px tall on average.
+                    let clip = ui.clip_rect();
+                    let content_top = ui.min_rect().top();
+                    let est_card: f32 = 200.0;
+                    let i0 = (((clip.top() - content_top) / est_card).floor() as usize)
+                        .saturating_sub(5);
+                    let i1 = ((((clip.top() - content_top) + clip.height()) / est_card).ceil()
+                        as usize
+                        + 10)
+                        .min(nav_items.len());
+                    for item in nav_items.get(i0..i1).unwrap_or(&[]) {
                         texture_cache.request_thumb(item.path.clone());
                     }
                     // Card width adapts to the (resizable) panel width.

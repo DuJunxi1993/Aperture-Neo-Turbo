@@ -53,6 +53,8 @@ pub struct TreeTreeState {
     /// When set, scroll the Recent list to this entry on the next draw,
     /// then clear (used when a This PC collapse hides the current folder).
     pub recent_scroll_target: Option<PathBuf>,
+    /// One-shot request to scroll the tree back to the top.
+    pub scroll_to_top: bool,
 }
 
 impl FileTree {
@@ -62,6 +64,7 @@ impl FileTree {
             expanded: [Default::default(), Default::default(), Default::default()],
             reveal_target: None,
             recent_scroll_target: None,
+            scroll_to_top: false,
         };
         // All roots start expanded (empty path = the root's own key).
         for set in &mut state.expanded {
