@@ -3336,7 +3336,11 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     visuals.extreme_bg_color = bg_hover;
 
     visuals.window_rounding = egui::Rounding::same(0.0);
-    visuals.menu_rounding = egui::Rounding::same(6.0);
+    // Phase 6: bump menu rounding 6 → 8 to match the new chip
+    // language. The default 6 read as a stock OS menu; 8 sits
+    // tighter with the panel chips and the title-bar buttons
+    // (which already use 8).
+    visuals.menu_rounding = egui::Rounding::same(8.0);
 
     // Buttons
     visuals.widgets.noninteractive.bg_fill = bg_panel;
@@ -3344,20 +3348,25 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
     visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_secondary);
 
+    // Phase 6: bump default button rounding 6 → 8 across
+    // inactive / hovered / active so every Linear-styled button
+    // matches the new chip language. Subtle but consistent — the
+    // previous 6 was visually heavy on the larger 30-px-tall
+    // title-bar / bottom-bar buttons.
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8);
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_subtle);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_secondary);
-    visuals.widgets.inactive.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12);
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_std);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary);
-    visuals.widgets.hovered.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.active.bg_fill = brand;
     visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, brand_hover);
     visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_primary);
-    visuals.widgets.active.rounding = egui::Rounding::same(6.0);
+    visuals.widgets.active.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.open.bg_fill = bg_elevated;
     visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border_std);
