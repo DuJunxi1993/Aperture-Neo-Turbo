@@ -62,8 +62,10 @@ enum UiAction {
     ToggleThumbs,
     /// User clicked a file in the thumbs panel.
     ThumbClicked(usize),
-    /// User double-clicked a folder in the tree (navigate into it).
-    FolderChosen(PathBuf),
+    /// User clicked a folder in the tree (navigate into it). The usize
+    /// is the tree root the folder was clicked in (0=Favorites,
+    /// 1=Recent, 2=This PC) — drives Ctrl+Arrow list selection.
+    FolderChosen(PathBuf, usize),
     /// Toggle the shortcut help panel.
     ToggleShortcutHelp,
     /// Toggle favorite for the current folder.
@@ -662,35 +664,31 @@ impl MainWindow {
         ((vh / card_h).floor() as usize).clamp(1, 100)
     }
 
-    /// Ctrl+Arrow: cycle among related folders.
-    /// - current folder in Recent → cycle Recent entries
-    /// - current folder in Favorites → cycle Favorites entries
-    /// - otherwise → cycle sibling folders (same parent) that contain images
+    /// Ctrl+Arrow: cycle among folders in the tree root the user last
+    /// clicked (ACTIVE_ROOT): Favorites → favorites list, Recent → recent
+    /// list, This PC → sibling folders (same parent) that contain images.
     fn handle_cycle_folder(&mut self, dir: i32) {
         let Some(cur) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
-        let Some(folder) = cur.parent().map(|p| p.to_path_buf()) else { return };
+        let folder = cur.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| cur.clone());
 
-        let recent = self.settings.recent_folders();
-        let favorites = self.settings.favorite_folders();
-
-        let (list, kind) = if recent.iter().any(|f| f == &folder) {
-            (recent, "recent")
-        } else if favorites.iter().any(|f| f == &folder) {
-            (favorites, "favorites")
-        } else {
-            // Siblings of the current folder that directly contain images.
-            let siblings = std::fs::read_dir(&folder)
-                .map(|rd| {
-                    let mut v: Vec<PathBuf> = rd
-                        .flatten()
-                        .map(|e| e.path())
-                        .filter(|p| p.is_dir() && Self::folder_has_images(p))
-                        .collect();
-                    v.sort();
-                    v
-                })
-                .unwrap_or_default();
-            (siblings, "siblings")
+        let active_root = ACTIVE_ROOT.load(std::sync::atomic::Ordering::Relaxed);
+        let (list, kind) = match active_root {
+            0 => (self.settings.favorite_folders(), "favorites"),
+            1 => (self.settings.recent_folders(), "recent"),
+            _ => {
+                let siblings = std::fs::read_dir(&folder)
+                    .map(|rd| {
+                        let mut v: Vec<PathBuf> = rd
+                            .flatten()
+                            .map(|e| e.path())
+                            .filter(|p| p.is_dir() && Self::folder_has_images(p))
+                            .collect();
+                        v.sort();
+                        v
+                    })
+                    .unwrap_or_default();
+                (siblings, "siblings")
+            }
         };
         if list.len() < 2 { return; }
         let idx = list.iter().position(|f| f == &folder).unwrap_or(0);
@@ -1682,9 +1680,12 @@ impl MainWindow {
         // Roots (depth 0, empty path) now use the expanded set too, so
         // their triangles collapse properly.
         let is_open = expanded[root_idx].contains(&node.path);
+        // Highlight only in the root the user last picked a folder from —
+        // the same path may be registered in both Recent and Favorites.
+        let active_root = ACTIVE_ROOT.load(std::sync::atomic::Ordering::Relaxed);
         let is_current = current
             .as_ref()
-            .map(|c| c == &node.path)
+            .map(|c| c == &node.path && root_idx == active_root)
             .unwrap_or(false);
         let display = node.display_name.clone();
         let path_clone = node.path.clone();
@@ -1746,7 +1747,7 @@ impl MainWindow {
                 *recent_scroll = None;
             }
             if resp.clicked() {
-                actions.push(UiAction::FolderChosen(path_clone.clone()));
+                actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
             }
             resp.context_menu(|ui| {
                 if ui.button("在资源管理器中打开").clicked() {
@@ -1754,7 +1755,7 @@ impl MainWindow {
                     ui.close_menu();
                 }
                 if ui.button("浏览图片").clicked() {
-                    actions.push(UiAction::FolderChosen(path_clone.clone()));
+                    actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
                     ui.close_menu();
                 }
                 if root_idx == 1 && ui.button("添加到收藏").clicked() {
@@ -1823,7 +1824,7 @@ impl MainWindow {
                     }
                 }
                 if depth > 0 {
-                    actions.push(UiAction::FolderChosen(path_clone.clone()));
+                    actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
                 }
             }
             // Right-click context menu: open / favorite management.
@@ -1833,7 +1834,7 @@ impl MainWindow {
                     ui.close_menu();
                 }
                 if depth > 0 && ui.button("浏览图片").clicked() {
-                    actions.push(UiAction::FolderChosen(path_clone.clone()));
+                    actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
                     ui.close_menu();
                 }
                 if depth > 0 && ui.button("添加到收藏").clicked() {
@@ -2018,7 +2019,8 @@ impl MainWindow {
                     if let Some(window) = &self.window { window.request_redraw(); }
                 }
             }
-            UiAction::FolderChosen(p) => {
+            UiAction::FolderChosen(p, root) => {
+                ACTIVE_ROOT.store(root, std::sync::atomic::Ordering::Relaxed);
                 self.navigate_to_folder(p);
             }
             UiAction::ToggleShortcutHelp => {
@@ -2044,10 +2046,7 @@ impl MainWindow {
                 self.file_tree.refresh_recent(&self.settings.recent_folders());
             }
             UiAction::RevealInExplorer(p) => {
-                use std::process::Command;
-                // Open the folder itself in Explorer (not /select, which
-                // opens the PARENT and selects the folder).
-                let _ = Command::new("explorer").arg(&p).spawn();
+                self.reveal_in_explorer(&p);
             }
             UiAction::BrowseFolder(p) => {
                 self.navigate_to_folder(p);
@@ -2087,7 +2086,7 @@ impl MainWindow {
             UiAction::OpenInExplorer => {
                 if let Some(current) = self.nav.lock().current() {
                     let path = current.path.clone();
-                    self.open_in_explorer(path);
+                    self.reveal_in_explorer(&path);
                 }
             }
         }
@@ -2170,14 +2169,19 @@ impl MainWindow {
         }
     }
 
-    /// Open the folder containing the current image in Windows Explorer
-    /// (with the image file selected).
-    fn open_in_explorer(&self, path: PathBuf) {
+    /// Reveal a path in Windows Explorer — the SINGLE shared behavior for
+    /// every "open in explorer" entry point (Ctrl+E, context menus):
+    /// directories open directly; files open with the file selected.
+    fn reveal_in_explorer(&self, path: &Path) {
         use std::process::Command;
-        // "/select,<path>" must be a SINGLE argument.
-        let _ = Command::new("explorer")
-            .arg(format!("/select,{}", path.display()))
-            .spawn();
+        if path.is_dir() {
+            let _ = Command::new("explorer").arg(path).spawn();
+        } else {
+            // "/select,<path>" must be a SINGLE argument.
+            let _ = Command::new("explorer")
+                .arg(format!("/select,{}", path.display()))
+                .spawn();
+        }
     }
 
     /// True when the folder directly contains at least one supported image.
@@ -2247,7 +2251,7 @@ impl MainWindow {
             let cmd = (ret.0 & 0xFFFF) as u32;
             match cmd {
                 1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
-                2 => self.open_in_explorer(current),
+                2 => self.reveal_in_explorer(&current),
                 3 => self.print_image(current),
                 4 => self.set_wallpaper(current),
                 _ => {} // dismissed
@@ -2700,6 +2704,9 @@ static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Mirrors MainWindow.is_fullscreen for the resize hook.
 pub static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+/// Which tree root the user last selected a folder in (0/1/2) —
+/// controls Ctrl+Arrow cycling and the single-highlight behavior.
+pub static ACTIVE_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
 
 unsafe extern "system" fn resize_hook_proc(
     hwnd: HWND,

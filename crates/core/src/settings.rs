@@ -85,14 +85,17 @@ impl SettingsStore {
         self.data.lock().recent_folders.clone()
     }
 
-    /// Add a folder to the recents list (dedup, most-recent-first, cap 10).
+    /// Add a folder to the recents list. New folders go to the front;
+    /// already-listed folders KEEP their position — reordering on every
+    /// visit broke stable Ctrl+Arrow cycling.
     pub fn push_recent_folder(&self, folder: PathBuf) {
         let mut d = self.data.lock();
-        d.recent_folders.retain(|f| f != &folder);
-        d.recent_folders.insert(0, folder);
-        d.recent_folders.truncate(10);
-        drop(d);
-        let _ = self.save();
+        if !d.recent_folders.contains(&folder) {
+            d.recent_folders.insert(0, folder);
+            d.recent_folders.truncate(10);
+            drop(d);
+            let _ = self.save();
+        }
     }
 
     /// Remove a folder from the recents list.
