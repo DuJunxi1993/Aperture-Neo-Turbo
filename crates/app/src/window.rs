@@ -43,7 +43,7 @@ use crate::event_router::{self, RouterState};
 const TREE_WIDTH: u32 = 240;
 const THUMB_WIDTH: u32 = 220;
 const TOOLBAR_HEIGHT: u32 = 40;
-const STATUS_BAR_HEIGHT: u32 = 44;
+const STATUS_BAR_HEIGHT: u32 = 48;
 /// Default initial size (logical). Picked to fit a 1280×800 logical screen
 /// after subtracting chrome (toolbar 36 + status 24 + panel widths 240+220).
 const DEFAULT_W: u32 = 1280;
@@ -899,7 +899,8 @@ impl MainWindow {
                     .frame(
                         egui::Frame::default()
                             .fill(egui::Color32::from_rgba_unmultiplied(
-                                18, 18, 24, (235.0 * a) as u8,
+                                pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
+                                (235.0 * a) as u8,
                             ))
                             .inner_margin(egui::Margin::symmetric(0.0, 8.0 * a)),
                     )
@@ -1006,6 +1007,16 @@ impl MainWindow {
                 let help_resp = egui::Window::new(
                     egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
                 )
+                // No default shadow/fill — the gray halo around the window
+                // read as a stray background block on both themes.
+                .frame(
+                    egui::Frame::default()
+                        .fill(pal.panel_bg)
+                        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                        .rounding(8.0)
+                        .inner_margin(egui::Margin::same(12.0))
+                        .shadow(egui::Shadow::NONE),
+                )
                 .fixed_pos(anchor_pos)
                 .pivot(egui::Align2::RIGHT_BOTTOM)
                 .resizable(false)
@@ -1075,13 +1086,16 @@ impl MainWindow {
             }
 
             // ----- STATUS BAR -----
+            // Same three-zone layout as the fullscreen bar (filename left /
+            // controls center / info + help right) for a consistent UI.
             if !self.is_fullscreen {
                 egui::TopBottomPanel::bottom("statusbar")
                     .exact_height(STATUS_BAR_HEIGHT as f32)
                     .show(&egui_state.ctx, |ui| {
-                        Self::draw_status_bar(
-                            ui, &current_path, nav_idx, nav_count2,
-                            current_size, zoom_pct, &mut actions, &pal,
+                        Self::draw_fullscreen_bar(
+                            ui, &mut actions, &current_path,
+                            nav_idx, nav_count2, current_size, zoom_pct,
+                            &pal,
                         );
                     });
             }
@@ -1273,13 +1287,16 @@ impl MainWindow {
     ) {
         let _ = nav_count;
         let bar = ui.max_rect();
+        // Side regions shrink on narrow windows so the three zones never
+        // overlap; the center keeps the controls truly centered.
+        let side_w = ((bar.width() - 480.0) / 2.0).clamp(120.0, 340.0);
 
         // Left: file name.
         let mut left = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(egui::Rect::from_min_max(
                     bar.min,
-                    egui::pos2(bar.left() + 340.0, bar.bottom()),
+                    egui::pos2(bar.left() + side_w, bar.bottom()),
                 ))
                 .id_salt("fs-bar-left")
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
@@ -1290,13 +1307,18 @@ impl MainWindow {
             .and_then(|p| p.file_name())
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "—".into());
-        left.label(egui::RichText::new(name).size(13.0).strong().color(pal.text_secondary));
+        left.add(
+            egui::Label::new(
+                egui::RichText::new(name).size(13.0).strong().color(pal.text_secondary),
+            )
+            .truncate(),
+        );
 
         // Right: zoom% · resolution + "?" help toggle.
         let mut right = ui.new_child(
             egui::UiBuilder::new()
                 .max_rect(egui::Rect::from_min_max(
-                    egui::pos2(bar.right() - 340.0, bar.top()),
+                    egui::pos2(bar.right() - side_w, bar.top()),
                     bar.max,
                 ))
                 .id_salt("fs-bar-right")
@@ -1306,6 +1328,7 @@ impl MainWindow {
         let q = right.add(
             egui::Button::new(egui::RichText::new("?").size(13.0))
                 .fill(pal.button_fill)
+                .stroke(egui::Stroke::new(1.0, pal.card_stroke))
                 .min_size(egui::vec2(32.0, 30.0))
                 .rounding(6.0),
         ).on_hover_text("Show shortcuts (Ctrl+/)");
@@ -1322,7 +1345,7 @@ impl MainWindow {
             );
         }
 
-        // Center: navigation + view controls.
+        // Center: navigation + view controls — truly centered.
         let center_rect = egui::Rect::from_center_size(bar.center(), egui::vec2(480.0, bar.height()));
         let mut center = ui.new_child(
             egui::UiBuilder::new()
@@ -1330,7 +1353,9 @@ impl MainWindow {
                 .id_salt("fs-bar-center")
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
-        Self::draw_nav_buttons(&mut center, actions, true, pal);
+        center.centered_and_justified(|ui| {
+            Self::draw_nav_buttons(ui, actions, true, pal);
+        });
     }
 
     /// Prev/Next (accent-tinted) + Fit / 1:1 / Fullscreen — shared by the
@@ -1953,71 +1978,6 @@ impl MainWindow {
                         ui.add_space(6.0);
                     }
                 });
-        });
-    }
-
-    fn draw_status_bar(
-        ui: &mut egui::Ui,
-        current_path: &Option<PathBuf>,
-        nav_idx: usize,
-        nav_count: usize,
-        current_size: Option<(u32, u32)>,
-        zoom_pct: f32,
-        actions: &mut Vec<UiAction>,
-        pal: &Palette,
-    ) {        // Transparent, borderless — blends seamlessly with the side panels
-        // (no visible seams at the tree/thumbs boundaries).
-        let frame = egui::Frame::default()
-            .fill(pal.panel_bg)
-            .inner_margin(egui::Margin::symmetric(10.0, 5.0));
-        frame.show(ui, |ui| {
-            ui.spacing_mut().item_spacing.x = 10.0;
-            // Horizontal wrapper REQUIRED: the bottom panel's default
-            // content layout is top_down, which would stack the buttons
-            // vertically and clip everything after the first.
-            ui.horizontal(|ui| {
-                // Left: navigation + view controls.
-                Self::draw_nav_buttons(ui, actions, false, pal);
-
-                // Right: "?" help toggle (anchoring point for the popover).
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let q = ui.add(
-                        egui::Button::new(egui::RichText::new("?").size(13.0))
-                            .fill(pal.button_fill)
-                            .min_size(egui::vec2(32.0, 30.0))
-                            .rounding(6.0),
-                    ).on_hover_text("Show shortcuts (Ctrl+/)");
-                    HELP_ANCHOR.with(|c| c.set(q.rect));
-                    if q.clicked() {
-                        actions.push(UiAction::ToggleShortcutHelp);
-                    }
-                });
-
-                // Center: image info (absolute — always truly centered).
-                let name = current_path
-                    .as_ref()
-                    .and_then(|p| p.file_name())
-                    .map(|n| n.to_string_lossy().into_owned())
-                    .unwrap_or_else(|| "—".into());
-                let dims = current_size
-                    .map(|(w, h)| format!(" · {}x{}", w, h))
-                    .unwrap_or_default();
-                let info = if nav_count == 0 {
-                    "No images".to_string()
-                } else {
-                    format!(
-                        "{}/{}  {}{}  ·  {:.0}%",
-                        nav_idx + 1, nav_count, name, dims, zoom_pct
-                    )
-                };
-                ui.painter().text(
-                    ui.max_rect().center(),
-                    egui::Align2::CENTER_CENTER,
-                    info,
-                    egui::FontId::proportional(13.0),
-                    pal.text_secondary,
-                );
-            });
         });
     }
 
