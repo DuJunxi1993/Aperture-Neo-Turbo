@@ -47,6 +47,12 @@ pub struct Direct2DViewer {
     /// Captured image rect before a viewport change (fullscreen toggle) —
     /// the "from" of the transition once the new viewport arrives.
     pending_viewport_anim_from: Option<(f32, f32, f32, f32)>,
+    /// Phase 3: image rotation in quarter-turns (0 / 1 / 2 / 3 =
+    /// 0° / 90° / 180° / 270° clockwise). Stored as an integer so
+    /// round-tripping through set_image (which resets to 0) is
+    /// lossless; the actual transform is `rotation * 90°` degrees.
+    /// NOT persisted across images (each new image starts at 0).
+    rotation: u8,
 }
 
 /// Screen-rect transition between two on-screen image rectangles.
@@ -83,10 +89,15 @@ impl Direct2DViewer {
             bg: [0.059, 0.063, 0.067],
             rect_anim: None,
             pending_viewport_anim_from: None,
+            rotation: 0,
         }
     }
 
     pub fn set_image(&mut self, bitmap: DecodedBitmap, direction: SlideDir) {
+        // Phase 3: every new image starts unrotated. Persisted
+        // rotation across images was an explicit design choice —
+        // most image viewers reset on navigate-next.
+        self.rotation = 0;
         self.slide_dir = direction;
         // Capture the outgoing image with its OWN fit transform before we
         // recompute for the incoming one — both images slide in parallel,
@@ -105,6 +116,39 @@ impl Direct2DViewer {
         } else {
             self.previous = None;
             self.animator.reset();
+        }
+    }
+
+    /// Phase 3: build a transform that rotates the current image
+    /// by `rotation * 90°` clockwise around the image's
+    /// pre-rotation centre. Combined with the existing fit/zoom
+    /// transform via multiplication so the math composes cleanly.
+    /// For `rotation == 0` the transform is identity.
+    fn rotation_transform(&self) -> AffineTransform {
+        if self.rotation == 0 {
+            return AffineTransform::identity();
+        }
+        // The image's screen-space centre (pre-rotation) is the
+        // rotation pivot. With the current fit transform: image is
+        // drawn at (offset_x, offset_y) with size (w*zoom, h*zoom),
+        // so its centre is (offset_x + w*zoom/2, offset_y + h*zoom/2).
+        let bmp = match &self.current {
+            Some(b) => b,
+            None => return AffineTransform::identity(),
+        };
+        let w = bmp.width as f32;
+        let h = bmp.height as f32;
+        let cx = self.offset_x + w * self.zoom * 0.5;
+        let cy = self.offset_y + h * self.zoom * 0.5;
+        let angle = self.rotation as f32 * std::f32::consts::FRAC_PI_2;
+        // AffineTransform is 2x3 (no separate Translate/Rotate helpers),
+        // so build it directly: T(cx,cy) * R(angle) * T(-cx,-cy).
+        let (s, c) = angle.sin_cos();
+        AffineTransform {
+            m11: c, m12: s,
+            m21: -s, m22: c,
+            dx: cx - c * cx + s * cy,
+            dy: cy - s * cx - c * cy,
         }
     }
 
@@ -207,6 +251,14 @@ impl Direct2DViewer {
                     )
                 };
                 let t = base.mul(cur_t);
+                // Phase 3: rotate the current image around its
+                // pre-rotation centre. The rotation is composed
+                // AFTER the fit/zoom transform so it rotates
+                // the already-fitted image, then multiplies with
+                // the STRETCH pre-compensation base. Identity for
+                // rotation == 0 so the common case is a no-op.
+                let r = self.rotation_transform();
+                let t = r.mul(t);
                 self.draw_bitmap_with_transform(&cur.d2d_bitmap, &t);
             }
 
@@ -393,4 +445,25 @@ impl Direct2DViewer {
     pub fn viewport_size(&self) -> (u32, u32) { (self.viewport_w, self.viewport_h) }
     pub fn zoom_value(&self) -> f32 { self.zoom }
     pub fn offset(&self) -> (f32, f32) { (self.offset_x, self.offset_y) }
+
+    /// Phase 3: read the current rotation in quarter-turns.
+    pub fn rotation(&self) -> u8 { self.rotation }
+
+    /// Phase 3: set the rotation in quarter-turns (0..=3). The
+    /// rotation is not animated — the next fit_to_screen() call
+    /// (triggered right after) runs the existing 180ms smoothstep
+    /// fit anim, which reads as the image "snapping to the new
+    /// orientation with a brief ease". Persists only until the
+    /// next set_image (which resets to 0).
+    pub fn set_rotation(&mut self, q: u8) {
+        self.rotation = q & 3;
+        self.fit_to_screen();
+    }
+
+    /// Phase 3: true when the current zoom is within 1% of the
+    /// auto-fit scale. Drives the fit↔1:1 cycle button label /
+    /// behaviour.
+    pub fn is_fit_scale(&self) -> bool {
+        (self.zoom - self.fit_scale).abs() < 0.01
+    }
 }

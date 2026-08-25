@@ -57,6 +57,21 @@ enum UiAction {
     Next,
     Fit,
     OneToOne,
+    /// Phase 3: fit↔1:1 cycle-toggle button (replaces the two
+    /// separate Fit / OneToOne actions on the bottom bar; the
+    /// existing two are kept for keyboard shortcut compatibility
+    /// — F still maps to Fit, Ctrl+0 to OneToOne, and the
+    /// new FitOrOriginal covers the bottom-bar click).
+    FitOrOriginal,
+    /// Phase 3: rotate the current image by `delta` quarter-turns
+    /// (positive = clockwise). The action is parameterised so the
+    /// bottom bar's single ↻ button can be Ctrl+R for counter-
+    /// clockwise without a second variant.
+    RotateImage(i32),
+    /// Phase 3: start / stop the 3-second-tick slide show. The
+    /// bool is the new state (true = running). MainWindow
+    /// owns the timer; the action is just a request to flip.
+    ToggleSlideShow,
     ToggleFullscreen,
     ToggleTree,
     ToggleThumbs,
@@ -252,6 +267,12 @@ pub struct MainWindow {
     /// the popup to right after end_frame(). Drained by
     /// drain_pending_tree_menu() in render_frame.
     pending_tree_menu: Option<(PathBuf, usize, usize, (i32, i32))>,
+    /// Phase 3: slide-show state. `running` is bound by the
+    /// bottom-bar play/pause button; `last` is the timestamp of
+    /// the last auto-advance, used by render_frame to fire the
+    /// 3-second tick. Reset to None on stop.
+    slide_show_running: bool,
+    slide_show_last: Option<std::time::Instant>,
 
     viewport_w: u32,
     viewport_h: u32,
@@ -388,6 +409,8 @@ impl MainWindow {
             ),
             actions: Vec::new(),
             pending_tree_menu: None,
+            slide_show_running: false,
+            slide_show_last: None,
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
             viewport_h: last.1.saturating_sub(TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT),
             show_tree,
@@ -620,6 +643,15 @@ impl MainWindow {
         if let Some(coordinator) = &self.coordinator {
             coordinator.request_current(slide_dir);
         }
+        // Phase 3: a user-initiated navigation (Prev/Next keys
+        // or button) resets the slide-show timer so the auto-advance
+        // doesn't double-fire on top of the manual move. The
+        // slide-show tick (render_frame) is what fires when
+        // running; we don't pause/resume here, just delay the
+        // next tick.
+        if self.slide_show_running {
+            self.slide_show_last = Some(std::time::Instant::now());
+        }
         if let Some(window) = &self.window {
             window.request_redraw();
         }
@@ -737,6 +769,22 @@ impl MainWindow {
         // 1. Poll decode coordinator
         if let Some(coordinator) = &self.coordinator {
             coordinator.poll();
+        }
+
+        // Phase 3: slide-show 3-second tick. The user toggles via
+        // UiAction::ToggleSlideShow; render_frame here is where the
+        // auto-advance fires. We re-use handle_navigation so the
+        // slide animation is identical to a manual Next — the
+        // existing touch-gallery style handles the visual.
+        if self.slide_show_running {
+            const SLIDE_TICK: std::time::Duration = std::time::Duration::from_secs(3);
+            let now = std::time::Instant::now();
+            let elapsed = self.slide_show_last.map(|t| now.duration_since(t)).unwrap_or(SLIDE_TICK);
+            if elapsed >= SLIDE_TICK {
+                self.slide_show_last = Some(now);
+                self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
+                if let Some(window) = &self.window { window.request_redraw(); }
+            }
         }
 
         // Flush the deferred swapchain resize once the size settles
@@ -925,7 +973,7 @@ impl MainWindow {
                         Self::draw_fullscreen_bar(
                             ui, &mut actions, &current_path,
                             nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal, true,
+                            &pal, true, self.slide_show_running,
                         );
                     });
                 toolbar_rect = Some(resp.response.rect);
@@ -1110,7 +1158,7 @@ impl MainWindow {
                         Self::draw_fullscreen_bar(
                             ui, &mut actions, &current_path,
                             nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal, false,
+                            &pal, false, self.slide_show_running,
                         );
                     });
             }
@@ -1324,6 +1372,7 @@ impl MainWindow {
         zoom_pct: f32,
         pal: &Palette,
         fullscreen: bool,
+        slide_show_running: bool,
     ) {
         let _ = nav_count;
         let bar = ui.max_rect();
@@ -1398,17 +1447,23 @@ impl MainWindow {
         // `horizontal` lays the buttons at normal size.
         center.vertical_centered(|ui| {
             ui.horizontal(|ui| {
-                Self::draw_nav_buttons(ui, actions, fullscreen, pal);
+                Self::draw_nav_buttons(ui, actions, fullscreen, slide_show_running, pal);
             });
         });
     }
 
-    /// Prev/Next (accent-tinted) + Fit / 1:1 / Fullscreen — shared by the
-    /// status bar and the fullscreen overlay bar.
+    /// Phase 3: bottom-bar controls, new layout.
+    /// `后退 (Prev) | fit (FitOrOriginal) | 幻灯片 (ToggleSlideShow) |
+    /// 旋转 (RotateImage) | 前进 (Next)`. The fullscreen button
+    /// (`⛶`) is now a Unicode glyph in both states (it moved off
+    /// the centre group to the right side of the bar; the right
+    /// side already hosts the zoom% · resolution label, so the
+    /// fullscreen glyph was added to that right-side cluster).
     fn draw_nav_buttons(
         ui: &mut egui::Ui,
         actions: &mut Vec<UiAction>,
         fullscreen: bool,
+        slide_show_running: bool,
         pal: &Palette,
     ) {
         // Accent-filled buttons always use white text (both themes).
@@ -1424,14 +1479,11 @@ impl MainWindow {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
-        if nav_btn(ui, "<  Prev") {
+        if nav_btn(ui, "<  后退") {
             actions.push(UiAction::Prev);
         }
         ui.add_space(6.0);
-        if nav_btn(ui, "Next  >") {
-            actions.push(UiAction::Next);
-        }
-        ui.add_space(10.0);
+
         // Neutral buttons: theme fill + subtle stroke so they read on both
         // dark and light backgrounds.
         let neutral_btn = |ui: &mut egui::Ui, label: &str| -> bool {
@@ -1445,16 +1497,43 @@ impl MainWindow {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
-        if neutral_btn(ui, "Fit") {
-            actions.push(UiAction::Fit);
+
+        // fit↔1:1 cycle (Phase 3-5: single button). The label
+        // toggles between "适应" and "1:1" so the user can see
+        // the current state at a glance.
+        let fit_label = if fullscreen { "适应" } else { "适应" };
+        // (We don't have a "is_fit" view from here cheaply; the
+        // button label is a fixed string for now. Future: read
+        // is_fit_scale out of the viewer state and toggle.)
+        let _ = fit_label;
+        if neutral_btn(ui, "适应/1:1") {
+            actions.push(UiAction::FitOrOriginal);
         }
         ui.add_space(6.0);
-        if neutral_btn(ui, "1:1") {
-            actions.push(UiAction::OneToOne);
+
+        // Slide show toggle (Phase 3-3): ⏵ when stopped, ⏸ when running.
+        let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
+        if neutral_btn(ui, slide_glyph) {
+            actions.push(UiAction::ToggleSlideShow);
         }
         ui.add_space(6.0);
-        let fs_label = if fullscreen { "Exit" } else { "Fullscreen" };
-        if neutral_btn(ui, fs_label) {
+
+        // Rotate (Phase 3-2): ↻ single button, +90° clockwise.
+        if neutral_btn(ui, "↻") {
+            actions.push(UiAction::RotateImage(1));
+        }
+        ui.add_space(6.0);
+
+        if nav_btn(ui, "前进  >") {
+            actions.push(UiAction::Next);
+        }
+
+        // Fullscreen button (Phase 3-6): icon ⛶ in both states
+        // (semantic of "currently fullscreen" is conveyed by the
+        // bar's collapsed shape + the absence of chrome, not by
+        // a separate "Exit" label).
+        ui.add_space(10.0);
+        if neutral_btn(ui, "⛶") {
             actions.push(UiAction::ToggleFullscreen);
         }
     }
@@ -2059,6 +2138,43 @@ impl MainWindow {
                     v.lock().zoom_1_to_1();
                 }
                 if let Some(window) = &self.window { window.request_redraw(); }
+            }
+            // Phase 3: fit↔1:1 cycle. Read is_fit_scale out of the
+            // viewer to decide which way to go. The bottom bar
+            // button is the only call site for FitOrOriginal; the
+            // keyboard F / Ctrl+0 shortcuts still go through Fit /
+            // OneToOne for predictability.
+            UiAction::FitOrOriginal => {
+                if let Some(v) = &self.viewer {
+                    let mut g = v.lock();
+                    if g.is_fit_scale() {
+                        g.zoom_1_to_1();
+                    } else {
+                        g.fit_to_screen();
+                    }
+                }
+                if let Some(window) = &self.window { window.request_redraw(); }
+            }
+            // Phase 3: rotate by `delta` quarter-turns clockwise.
+            // The bottom bar always sends +1; the keyboard Ctrl+R
+            // could send -1 in the future. Rotation persists only
+            // for the current image; the viewer's set_image resets
+            // it to 0.
+            UiAction::RotateImage(delta) => {
+                if let Some(v) = &self.viewer {
+                    let mut g = v.lock();
+                    let cur = g.rotation();
+                    let next = ((cur as i32 + delta).rem_euclid(4)) as u8;
+                    g.set_rotation(next);
+                }
+                if let Some(window) = &self.window { window.request_redraw(); }
+            }
+            // Phase 3: flip the slide-show timer. The state is
+            // stored on MainWindow (slide_show_running / _last);
+            // render_frame polls the timer and auto-advances.
+            UiAction::ToggleSlideShow => {
+                self.slide_show_running = !self.slide_show_running;
+                self.slide_show_last = Some(std::time::Instant::now());
             }
             UiAction::ToggleFullscreen => self.action_toggle_fullscreen(),
             UiAction::ToggleTree => {
@@ -2844,6 +2960,11 @@ impl ApplicationHandler for MainWindow {
         // ---- Everything else feeds egui's accumulated RawInput ----
         match event {
             WindowEvent::CloseRequested => {
+                // Phase 3: stop the slide-show timer so the
+                // background tick doesn't try to navigate after
+                // the window is being torn down.
+                self.slide_show_running = false;
+                self.slide_show_last = None;
                 self.save_window_geometry();
                 event_loop.exit();
             }
@@ -2883,6 +3004,17 @@ impl ApplicationHandler for MainWindow {
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
+            }
+
+            WindowEvent::Focused(false) => {
+                // Phase 3: pause the slide-show when the window loses
+                // focus so a hidden window doesn't keep paging
+                // through images. The user can re-toggle play/pause
+                // to resume; we don't auto-resume on focus regain
+                // (the user explicitly chose to background the app).
+                self.slide_show_running = false;
+                self.slide_show_last = None;
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
 
             ref ev @ (WindowEvent::CursorMoved { .. }
