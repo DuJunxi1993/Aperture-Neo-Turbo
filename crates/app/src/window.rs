@@ -1383,19 +1383,41 @@ impl MainWindow {
                 let current_path = self.nav.lock().current().map(|i| i.path.clone());
                 let mut out: Vec<UiAction> = Vec::new();
 
-                // Phase 10: menu row styled after the Aperture Neo main
-                // project's context menu (reference screenshot): full-width
-                // 30px rows, 13px left-aligned label, 6px-rounded hover
-                // wash, red destructive item, no separators — grouping
-                // reads through spacing alone. Auto height (min_width
-                // only) so the window hugs its content.
+                // Phase 12: shared menu width = the longest label across
+                // both menus ("在资源管理器中打开" dominates) measured
+                // through the font system + horizontal padding. Rows take
+                // this as an EXPLICIT width — the previous
+                // `ui.available_width()` resolved against the window's
+                // unconstrained first-pass rect and blew the menu up to
+                // ~2x the text width (set_min_width is a floor, not a
+                // ceiling).
+                let label_font = egui::FontId::proportional(13.0);
+                let all_labels = [
+                    "复制图片路径",
+                    "在资源管理器中打开",
+                    "打印",
+                    "设为桌面壁纸",
+                    "在目录树中定位",
+                    "浏览图片",
+                    "添加到收藏",
+                    "取消收藏",
+                    "从 Recent 移除",
+                ];
+                let menu_w = all_labels.iter()
+                    .map(|l| ctx.fonts(|f|
+                        f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
+                    .fold(0.0f32, f32::max)
+                    + 28.0; // row padding (10 left + ~4 right) + frame margins
+                // Content width inside the frame's 4px inner + 2px outer
+                // margins (12 total horizontal).
+                let row_w = menu_w - 12.0;
                 let mut row = |ui: &mut egui::Ui,
                                label: &str,
                                enabled: bool,
                                destructive: bool|
                     -> bool {
                     let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(ui.available_width(), 30.0),
+                        egui::vec2(row_w, 30.0),
                         egui::Sense::click(),
                     );
                     if resp.hovered() && enabled {
@@ -1421,24 +1443,7 @@ impl MainWindow {
 
                 // --- Image right-click popup ---
                 if let Some(initial_pos) = self.image_ctx_menu {
-                    // Phase 12: width fits the longest label (measured
-                    // through the font system) + horizontal padding —
-                    // the previous hardcoded 190px left a wide dead
-                    // strip on the right of short menus.
                     const EST_H: f32 = 190.0;
-                    let label_font = egui::FontId::proportional(13.0);
-                    let image_labels = [
-                        "复制图片路径",
-                        "在资源管理器中打开",
-                        "打印",
-                        "设为桌面壁纸",
-                        "在目录树中定位",
-                    ];
-                    let menu_w = image_labels.iter()
-                        .map(|l| ctx.fonts(|f|
-                            f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
-                        .fold(0.0f32, f32::max)
-                        + 28.0; // row padding (10 left + ~4 right) + frame margins
                     let pos = edge_clamp(initial_pos, screen, menu_w, EST_H);
                     let mut close = false;
 
@@ -1508,24 +1513,7 @@ impl MainWindow {
                 }
                 // --- Tree right-click popup ---
                 if let Some(menu) = self.tree_ctx_menu.clone() {
-                    // Phase 12: measured width (superset of all item
-                    // labels — items shown vary by root/depth, sizing to
-                    // the widest keeps every variant identical).
                     const EST_H: f32 = 210.0;
-                    let label_font = egui::FontId::proportional(13.0);
-                    let tree_labels = [
-                        "在资源管理器中打开",
-                        "浏览图片",
-                        "添加到收藏",
-                        "取消收藏",
-                        "从 Recent 移除",
-                        "在目录树中定位",
-                    ];
-                    let menu_w = tree_labels.iter()
-                        .map(|l| ctx.fonts(|f|
-                            f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
-                        .fold(0.0f32, f32::max)
-                        + 28.0;
                     let pos = edge_clamp(menu.pos, screen, menu_w, EST_H);
 
                     let mut close = false;
@@ -2687,22 +2675,16 @@ impl MainWindow {
         unsafe {
             let full = CreateRectRgn(0, 0, cw, ch);
             for r in rects {
-                // Phase 11: padding 10px → 1px. The old 10px ring showed
-                // the wgpu surface's canvas-clear color around the menu,
-                // reading as a light halo over images (the popover's own
-                // frame now covers its outer 2px via outer_margin, so 1px
-                // of canvas is all that remains — imperceptible).
-                let hl = ((r.min.x - 1.0) * ppp - cx).round() as i32;
-                let ht = ((r.min.y - 1.0) * ppp - cy).round() as i32;
-                let hr = ((r.max.x + 1.0) * ppp - cx).round() as i32;
-                let hb = ((r.max.y + 1.0) * ppp - cy).round() as i32;
-                // Phase 12: ROUNDED hole. The menus have 8px-rounded
-                // corners; a rectangular hole exposed the four corners
-                // outside the menu's rounding, showing canvas-clear
-                // slivers that read as a halo no matter how tight the
-                // rect got. CreateRoundRectRgn matches the menu's shape
-                // (8 logical px + 1 for the expand, scaled to physical).
-                let radius = (9.0 * ppp).round() as i32;
+                // Phase 12: hole hugs the menu — expand by exactly ONE
+                // PHYSICAL pixel (the previous 1 LOGICAL px was 1.25
+                // physical at 125% DPI, a visible ring), and the corner
+                // radius matches the menu's 8 logical px rounding
+                // exactly (the previous 9 left the corners proud).
+                let hl = ((r.min.x * ppp) - cx).round() as i32 - 1;
+                let ht = ((r.min.y * ppp) - cy).round() as i32 - 1;
+                let hr = ((r.max.x * ppp) - cx).round() as i32 + 1;
+                let hb = ((r.max.y * ppp) - cy).round() as i32 + 1;
+                let radius = (8.0 * ppp).round() as i32;
                 let hole = CreateRoundRectRgn(hl, ht, hr, hb, radius, radius);
                 CombineRgn(full, full, hole, RGN_DIFF);
             }
