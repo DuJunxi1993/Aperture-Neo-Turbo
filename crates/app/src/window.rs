@@ -1120,8 +1120,16 @@ impl MainWindow {
             // Widths ease toward their targets (macOS sidebar animation);
             // the tree's content minimum is measured while drawing so the
             // panel widens for deep folders and shrinks back on collapse.
+            // Phase 12: widths are snapped to WHOLE physical pixels
+            // (round(anim*ppp)/ppp) before feeding egui — the D2D child
+            // is positioned at round(anim*ppp), so a fractional logical
+            // width left a 1px column of canvas showing between panel
+            // and viewer (the gray seam near the bottom bar).
+            let ppp_snap = ppp.max(0.1);
             let tree_anim = self.tree_panel.tick(self.show_tree && !self.is_fullscreen, dt);
             let thumb_anim = self.thumb_panel.tick(self.show_thumbs && !self.is_fullscreen, dt);
+            let tree_anim = (tree_anim * ppp_snap).round() / ppp_snap;
+            let thumb_anim = (thumb_anim * ppp_snap).round() / ppp_snap;
 
             // We collect any tree/thumb actions into a fresh Vec that the
             // outer scope owns. The draw helpers take &mut Vec<UiAction>
@@ -1191,6 +1199,43 @@ impl MainWindow {
             }
             // Merge side panel actions into the main queue.
             actions.extend(side_actions);
+
+            // Phase 12: belt-and-braces seam fill — paint a 1px column
+            // of panel_bg over the panel↔viewer boundaries so no canvas
+            // color can ever show through a rounding gap (the visible
+            // gray line near the bottom bar). No-op in fullscreen
+            // (panels hidden, no seams).
+            if !self.is_fullscreen {
+                let seam = egui_state.ctx.layer_painter(egui::LayerId::new(
+                    egui::Order::Middle,
+                    egui::Id::new(0x5EAF),
+                ));
+                let screen = egui_state.ctx.input(|i| i.screen_rect);
+                let top = TOOLBAR_HEIGHT as f32;
+                let bottom = screen.bottom() - STATUS_BAR_HEIGHT as f32;
+                if self.show_tree && self.tree_rect_phys.2 > 0.0 {
+                    let x = (self.tree_rect_phys.0 + self.tree_rect_phys.2) / ppp;
+                    seam.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x, top),
+                            egui::pos2(x + 1.0, bottom),
+                        ),
+                        0.0,
+                        pal.panel_bg,
+                    );
+                }
+                if self.show_thumbs && self.thumb_rect_phys.2 > 0.0 {
+                    let x = self.thumb_rect_phys.0 / ppp;
+                    seam.rect_filled(
+                        egui::Rect::from_min_max(
+                            egui::pos2(x - 1.0, top),
+                            egui::pos2(x, bottom),
+                        ),
+                        0.0,
+                        pal.panel_bg,
+                    );
+                }
+            }
 
             // Phase 7 修复: 之前 D2D viewer 只在 ToggleTree/ToggleThumbs
             // action 触发的 relayout_viewer() 里 resize 一次。tree_panel
