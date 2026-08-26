@@ -372,9 +372,27 @@ impl Direct2DViewer {
 
     /// Capture the current image rect as the "from" of an upcoming
     /// viewport transition (fullscreen toggle).
+    ///
+    /// Phase 7 修复: 之前 capture 的是屏幕坐标
+    /// `(viewport_origin.x + offset_x, ...)`。但 resize() 之后
+    /// viewport_origin 变成新值（例如全屏时变成 (0, 0)），而
+    /// `from` 还保留着旧值。render 里的插值是
+    /// `r.0 - viewport_origin.0`（新的 origin），所以 t=0 时
+    /// 图片出现在 `old_origin.x + old_offset - new_origin.x`
+    /// 位置 — 在全屏情况下是 `0 + 240 - 0 = 240`（windowed
+    /// 模式下的 x），然后插值到全屏居中位置 ~660，看起来图片
+    /// "向右弹"。
+    ///
+    /// 修复: 直接 capture 视口相对坐标（去掉 viewport_origin），
+    /// 渲染端的 `r.0 - viewport_origin.0` 就始终正确。
     pub fn mark_viewport_transition(&mut self) {
-        if self.current.is_some() {
-            self.pending_viewport_anim_from = Some(self.image_rect());
+        if let Some(bmp) = &self.current {
+            self.pending_viewport_anim_from = Some((
+                self.offset_x,
+                self.offset_y,
+                bmp.width as f32 * self.zoom,
+                bmp.height as f32 * self.zoom,
+            ));
         }
     }
 
