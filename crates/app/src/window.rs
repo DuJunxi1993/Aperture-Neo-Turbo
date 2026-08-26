@@ -1535,40 +1535,40 @@ impl MainWindow {
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
                             ui.set_min_width(menu_w);
+                            // Phase 12: streamlined item set — we're
+                            // already IN the tree, so 浏览图片 and
+                            // 在目录树中定位 are no-ops from here and were
+                            // removed. Favorite add/remove is a single
+                            // mutually-exclusive row driven by the
+                            // folder's current favorite state (previously
+                            // 添加到收藏 was only offered in the Recent
+                            // root, which made favoriting a This PC
+                            // folder impossible from its own context
+                            // menu). Rows are uniformly spaced.
+                            let is_fav = self
+                                .settings
+                                .favorite_folders()
+                                .iter()
+                                .any(|f| f == &menu.path);
                             if menu.depth > 0 {
                                 if row(ui, "在资源管理器中打开", true, false) {
                                     out.push(UiAction::RevealInExplorer(menu.path.clone()));
                                     close = true;
                                 }
-                                if row(ui, "浏览图片", true, false) {
-                                    out.push(UiAction::FolderChosen(menu.path.clone(), menu.root_idx));
-                                    close = true;
-                                }
-                                ui.add_space(4.0);
-                            }
-                            if menu.root_idx == 1 && menu.depth > 0 {
-                                if row(ui, "添加到收藏", true, false) {
+                                if is_fav {
+                                    if row(ui, "取消收藏", true, false) {
+                                        out.push(UiAction::RemoveFavorite(menu.path.clone()));
+                                        close = true;
+                                    }
+                                } else if row(ui, "添加到收藏", true, false) {
                                     out.push(UiAction::AddFavorite(menu.path.clone()));
                                     close = true;
                                 }
-                            }
-                            if menu.root_idx == 0 && menu.depth > 0 {
-                                if row(ui, "取消收藏", true, false) {
-                                    out.push(UiAction::RemoveFavorite(menu.path.clone()));
-                                    close = true;
-                                }
-                            }
-                            if menu.root_idx == 1 && menu.depth > 0 {
-                                if row(ui, "从 Recent 移除", true, false) {
-                                    out.push(UiAction::RemoveRecent(menu.path.clone()));
-                                    close = true;
-                                }
-                            }
-                            if menu.depth > 0 {
-                                ui.add_space(4.0);
-                                if row(ui, "在目录树中定位", true, false) {
-                                    out.push(UiAction::RevealInTree(menu.path.clone()));
-                                    close = true;
+                                if menu.root_idx == 1 {
+                                    if row(ui, "从 Recent 移除", true, false) {
+                                        out.push(UiAction::RemoveRecent(menu.path.clone()));
+                                        close = true;
+                                    }
                                 }
                             }
                         });
@@ -2215,6 +2215,11 @@ impl MainWindow {
                     // "FOLDERS" label next to it. The hit area stays
                     // comfortable at 20px and the row's Align::Center
                     // layout keeps it vertically aligned with the text.
+                    // Phase 12: triangle → HOME glyph (stroked house:
+                    // pitched roof + body), matching the vector-drawn
+                    // window controls' 1.5px round-cap style. Reads as
+                    // "back home / top of list" more naturally than a
+                    // bare triangle.
                     let (rect, btn_resp) = ui.allocate_exact_size(
                         egui::vec2(20.0, 20.0),
                         egui::Sense::click(),
@@ -2222,20 +2227,32 @@ impl MainWindow {
                     if btn_resp.hovered() {
                         ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
                     }
+                    let p = ui.painter();
+                    let stroke = egui::Stroke::new(1.5, pal.text_secondary);
                     let cx = rect.center().x;
-                    let top_y = rect.top() + 4.0;
-                    let bot_y = rect.bottom() - 4.0;
-                    let half_w = (rect.width() * 0.26).max(3.5);
-                    let tri = [
-                        egui::pos2(cx, top_y),
-                        egui::pos2(cx - half_w, bot_y),
-                        egui::pos2(cx + half_w, bot_y),
-                    ];
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        tri.to_vec(),
-                        pal.text_secondary,
-                        egui::Stroke::NONE,
-                    ));
+                    let roof_y = rect.top() + 4.0;
+                    let eave_y = rect.center().y + 0.5;
+                    let floor_y = rect.bottom() - 4.0;
+                    let body_l = rect.left() + 4.5;
+                    let body_r = rect.right() - 4.5;
+                    // Roof: left eave → apex → right eave.
+                    p.line_segment(
+                        [egui::pos2(body_l, eave_y), egui::pos2(cx, roof_y)],
+                        stroke,
+                    );
+                    p.line_segment(
+                        [egui::pos2(cx, roof_y), egui::pos2(body_r, eave_y)],
+                        stroke,
+                    );
+                    // Body: rect below the eaves.
+                    p.rect_stroke(
+                        egui::Rect::from_min_max(
+                            egui::pos2(body_l, eave_y),
+                            egui::pos2(body_r, floor_y),
+                        ),
+                        1.0,
+                        stroke,
+                    );
                     let btn_resp = btn_resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Back to top");
                     if btn_resp.clicked() {
