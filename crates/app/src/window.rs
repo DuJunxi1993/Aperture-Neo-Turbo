@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
-use winit::dpi::LogicalSize;
+use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
@@ -530,13 +530,21 @@ impl MainWindow {
         // create a window that exceeds the screen (Windows would clip it
         // and the egui surface would be bigger than the visible area).
         let monitor = event_loop.primary_monitor();
-        let (max_w, max_h, scale) = monitor
+        let (max_w, max_h, scale, mon_pos, mon_size) = monitor
             .map(|m| {
                 let sf = m.scale_factor();
                 let LogicalSize { width, height } = m.size().to_logical::<f64>(sf);
-                (width * 0.9, height * 0.9, sf)
+                // Phase 8: also grab the monitor's logical origin +
+                // size so we can center the window on it. Without an
+                // explicit position winit lets the OS place the window
+                // wherever it likes — on multi-monitor setups or after
+                // the previous session moved it to the bottom-right,
+                // the window can open partially off-screen.
+                let LogicalPosition { x, y } = m.position().to_logical::<f64>(sf);
+                let LogicalSize { width: mw, height: mh } = m.size().to_logical::<f64>(sf);
+                (width * 0.9, height * 0.9, sf, (x, y), (mw, mh))
             })
-            .unwrap_or((1920.0, 1080.0, 1.0));
+            .unwrap_or((1920.0, 1080.0, 1.0, (0.0, 0.0), (1920.0, 1080.0)));
 
         let (init_w, init_h, min_w, min_h) = if let Some((iw, ih)) = self.single_image_size {
             // Immersive single-image launch: the client area matches the
@@ -558,11 +566,26 @@ impl MainWindow {
             ((max_w / 1.5).max(MIN_W as f64), (max_h / 1.5).max(MIN_H as f64), MIN_W as f64, MIN_H as f64)
         };
 
+        // Phase 8: DPI-aware default placement. Center the window on
+        // the primary monitor in LOGICAL coordinates (winit converts
+        // LogicalPosition → PhysicalPosition using the same scale
+        // factor we read above, so this is correct at 100% / 125% /
+        // 150% scaling alike). Clamped so the title bar always stays
+        // visible even if the computed rect slightly overflows.
+        let pos_x = (mon_pos.0 + (mon_size.0 - init_w) / 2.0)
+            .max(mon_pos.0)
+            .min(mon_pos.0 + mon_size.0 - min_w);
+        let pos_y = (mon_pos.1 + (mon_size.1 - init_h) / 2.0)
+            .max(mon_pos.1)
+            .min(mon_pos.1 + mon_size.1 - min_h);
+
         let window = event_loop.create_window(
             WindowAttributes::default()
                 .with_title("Aperture Neo")
                 .with_inner_size(LogicalSize::new(init_w, init_h))
                 .with_min_inner_size(LogicalSize::new(min_w, min_h))
+                // Phase 8: explicit centered placement (see above).
+                .with_position(LogicalPosition::new(pos_x, pos_y))
                 // Custom-drawn titlebar: the OS frame is removed; egui draws
                 // the title row (menu buttons + window controls). Resize
                 // borders are restored in init_renderer by re-adding
