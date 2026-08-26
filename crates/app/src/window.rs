@@ -1945,7 +1945,15 @@ impl MainWindow {
         // child ui anchored to the same rect.
         let bar_rect = ui.max_rect();
         let bar = ui.allocate_rect(bar_rect, egui::Sense::click_and_drag());
-        if bar.dragged() {
+        // Phase 11 fix: fire drag_window ONCE per press (drag_started),
+        // not every frame of the drag. winit's drag_window releases
+        // mouse capture and enters Windows' MODAL SC_MOVE loop; calling
+        // it again every frame while that loop (or its aftermath) is
+        // still winding down made re-entry fail probabilistically —
+        // most often with the window parked at the screen's bottom-
+        // right corner near the taskbar — leaving the window
+        // un-draggable until a resize reset the capture state.
+        if bar.drag_started() {
             let _ = window.drag_window();
         }
         if bar.double_clicked() {
