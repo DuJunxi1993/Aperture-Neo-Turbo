@@ -2906,22 +2906,43 @@ impl MainWindow {
             self.chrome_visible = true;
             self.chrome_hide_at = None;
         }
-        // Phase 1: hide / restore the standard resize-grip frame
-        // (WS_THICKFRAME) so DWM doesn't draw a 1–2 px border around
-        // the monitor while in borderless fullscreen. Entering strips
-        // it; exiting restores it so the window can still be resized
-        // from the edges. SWP_FRAMECHANGED forces a redraw of the
-        // non-client area so the change is visible immediately.
+        // Phase 1 + Phase 11: hide / restore the standard resize-grip
+        // frame (WS_THICKFRAME) so DWM doesn't draw a 1–2 px border
+        // around the monitor while in borderless fullscreen. ORDER
+        // MATTERS: entering strips the frame BEFORE the OS swap; exit
+        // restores it AFTER set_fullscreen(None) — restoring while the
+        // window is still monitor-sized made DWM paint a hairline
+        // border around the whole display during the exit transition.
+        // Phase 11 also disables the Win11 DWM hairline border and
+        // rounded corners while immersive (both re-appear on top-level
+        // windows during style transitions otherwise).
         let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-        if hwnd_raw != 0 {
-            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-            unsafe { set_window_thick_frame(hwnd, !self.is_fullscreen) };
+        let hwnd = if hwnd_raw != 0 {
+            Some(HWND(hwnd_raw as *mut core::ffi::c_void))
+        } else {
+            None
+        };
+        if self.is_fullscreen {
+            if let Some(hwnd) = hwnd {
+                unsafe {
+                    set_window_thick_frame(hwnd, false);
+                    set_dwm_fullscreen_chrome(hwnd, false);
+                }
+            }
         }
         window.set_fullscreen(if self.is_fullscreen {
             Some(winit::window::Fullscreen::Borderless(None))
         } else {
             None
         });
+        if !self.is_fullscreen {
+            if let Some(hwnd) = hwnd {
+                unsafe {
+                    set_window_thick_frame(hwnd, true);
+                    set_dwm_fullscreen_chrome(hwnd, true);
+                }
+            }
+        }
         // Phase 11: supply the fullscreen animation TARGET in window
         // coords, computed from the FINAL panel layout (user widths).
         // The image's path is then independent of the tree/thumb
@@ -3667,6 +3688,62 @@ unsafe fn set_window_thick_frame(hwnd: HWND, on: bool) {
         hwnd, None, 0, 0, 0, 0,
         SWP_FRAMECHANGED | SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE,
     );
+}
+
+/// Phase 11: disable the Win11 DWM hairline window border and rounded
+/// corners while in borderless fullscreen; restore on exit.
+///
+/// - `DWMWA_BORDER_COLOR` (= 34): `DWMWA_COLOR_NONE` (0xFFFFFFFE)
+///   removes the 1px theme-colored border Windows 11 draws around
+///   top-level windows — it can survive a fullscreen style swap and
+///   reads as a hairline frame around the monitor.
+/// - `DWMWA_WINDOW_CORNER_PREFERENCE` (= 33): `DWMWCP_DONOTROUND` (1)
+///   prevents rounded-corner notches at the four screen corners when
+///   the window is monitor-sized.
+///
+/// Both attributes fail harmlessly on Windows 10 (unsupported attr →
+/// error ignored), where neither artifact exists.
+unsafe fn set_dwm_fullscreen_chrome(hwnd: HWND, on: bool) {
+    use windows::Win32::Graphics::Dwm::{
+        DwmSetWindowAttribute, DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE,
+        DWM_WINDOW_CORNER_PREFERENCE,
+    };
+    const DWMWCP_DONOTROUND: DWM_WINDOW_CORNER_PREFERENCE = DWM_WINDOW_CORNER_PREFERENCE(1);
+    const DWMWCP_ROUND: DWM_WINDOW_CORNER_PREFERENCE = DWM_WINDOW_CORNER_PREFERENCE(2);
+    const DWMWA_COLOR_NONE: u32 = 0xFFFF_FFFE;
+    const DWMWA_COLOR_DEFAULT: u32 = 0xFFFF_FFFF;
+
+    if on {
+        let pref = DWMWCP_ROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        let color: u32 = DWMWA_COLOR_DEFAULT;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    } else {
+        let pref = DWMWCP_DONOTROUND;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE,
+            &pref as *const _ as *const core::ffi::c_void,
+            std::mem::size_of::<DWM_WINDOW_CORNER_PREFERENCE>() as u32,
+        );
+        let color: u32 = DWMWA_COLOR_NONE;
+        let _ = DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            &color as *const u32 as *const core::ffi::c_void,
+            std::mem::size_of::<u32>() as u32,
+        );
+    }
 }
 
 fn install_fonts(ctx: &egui::Context) {
