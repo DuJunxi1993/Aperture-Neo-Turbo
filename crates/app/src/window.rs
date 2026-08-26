@@ -371,21 +371,26 @@ pub struct EguiState {
 }
 
 /// Phase 8: shift a popup's anchor position so the popup stays
-/// fully on-screen. If `pos` plus the popup's estimated size
-/// overflows the right or bottom edge, the position is moved
-/// left / up so the popup fits inside the screen rect. Used by
-/// the image and tree right-click context menus (and reusable
-/// for any future egui::Window popover). Module-level free
-/// function — the popup drawers call it from inside egui
-/// closures that don't have access to `self`.
+/// fully on-screen. Phase 11: clamps ALL FOUR sides — the tree menu
+/// opens near the window's left edge and previously extended past it
+/// (only right/bottom were handled). Module-level free function —
+/// the popup drawers call it from inside egui closures that don't
+/// have access to `self`.
 fn edge_clamp(pos: egui::Pos2, screen: egui::Rect, est_w: f32, est_h: f32) -> egui::Pos2 {
     let mut x = pos.x;
     let mut y = pos.y;
-    if x + est_w > screen.right() {
-        x = (screen.right() - est_w - 4.0).max(screen.left());
+    const MARGIN: f32 = 4.0;
+    if x < screen.left() + MARGIN {
+        x = screen.left() + MARGIN;
     }
-    if y + est_h > screen.bottom() {
-        y = (screen.bottom() - est_h - 4.0).max(screen.top());
+    if y < screen.top() + MARGIN {
+        y = screen.top() + MARGIN;
+    }
+    if x + est_w > screen.right() - MARGIN {
+        x = (screen.right() - est_w - MARGIN).max(screen.left() + MARGIN);
+    }
+    if y + est_h > screen.bottom() - MARGIN {
+        y = (screen.bottom() - est_h - MARGIN).max(screen.top() + MARGIN);
     }
     egui::pos2(x, y)
 }
@@ -1234,6 +1239,7 @@ impl MainWindow {
                         .fill(pal.panel_bg)
                         .stroke(egui::Stroke::new(1.0, pal.card_stroke))
                         .rounding(8.0)
+                        .outer_margin(egui::Margin::same(2.0))
                         .inner_margin(egui::Margin::same(12.0))
                         .shadow(egui::Shadow::NONE),
                 )
@@ -1397,10 +1403,14 @@ impl MainWindow {
                         .collapsible(false)
                         .fixed_pos(pos)
                         .min_width(EST_W)
+                        // Phase 11: outer_margin paints panel_bg over the
+                        // hole's 1px ring (see apply_child_holes) so no
+                        // light halo shows around the menu over images.
                         .frame(egui::Frame::default()
                             .fill(bg)
                             .stroke(egui::Stroke::new(1.0, stroke))
                             .rounding(8.0)
+                            .outer_margin(egui::Margin::same(2.0))
                             .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
@@ -1466,10 +1476,14 @@ impl MainWindow {
                         .collapsible(false)
                         .fixed_pos(pos)
                         .min_width(EST_W)
+                        // Phase 11: outer_margin paints panel_bg over the
+                        // hole's 1px ring (see apply_child_holes) so no
+                        // light halo shows around the menu over images.
                         .frame(egui::Frame::default()
                             .fill(bg)
                             .stroke(egui::Stroke::new(1.0, stroke))
                             .rounding(8.0)
+                            .outer_margin(egui::Margin::same(2.0))
                             .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
@@ -1515,9 +1529,17 @@ impl MainWindow {
                         if resp.response.clicked_elsewhere() {
                             close = true;
                         }
-                    }
-                    if close {
-                        self.tree_ctx_menu = None;
+                        if close {
+                            self.tree_ctx_menu = None;
+                        } else {
+                            // Phase 11: the tree menu joins the unified hole
+                            // punch — when it overlaps the viewer area the
+                            // D2D child would otherwise hide that part (the
+                            // tree menu used to rely on staying within the
+                            // tree panel, which the wider 190px layout
+                            // breaks on narrow panels).
+                            popover_rects.push(resp.response.rect);
+                        }
                     }
                 }
                 out
@@ -2598,12 +2620,15 @@ impl MainWindow {
         unsafe {
             let full = CreateRectRgn(0, 0, cw, ch);
             for r in rects {
-                // 10px logical padding so the popover's stroke/rounding
-                // isn't clipped by the hole edge.
-                let hl = ((r.min.x - 10.0) * ppp - cx).round() as i32;
-                let ht = ((r.min.y - 10.0) * ppp - cy).round() as i32;
-                let hr = ((r.max.x + 10.0) * ppp - cx).round() as i32;
-                let hb = ((r.max.y + 10.0) * ppp - cy).round() as i32;
+                // Phase 11: padding 10px → 1px. The old 10px ring showed
+                // the wgpu surface's canvas-clear color around the menu,
+                // reading as a light halo over images (the popover's own
+                // frame now covers its outer 2px via outer_margin, so 1px
+                // of canvas is all that remains — imperceptible).
+                let hl = ((r.min.x - 1.0) * ppp - cx).round() as i32;
+                let ht = ((r.min.y - 1.0) * ppp - cy).round() as i32;
+                let hr = ((r.max.x + 1.0) * ppp - cx).round() as i32;
+                let hb = ((r.max.y + 1.0) * ppp - cy).round() as i32;
                 let hole = CreateRectRgn(hl, ht, hr, hb);
                 CombineRgn(full, full, hole, RGN_DIFF);
             }
