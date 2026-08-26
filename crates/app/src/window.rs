@@ -1052,6 +1052,7 @@ impl MainWindow {
                             &folder,
                             nav_count,
                             &mut side_actions,
+                            &mut self.pending_tree_menu,
                             &pal,
                         );
                         self.tree_panel.content_min = min_w;
@@ -1778,12 +1779,23 @@ impl MainWindow {
     /// Draw the folder tree. Returns the content-driven minimum width
     /// (logical px) so the panel can widen for deep/long entries and
     /// shrink back when they collapse.
+    ///
+    /// `pending` is an out-param for the deferred native context menu:
+    /// when a node is right-clicked, `draw_tree_node` writes the path
+    /// + cursor + root + depth to this slot. The caller (which has
+    /// access to `self.pending_tree_menu`) drains the slot after the
+    /// egui frame ends and calls `show_tree_context_menu`. Passing
+    /// the field by `&mut` here is the bug fix that makes right-click
+    /// on tree nodes actually work — the previous code used a local
+    /// `Option` inside the egui closure which was dropped before
+    /// the drain step, silently losing every right-click.
     fn draw_tree_panel_static(
         ui: &mut egui::Ui,
         tree: &crate::file_tree::FileTree,
         folder: &Option<PathBuf>,
         nav_count: usize,
         actions: &mut Vec<UiAction>,
+        pending: &mut Option<(PathBuf, usize, usize, (i32, i32))>,
         pal: &Palette,
     ) -> f32 {
         let frame = egui::Frame::default()
@@ -1847,17 +1859,18 @@ impl MainWindow {
                     let reveal = state.reveal_target.take();
                     let mut revealed = false;
                     let mut recent_scroll = state.recent_scroll_target.take();
-                    // Phase 2: out-param for the deferred tree
-                    // context menu; one slot shared across the
-                    // whole tree (only the most recent right-click
-                    // survives, which is fine — multi-right-click
-                    // isn't a real interaction).
-                    let mut pending: Option<(PathBuf, usize, usize, (i32, i32))> = None;
+                    // Phase 2 + 修复: 之前的代码用闭包里的局部 `pending` 变量，
+                    // 闭包结束时被 drop，导致右键事件被静默丢弃，菜单永远不显示。
+                    // 这里把 self.pending_tree_menu 取出作为局部借用，
+                    // 显式 reset 为 None，然后把 &mut 传进 draw_tree_node。
+                    // 闭包是 FnOnce，借用生命周期等同于闭包执行期间。
+                    *pending = None;
                     let mut max_w: f32 = 0.0;
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
                             ui, root, 0, folder, &mut expanded, actions, root_idx,
-                            &reveal, &mut revealed, &mut pending, &mut recent_scroll, &pal,
+                            &reveal, &mut revealed, &mut *pending,
+                            &mut recent_scroll, &pal,
                         ));
                     }
                     state.roots = roots;
