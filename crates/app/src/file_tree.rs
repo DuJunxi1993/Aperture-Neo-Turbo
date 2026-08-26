@@ -55,12 +55,6 @@ pub struct TreeTreeState {
     pub recent_scroll_target: Option<PathBuf>,
     /// One-shot request to scroll the tree back to the top.
     pub scroll_to_top: bool,
-    /// Phase 11: persistently highlighted folder (set by the
-    /// "在目录树中定位" context-menu action). Unlike `reveal_target`
-    /// (transient scroll+highlight, cleared after one draw) this stays
-    /// set so the located node keeps the indigo selection card until
-    /// the user clicks another folder.
-    pub located: Option<PathBuf>,
 }
 
 impl FileTree {
@@ -71,7 +65,6 @@ impl FileTree {
             reveal_target: None,
             recent_scroll_target: None,
             scroll_to_top: false,
-            located: None,
         };
         // All roots start expanded (empty path = the root's own key).
         for set in &mut state.expanded {
@@ -150,9 +143,6 @@ impl FileTree {
             state.expanded[2].insert(p.clone());
         }
         state.reveal_target = Some(path.to_path_buf());
-        // Phase 11: persist the located highlight until the user picks
-        // another folder.
-        state.located = Some(path.to_path_buf());
     }
 
     /// Lazy: enumerate subdirectories under `path` and replace the node's
