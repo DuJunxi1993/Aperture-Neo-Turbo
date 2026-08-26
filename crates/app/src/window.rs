@@ -1957,6 +1957,14 @@ impl MainWindow {
                     egui::FontId::proportional(15.0),
                     pal.text_secondary,
                 );
+                // Phase 8: write HELP_ANCHOR here so the shortcut
+                // help popover anchors to the TOP-BAR `?` button
+                // (its current home). Without this, the popover
+                // falls back to "above the status bar's right side"
+                // (line 1165), which puts it at the bottom of the
+                // screen even though the button the user clicked is
+                // at the top.
+                HELP_ANCHOR.with(|c| c.set(hrect));
                 if hresp.clicked() {
                     actions.push(UiAction::ToggleShortcutHelp);
                 }
