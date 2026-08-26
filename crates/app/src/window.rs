@@ -1615,6 +1615,17 @@ impl MainWindow {
                                         close = true;
                                     }
                                 }
+                                // Phase 13: locate stays available from
+                                // Recent/Favorites (jumping back into the
+                                // This PC branch is meaningful there) but
+                                // is hidden under This PC itself — picking
+                                // a folder there already IS the locate.
+                                if menu.root_idx != 2 {
+                                    if row(ui, "在目录树中定位", true, false) {
+                                        out.push(UiAction::RevealInTree(menu.path.clone()));
+                                        close = true;
+                                    }
+                                }
                             }
                         });
                     if let Some(resp) = win_resp {
@@ -2265,6 +2276,13 @@ impl MainWindow {
                     // window controls' 1.5px round-cap style. Reads as
                     // "back home / top of list" more naturally than a
                     // bare triangle.
+                    // Phase 13: stroked two-piece house → FILLED house
+                    // pentagon (apex → right eave → right floor → left
+                    // floor → left eave). A solid silhouette reads
+                    // unmistakably as "home" at 20px, unlike the stroked
+                    // roof+rect which rendered as a triangle perched on
+                    // an unrelated box. The pentagon is convex, so a
+                    // single convex_polygon shape suffices.
                     let (rect, btn_resp) = ui.allocate_exact_size(
                         egui::vec2(20.0, 20.0),
                         egui::Sense::click(),
@@ -2272,32 +2290,24 @@ impl MainWindow {
                     if btn_resp.hovered() {
                         ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
                     }
-                    let p = ui.painter();
-                    let stroke = egui::Stroke::new(1.5, pal.text_secondary);
                     let cx = rect.center().x;
-                    let roof_y = rect.top() + 4.0;
-                    let eave_y = rect.center().y + 0.5;
+                    let apex_y = rect.top() + 3.0;
+                    let eave_y = rect.center().y - 0.5;
                     let floor_y = rect.bottom() - 4.0;
-                    let body_l = rect.left() + 4.5;
-                    let body_r = rect.right() - 4.5;
-                    // Roof: left eave → apex → right eave.
-                    p.line_segment(
-                        [egui::pos2(body_l, eave_y), egui::pos2(cx, roof_y)],
-                        stroke,
-                    );
-                    p.line_segment(
-                        [egui::pos2(cx, roof_y), egui::pos2(body_r, eave_y)],
-                        stroke,
-                    );
-                    // Body: rect below the eaves.
-                    p.rect_stroke(
-                        egui::Rect::from_min_max(
-                            egui::pos2(body_l, eave_y),
-                            egui::pos2(body_r, floor_y),
-                        ),
-                        1.0,
-                        stroke,
-                    );
+                    let body_l = rect.left() + 4.0;
+                    let body_r = rect.right() - 4.0;
+                    let house = [
+                        egui::pos2(cx, apex_y),
+                        egui::pos2(body_r, eave_y),
+                        egui::pos2(body_r, floor_y),
+                        egui::pos2(body_l, floor_y),
+                        egui::pos2(body_l, eave_y),
+                    ];
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        house.to_vec(),
+                        pal.text_secondary,
+                        egui::Stroke::NONE,
+                    ));
                     let btn_resp = btn_resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Back to top");
                     if btn_resp.clicked() {
@@ -2737,15 +2747,19 @@ impl MainWindow {
         unsafe {
             let full = CreateRectRgn(0, 0, cw, ch);
             for r in rects {
-                // Phase 12: hole hugs the menu — expand by exactly ONE
-                // PHYSICAL pixel (the previous 1 LOGICAL px was 1.25
-                // physical at 125% DPI, a visible ring), and the corner
-                // radius matches the menu's 8 logical px rounding
-                // exactly (the previous 9 left the corners proud).
-                let hl = ((r.min.x * ppp) - cx).round() as i32 - 1;
-                let ht = ((r.min.y * ppp) - cy).round() as i32 - 1;
-                let hr = ((r.max.x * ppp) - cx).round() as i32 + 1;
-                let hb = ((r.max.y * ppp) - cy).round() as i32 + 1;
+                // Phase 13: ZERO expansion. The previous 1-physical-px
+                // grow-out put a ring of canvas-clear color around the
+                // menu (the ring lies OUTSIDE the frame's painted rect),
+                // and the corner radius wasn't grown to match, widening
+                // the corner gaps. The hole now coincides exactly with
+                // the frame rect at radius 8*ppp — the frame's own fill
+                // (panel_bg) reaches the region edge, so no canvas can
+                // show. The antialiased outer half-pixel of the stroke is
+                // hard-clipped, which reads as a slightly crisper edge.
+                let hl = ((r.min.x * ppp) - cx).round() as i32;
+                let ht = ((r.min.y * ppp) - cy).round() as i32;
+                let hr = ((r.max.x * ppp) - cx).round() as i32;
+                let hb = ((r.max.y * ppp) - cy).round() as i32;
                 let radius = (8.0 * ppp).round() as i32;
                 let hole = CreateRoundRectRgn(hl, ht, hr, hb, radius, radius);
                 CombineRgn(full, full, hole, RGN_DIFF);
