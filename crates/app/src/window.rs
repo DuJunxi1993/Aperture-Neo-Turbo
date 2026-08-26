@@ -2227,6 +2227,9 @@ impl MainWindow {
                     let reveal = state.reveal_target.take();
                     let mut revealed = false;
                     let mut recent_scroll = state.recent_scroll_target.take();
+                    // Phase 11: persistently highlighted "located" folder
+                    // (set by the 在目录树中定位 context-menu action).
+                    let located = state.located.clone();
                     // Phase 2 + Phase 8 修复: 之前用闭包内局部 `pending` 变量，
                     // 闭包返回时被 drop 导致右键事件被静默丢弃。Phase 8 改用
                     // 传入 `&mut Option<TreeCtxMenu>` 指向 self.tree_ctx_menu。
@@ -2239,7 +2242,7 @@ impl MainWindow {
                         max_w = max_w.max(Self::draw_tree_node(
                             ui, root, 0, folder, &mut expanded, actions, root_idx,
                             &reveal, &mut revealed, pending_ctx,
-                            &mut recent_scroll, &pal,
+                            &mut recent_scroll, &located, &pal,
                         ));
                     }
                     state.roots = roots;
@@ -2277,6 +2280,8 @@ impl MainWindow {
         // reads it and calls open_tree_context_menu.
         pending: &mut Option<TreeCtxMenu>,
         recent_scroll: &mut Option<PathBuf>,
+        // Phase 11: persistently highlighted folder (在目录树中定位).
+        located: &Option<PathBuf>,
         pal: &Palette,
     ) -> f32 {
         // Nodes are created with `children: Some(vec![])`, so emptiness —
@@ -2312,7 +2317,10 @@ impl MainWindow {
             format!("tree-r{root_idx}-{}", path_clone.display())
         };
         let is_reveal_target = reveal.as_ref() == Some(&node.path) && root_idx == 2;
-        let text_color = if is_current || is_reveal_target {
+        // Phase 11: the located folder keeps the selection card until
+        // the user picks another folder (see TreeState.located).
+        let is_located = located.as_ref() == Some(&node.path) && depth > 0;
+        let text_color = if is_current || is_reveal_target || is_located {
             pal.selection_text
         } else {
             pal.text_secondary
@@ -2333,7 +2341,7 @@ impl MainWindow {
         // highlight (egui selectable_label's built-in selected color mixes
         // green/blue with our indigo). Click navigates, right-click manages.
         if is_leaf_entry {
-            let selected = is_current || is_reveal_target;
+            let selected = is_current || is_reveal_target || is_located;
             let (rect, resp) = ui.allocate_exact_size(
                 egui::vec2(ui.available_width(), 26.0),
                 egui::Sense::click(),
@@ -2377,6 +2385,23 @@ impl MainWindow {
                 }
             }
         } else {
+            // Phase 11: paint the located-selection card BEFORE the
+            // header so the header text renders on top of it. This PC
+            // headers are CollapsingHeaders with no built-in selected
+            // card; without this the located folder would only change
+            // text color instead of showing the full click-highlight
+            // card the user asked for.
+            if is_located {
+                let cr = ui.cursor();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(cr.left(), cr.top()),
+                        egui::pos2(cr.right(), cr.top() + 26.0),
+                    ),
+                    6.0,
+                    pal.selected_card_fill,
+                );
+            }
             let header = egui::CollapsingHeader::new(
                 egui::RichText::new(display).size(14.0).color(text_color)
             )
@@ -2397,7 +2422,7 @@ impl MainWindow {
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
                             ui, child, depth + 1, current, expanded, actions, root_idx,
-                            reveal, revealed, pending, recent_scroll, pal,
+                            reveal, revealed, pending, recent_scroll, located, pal,
                         );
                         max_w = max_w.max(w);
                     }
@@ -2713,6 +2738,8 @@ impl MainWindow {
             }
             UiAction::FolderChosen(p, root) => {
                 ACTIVE_ROOT.store(root, std::sync::atomic::Ordering::Relaxed);
+                // Phase 11: a user click supersedes the located highlight.
+                self.file_tree.state.lock().located = None;
                 self.navigate_to_folder(p);
             }
             UiAction::ToggleShortcutHelp => {
