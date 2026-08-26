@@ -224,8 +224,10 @@ impl Direct2DViewer {
                     if anim.start.elapsed().as_secs_f32() >= anim.dur {
                         let to = anim.to;
                         self.zoom = if cur.width > 0 { to.2 / cur.width as f32 } else { self.zoom };
-                        self.offset_x = to.0 - self.viewport_origin.0;
-                        self.offset_y = to.1 - self.viewport_origin.1;
+                        // Phase 8: `to` is viewer-relative — matches
+                        // offset_x/offset_y directly, no origin math.
+                        self.offset_x = to.0;
+                        self.offset_y = to.1;
                         self.rect_anim = None;
                     }
                 }
@@ -239,11 +241,14 @@ impl Direct2DViewer {
                         anim.from.3 + (anim.to.3 - anim.from.3) * t,
                     );
                     let s = if cur.width > 0 { r.2 / cur.width as f32 } else { 1.0 };
-                    AffineTransform::translate(
-                        r.0 - self.viewport_origin.0,
-                        r.1 - self.viewport_origin.1,
-                    )
-                    .mul(AffineTransform::scale(s))
+                    // Phase 8: r is in VIEWER-RELATIVE coords (same as
+                    // offset_x/offset_y on the non-animated path) — no
+                    // viewport_origin subtraction needed here. The D2D
+                    // swapchain's origin IS the viewport origin, so a
+                    // translate of (offset_x, offset_y) draws the image
+                    // at the right place.
+                    AffineTransform::translate(r.0, r.1)
+                        .mul(AffineTransform::scale(s))
                 } else {
                     self.animator.current_transform(
                         self.zoom, self.offset_x, self.offset_y,
@@ -343,27 +348,23 @@ impl Direct2DViewer {
         };
     }
 
-    /// Current on-screen image rectangle in WINDOW coordinates.
-    fn image_rect(&self) -> (f32, f32, f32, f32) {
-        match &self.current {
-            Some(bmp) => (
-                self.viewport_origin.0 + self.offset_x,
-                self.viewport_origin.1 + self.offset_y,
-                bmp.width as f32 * self.zoom,
-                bmp.height as f32 * self.zoom,
-            ),
-            None => (0.0, 0.0, 0.0, 0.0),
-        }
-    }
-
     /// Begin a screen-rect transition from the current image rect to
-    /// `target` (window coords). Used by fit / 1:1 / fullscreen toggles —
-    /// the image travels along the path instead of a context-free zoom.
+    /// `target`. Both `from` and `target` are in VIEWER-RELATIVE
+    /// coords (offset from the viewport's top-left) — the same coord
+    /// system the non-animated path uses (`offset_x/offset_y`). Used
+    /// by fit / 1:1 toggles — the image travels along the path
+    /// instead of a context-free zoom.
     pub fn start_rect_anim(&mut self, target: (f32, f32, f32, f32)) {
         if self.current.is_none() {
             return;
         }
-        let from = self.image_rect();
+        let from = (self.offset_x, self.offset_y, {
+            let bmp = self.current.as_ref().unwrap();
+            bmp.width as f32 * self.zoom
+        }, {
+            let bmp = self.current.as_ref().unwrap();
+            bmp.height as f32 * self.zoom
+        });
         if (from.2 - target.2).abs() < 0.5 && (from.0 - target.0).abs() < 0.5 {
             return; // already there
         }
@@ -399,9 +400,11 @@ impl Direct2DViewer {
     pub fn fit_to_screen(&mut self) {
         self.compute_fit();
         if let Some(bmp) = &self.current {
+            // Phase 8: viewer-relative target (matches `from` in
+            // start_rect_anim and the non-animated offset_x/y path).
             let target = (
-                self.viewport_origin.0 + self.offset_x,
-                self.viewport_origin.1 + self.offset_y,
+                self.offset_x,
+                self.offset_y,
                 bmp.width as f32 * self.zoom,
                 bmp.height as f32 * self.zoom,
             );
@@ -421,8 +424,8 @@ impl Direct2DViewer {
             self.offset_x = (self.viewport_w as f32 - bmp.width as f32 * 1.0) * 0.5;
             self.offset_y = (self.viewport_h as f32 - bmp.height as f32 * 1.0) * 0.5;
             let target = (
-                self.viewport_origin.0 + self.offset_x,
-                self.viewport_origin.1 + self.offset_y,
+                self.offset_x,
+                self.offset_y,
                 bmp.width as f32,
                 bmp.height as f32,
             );
@@ -440,12 +443,20 @@ impl Direct2DViewer {
         self.compute_fit();
         // Fullscreen (or panel-layout) transitions: animate the image from
         // where it was to the new fit — a path animation, not a zoom.
+        // Phase 8: both `from` (captured by mark_viewport_transition)
+        // and `target` are in VIEWER-RELATIVE coords, so the
+        // interpolation stays in one coord system even when the
+        // viewport origin changes (e.g. windowed → fullscreen moves
+        // origin from ~(240, 44) to (0, 0)). Previously `target` was
+        // in screen coords (`x + offset`) while `from` was
+        // viewer-relative — a unit mismatch that made the image
+        // teleport sideways when it was right of center.
         if (size_changed || origin_changed) && !self.animator.is_sliding() {
             if let Some(from) = self.pending_viewport_anim_from.take() {
                 if let Some(bmp) = &self.current {
                     let target = (
-                        x + self.offset_x,
-                        y + self.offset_y,
+                        self.offset_x,
+                        self.offset_y,
                         bmp.width as f32 * self.zoom,
                         bmp.height as f32 * self.zoom,
                     );
