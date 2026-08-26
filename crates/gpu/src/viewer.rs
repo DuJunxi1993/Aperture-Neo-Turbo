@@ -124,22 +124,38 @@ impl Direct2DViewer {
     /// pre-rotation centre. Combined with the existing fit/zoom
     /// transform via multiplication so the math composes cleanly.
     /// For `rotation == 0` the transform is identity.
+    ///
+    /// Phase 9: the pivot is the centre of the DISPLAYED (rotated)
+    /// bounding rect, computed from rotation-aware effective
+    /// dimensions — matching compute_fit, which now also swaps w/h
+    /// for odd quarter-turns. With the previous pre-rotation pivot,
+    /// a 90° turn of a portrait image pivoted around the old
+    /// portrait rect's centre while fit had already been recomputed
+    /// for landscape → most of the content landed outside the
+    /// viewport.
+    fn effective_size(&self) -> (f32, f32) {
+        match &self.current {
+            Some(b) => {
+                let (w, h) = (b.width as f32, b.height as f32);
+                if self.rotation % 2 == 1 { (h, w) } else { (w, h) }
+            }
+            None => (0.0, 0.0),
+        }
+    }
+
     fn rotation_transform(&self) -> AffineTransform {
         if self.rotation == 0 {
             return AffineTransform::identity();
         }
-        // The image's screen-space centre (pre-rotation) is the
-        // rotation pivot. With the current fit transform: image is
-        // drawn at (offset_x, offset_y) with size (w*zoom, h*zoom),
-        // so its centre is (offset_x + w*zoom/2, offset_y + h*zoom/2).
         let bmp = match &self.current {
             Some(b) => b,
             None => return AffineTransform::identity(),
         };
-        let w = bmp.width as f32;
-        let h = bmp.height as f32;
-        let cx = self.offset_x + w * self.zoom * 0.5;
-        let cy = self.offset_y + h * self.zoom * 0.5;
+        // Centre of the displayed rect: drawn at (offset_x, offset_y)
+        // with size (eff_w * zoom, eff_h * zoom).
+        let (ew, eh) = self.effective_size();
+        let cx = self.offset_x + ew * self.zoom * 0.5;
+        let cy = self.offset_y + eh * self.zoom * 0.5;
         let angle = self.rotation as f32 * std::f32::consts::FRAC_PI_2;
         // AffineTransform is 2x3 (no separate Translate/Rotate helpers),
         // so build it directly: T(cx,cy) * R(angle) * T(-cx,-cy).
@@ -158,12 +174,21 @@ impl Direct2DViewer {
                 self.fit_scale = 1.0;
                 return;
             }
-            let scale_x = self.viewport_w as f32 / bmp.width as f32;
-            let scale_y = self.viewport_h as f32 / bmp.height as f32;
+            // Phase 9: rotation-aware fit — a 90/270 turn swaps the
+            // displayed width and height, so the fit must be computed
+            // against the ROTATED dimensions or the rotated image
+            // overflows the viewport.
+            let (dw, dh) = if self.rotation % 2 == 1 {
+                (bmp.height as f32, bmp.width as f32)
+            } else {
+                (bmp.width as f32, bmp.height as f32)
+            };
+            let scale_x = self.viewport_w as f32 / dw;
+            let scale_y = self.viewport_h as f32 / dh;
             self.fit_scale = scale_x.min(scale_y);
             self.zoom = self.fit_scale;
-            self.offset_x = (self.viewport_w as f32 - bmp.width as f32 * self.zoom) * 0.5;
-            self.offset_y = (self.viewport_h as f32 - bmp.height as f32 * self.zoom) * 0.5;
+            self.offset_x = (self.viewport_w as f32 - dw * self.zoom) * 0.5;
+            self.offset_y = (self.viewport_h as f32 - dh * self.zoom) * 0.5;
         }
     }
 
@@ -225,11 +250,14 @@ impl Direct2DViewer {
             // Draw current bitmap — a screen-rect transition (fullscreen /
             // fit / 1:1) overrides the regular transform while in flight.
             if let Some(cur) = &self.current {
+                // Phase 9: rotation-aware displayed width for the
+                // rect-anim scale factor (odd quarter-turns swap w/h).
+                let disp_w = if self.rotation % 2 == 1 { cur.height as f32 } else { cur.width as f32 };
                 // Finish the transition and commit its final transform.
                 if let Some(anim) = &self.rect_anim {
                     if anim.start.elapsed().as_secs_f32() >= anim.dur {
                         let to = anim.to;
-                        self.zoom = if cur.width > 0 { to.2 / cur.width as f32 } else { self.zoom };
+                        self.zoom = if disp_w > 0.0 { to.2 / disp_w } else { self.zoom };
                         // Phase 8: `to` is viewer-relative — matches
                         // offset_x/offset_y directly, no origin math.
                         self.offset_x = to.0;
@@ -246,7 +274,7 @@ impl Direct2DViewer {
                         anim.from.2 + (anim.to.2 - anim.from.2) * t,
                         anim.from.3 + (anim.to.3 - anim.from.3) * t,
                     );
-                    let s = if cur.width > 0 { r.2 / cur.width as f32 } else { 1.0 };
+                    let s = if disp_w > 0.0 { r.2 / disp_w } else { 1.0 };
                     // Phase 8: r is in VIEWER-RELATIVE coords (same as
                     // offset_x/offset_y on the non-animated path) — no
                     // viewport_origin subtraction needed here. The D2D
@@ -357,20 +385,17 @@ impl Direct2DViewer {
     /// Begin a screen-rect transition from the current image rect to
     /// `target`. Both `from` and `target` are in VIEWER-RELATIVE
     /// coords (offset from the viewport's top-left) — the same coord
-    /// system the non-animated path uses (`offset_x/offset_y`). Used
-    /// by fit / 1:1 toggles — the image travels along the path
-    /// instead of a context-free zoom.
+    /// system the non-animated path uses (`offset_x/offset_y`). The
+    /// width/height components are EFFECTIVE (rotation-aware)
+    /// displayed sizes, matching compute_fit. Used by fit / 1:1
+    /// toggles — the image travels along the path instead of a
+    /// context-free zoom.
     pub fn start_rect_anim(&mut self, target: (f32, f32, f32, f32)) {
         if self.current.is_none() {
             return;
         }
-        let from = (self.offset_x, self.offset_y, {
-            let bmp = self.current.as_ref().unwrap();
-            bmp.width as f32 * self.zoom
-        }, {
-            let bmp = self.current.as_ref().unwrap();
-            bmp.height as f32 * self.zoom
-        });
+        let (ew, eh) = self.effective_size();
+        let from = (self.offset_x, self.offset_y, ew * self.zoom, eh * self.zoom);
         if (from.2 - target.2).abs() < 0.5 && (from.0 - target.0).abs() < 0.5 {
             return; // already there
         }
@@ -393,26 +418,29 @@ impl Direct2DViewer {
     /// 修复: 直接 capture 视口相对坐标（去掉 viewport_origin），
     /// 渲染端的 `r.0 - viewport_origin.0` 就始终正确。
     pub fn mark_viewport_transition(&mut self) {
-        if let Some(bmp) = &self.current {
+        if self.current.is_some() {
+            let (ew, eh) = self.effective_size();
             self.pending_viewport_anim_from = Some((
                 self.offset_x,
                 self.offset_y,
-                bmp.width as f32 * self.zoom,
-                bmp.height as f32 * self.zoom,
+                ew * self.zoom,
+                eh * self.zoom,
             ));
         }
     }
 
     pub fn fit_to_screen(&mut self) {
         self.compute_fit();
-        if let Some(bmp) = &self.current {
+        if self.current.is_some() {
             // Phase 8: viewer-relative target (matches `from` in
             // start_rect_anim and the non-animated offset_x/y path).
+            // Phase 9: effective (rotation-aware) displayed size.
+            let (ew, eh) = self.effective_size();
             let target = (
                 self.offset_x,
                 self.offset_y,
-                bmp.width as f32 * self.zoom,
-                bmp.height as f32 * self.zoom,
+                ew * self.zoom,
+                eh * self.zoom,
             );
             self.start_rect_anim(target);
         }
@@ -426,14 +454,21 @@ impl Direct2DViewer {
     /// 1:1 — one image pixel per screen pixel, centered.
     pub fn zoom_1_to_1(&mut self) {
         if let Some(ref bmp) = self.current {
+            // Phase 9: effective dims — for odd quarter-turns the
+            // DISPLAYED pixel size is height×width of the bitmap.
+            let (dw, dh) = if self.rotation % 2 == 1 {
+                (bmp.height as f32, bmp.width as f32)
+            } else {
+                (bmp.width as f32, bmp.height as f32)
+            };
             self.zoom = 1.0;
-            self.offset_x = (self.viewport_w as f32 - bmp.width as f32 * 1.0) * 0.5;
-            self.offset_y = (self.viewport_h as f32 - bmp.height as f32 * 1.0) * 0.5;
+            self.offset_x = (self.viewport_w as f32 - dw) * 0.5;
+            self.offset_y = (self.viewport_h as f32 - dh) * 0.5;
             let target = (
                 self.offset_x,
                 self.offset_y,
-                bmp.width as f32,
-                bmp.height as f32,
+                dw,
+                dh,
             );
             self.start_rect_anim(target);
         }
@@ -486,15 +521,21 @@ impl Direct2DViewer {
     /// Phase 3: read the current rotation in quarter-turns.
     pub fn rotation(&self) -> u8 { self.rotation }
 
-    /// Phase 3: set the rotation in quarter-turns (0..=3). The
-    /// rotation is not animated — the next fit_to_screen() call
-    /// (triggered right after) runs the existing 180ms smoothstep
-    /// fit anim, which reads as the image "snapping to the new
-    /// orientation with a brief ease". Persists only until the
-    /// next set_image (which resets to 0).
+    /// Phase 3: set the rotation in quarter-turns (0..=3). Persists
+    /// only until the next set_image (which resets to 0).
+    ///
+    /// Phase 9: snap immediately instead of running the fit rect
+    /// animation. The rotation matrix applies instantly while a rect
+    /// anim would still be interpolating the UNROTATED rect — the two
+    /// disagree for every intermediate frame, which read as the image
+    /// teleporting / spinning around the wrong pivot. A direct
+    /// compute_fit + snap is visually clean: one frame it's portrait,
+    /// the next it's landscape, centred and fully in view.
     pub fn set_rotation(&mut self, q: u8) {
         self.rotation = q & 3;
-        self.fit_to_screen();
+        self.rect_anim = None;
+        self.pending_viewport_anim_from = None;
+        self.compute_fit();
     }
 
     /// Phase 3: true when the current zoom is within 1% of the
