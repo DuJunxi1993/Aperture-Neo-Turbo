@@ -134,37 +134,44 @@ impl Direct2DViewer {
         }
     }
 
-    /// Phase 10: build the FULL image transform for a given viewer-
-    /// relative position and scale, with rotation composed in the
-    /// correct slot:
+    /// Phase 11: build the FULL image transform for a given viewer-
+    /// relative position and scale, with rotation as a PER-QUADRANT
+    /// hardcoded matrix. No sin/cos, no mul chains — each entry is the
+    /// closed-form mapping written directly against the convention
+    /// D2D actually applies (row-vector: x' = x·M11 + y·M21 + M31,
+    /// y' = x·M12 + y·M22 + M32 — confirmed empirically by the Phase
+    /// 7/10 rotation attempts, where column-convention entries
+    /// misplaced 90/270 exactly as a transpose would).
     ///
-    ///   T(d) · T(pₛ) · R(θ) · T(−pₛ) · S(s)
+    /// Desired screen mappings (y-down, +90 = clockwise), with
+    /// sx = x·s, sy = y·s, sw = bitmap width·s, sh = height·s:
     ///
-    /// where pₛ = (w·s/2, h·s/2) is the SCALED BITMAP's centre. Point
-    /// order: bitmap pixel → scale → rotate about the bitmap's own
-    /// centre → translate to d. The rotated bounding box therefore
-    /// lands exactly at [d, d + eff·s] — matching rotation-aware
-    /// compute_fit — for EVERY quarter-turn including 90/270.
+    ///   0°:   (sx + dx,        sy + dy)
+    ///   90°:  (−sy + dx + sh,  sx + dy)
+    ///   180°: (−sx + dx + sw,  −sy + dy + sh)
+    ///   270°: (sy + dx,        −sx + dy + sw)
     ///
-    /// The previous composition multiplied a rotation AFTER the full
-    /// fit transform (R · T · S), pivoting around the displayed
-    /// rect's centre while the rect itself was still unrotated — the
-    /// two centres coincide only for 180°, which is why 90/270
-    /// wandered off-screen.
+    /// In every quadrant the displayed bounding box lands exactly at
+    /// [d, d + eff·s], matching rotation-aware compute_fit. (If the
+    /// rotation DIRECTION ever feels inverted, swap the 90/270 arms —
+    /// centering is unaffected either way.)
     fn display_transform(&self, dx: f32, dy: f32, s: f32) -> AffineTransform {
         let (bw, bh) = match &self.current {
             Some(b) => (b.width as f32, b.height as f32),
             None => return AffineTransform::identity(),
         };
-        let px = bw * s * 0.5;
-        let py = bh * s * 0.5;
-        let angle = self.rotation as f32 * std::f32::consts::FRAC_PI_2;
-        let (sn, cs) = angle.sin_cos();
-        let rot = AffineTransform { m11: cs, m12: sn, m21: -sn, m22: cs, dx: 0.0, dy: 0.0 };
-        AffineTransform::translate(dx + px, dy + py)
-            .mul(rot)
-            .mul(AffineTransform::translate(-px, -py))
-            .mul(AffineTransform::scale(s))
+        let sw = bw * s;
+        let sh = bh * s;
+        match self.rotation {
+            // 90 CW: x' = −s·y + dx + sh ; y' = s·x + dy
+            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: dx + sh, dy },
+            // 180: x' = −s·x + dx + sw ; y' = −s·y + dy + sh
+            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: dx + sw, dy: dy + sh },
+            // 270 CW: x' = s·y + dx ; y' = −s·x + dy + sw
+            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx, dy: dy + sw },
+            // 0: identity scale + translate
+            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx, dy },
+        }
     }
 
     fn compute_fit(&mut self) {
