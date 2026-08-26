@@ -122,17 +122,8 @@ impl Direct2DViewer {
     /// Phase 3: build a transform that rotates the current image
     /// by `rotation * 90°` clockwise around the image's
     /// pre-rotation centre. Combined with the existing fit/zoom
-    /// transform via multiplication so the math composes cleanly.
-    /// For `rotation == 0` the transform is identity.
-    ///
-    /// Phase 9: the pivot is the centre of the DISPLAYED (rotated)
-    /// bounding rect, computed from rotation-aware effective
-    /// dimensions — matching compute_fit, which now also swaps w/h
-    /// for odd quarter-turns. With the previous pre-rotation pivot,
-    /// a 90° turn of a portrait image pivoted around the old
-    /// portrait rect's centre while fit had already been recomputed
-    /// for landscape → most of the content landed outside the
-    /// viewport.
+    /// Displayed (rotation-aware) dimensions: a 90/270 turn swaps
+    /// the bitmap's width and height. Used by fit / rect-anim targets.
     fn effective_size(&self) -> (f32, f32) {
         match &self.current {
             Some(b) => {
@@ -143,29 +134,37 @@ impl Direct2DViewer {
         }
     }
 
-    fn rotation_transform(&self) -> AffineTransform {
-        if self.rotation == 0 {
-            return AffineTransform::identity();
-        }
-        let bmp = match &self.current {
-            Some(b) => b,
+    /// Phase 10: build the FULL image transform for a given viewer-
+    /// relative position and scale, with rotation composed in the
+    /// correct slot:
+    ///
+    ///   T(d) · T(pₛ) · R(θ) · T(−pₛ) · S(s)
+    ///
+    /// where pₛ = (w·s/2, h·s/2) is the SCALED BITMAP's centre. Point
+    /// order: bitmap pixel → scale → rotate about the bitmap's own
+    /// centre → translate to d. The rotated bounding box therefore
+    /// lands exactly at [d, d + eff·s] — matching rotation-aware
+    /// compute_fit — for EVERY quarter-turn including 90/270.
+    ///
+    /// The previous composition multiplied a rotation AFTER the full
+    /// fit transform (R · T · S), pivoting around the displayed
+    /// rect's centre while the rect itself was still unrotated — the
+    /// two centres coincide only for 180°, which is why 90/270
+    /// wandered off-screen.
+    fn display_transform(&self, dx: f32, dy: f32, s: f32) -> AffineTransform {
+        let (bw, bh) = match &self.current {
+            Some(b) => (b.width as f32, b.height as f32),
             None => return AffineTransform::identity(),
         };
-        // Centre of the displayed rect: drawn at (offset_x, offset_y)
-        // with size (eff_w * zoom, eff_h * zoom).
-        let (ew, eh) = self.effective_size();
-        let cx = self.offset_x + ew * self.zoom * 0.5;
-        let cy = self.offset_y + eh * self.zoom * 0.5;
+        let px = bw * s * 0.5;
+        let py = bh * s * 0.5;
         let angle = self.rotation as f32 * std::f32::consts::FRAC_PI_2;
-        // AffineTransform is 2x3 (no separate Translate/Rotate helpers),
-        // so build it directly: T(cx,cy) * R(angle) * T(-cx,-cy).
-        let (s, c) = angle.sin_cos();
-        AffineTransform {
-            m11: c, m12: s,
-            m21: -s, m22: c,
-            dx: cx - c * cx + s * cy,
-            dy: cy - s * cx - c * cy,
-        }
+        let (sn, cs) = angle.sin_cos();
+        let rot = AffineTransform { m11: cs, m12: sn, m21: -sn, m22: cs, dx: 0.0, dy: 0.0 };
+        AffineTransform::translate(dx + px, dy + py)
+            .mul(rot)
+            .mul(AffineTransform::translate(-px, -py))
+            .mul(AffineTransform::scale(s))
     }
 
     fn compute_fit(&mut self) {
@@ -284,14 +283,14 @@ impl Direct2DViewer {
                         anim.from.3 + (anim.to.3 - anim.from.3) * t,
                     );
                     let s = if disp_w > 0.0 { r.2 / disp_w } else { 1.0 };
-                    // Phase 8: r is in VIEWER-RELATIVE coords (same as
-                    // offset_x/offset_y on the non-animated path) — no
-                    // viewport_origin subtraction needed here. The D2D
-                    // swapchain's origin IS the viewport origin, so a
-                    // translate of (offset_x, offset_y) draws the image
-                    // at the right place.
-                    AffineTransform::translate(r.0, r.1)
-                        .mul(AffineTransform::scale(s))
+                    // Phase 10: full T·R·T·S chain with rotation in the
+                    // correct slot (see display_transform).
+                    self.display_transform(r.0, r.1, s)
+                } else if !self.animator.is_sliding() && self.rotation != 0 {
+                    // Phase 10: resting frame with rotation — build the
+                    // full chain directly (animator's transform has no
+                    // rotation slot).
+                    self.display_transform(self.offset_x, self.offset_y, self.zoom)
                 } else {
                     self.animator.current_transform(
                         self.zoom, self.offset_x, self.offset_y,
@@ -299,14 +298,6 @@ impl Direct2DViewer {
                     )
                 };
                 let t = base.mul(cur_t);
-                // Phase 3: rotate the current image around its
-                // pre-rotation centre. The rotation is composed
-                // AFTER the fit/zoom transform so it rotates
-                // the already-fitted image, then multiplies with
-                // the STRETCH pre-compensation base. Identity for
-                // rotation == 0 so the common case is a no-op.
-                let r = self.rotation_transform();
-                let t = r.mul(t);
                 self.draw_bitmap_with_transform(&cur.d2d_bitmap, &t);
             }
 
@@ -374,9 +365,18 @@ impl Direct2DViewer {
     /// images smaller than the viewport stay centered; larger images keep
     /// at least some content covering the viewport.
     fn clamp_pan(&mut self) {
+        // Phase 10: rotation-aware — the displayed size for odd
+        // quarter-turns is height×width, so panning bounds must be
+        // computed from the EFFECTIVE dims or dragging a rotated
+        // image misbehaves (clamped against the wrong box).
         let Some(bmp) = &self.current else { return };
-        let w = bmp.width as f32 * self.zoom;
-        let h = bmp.height as f32 * self.zoom;
+        let (ew, eh) = if self.rotation % 2 == 1 {
+            (bmp.height as f32, bmp.width as f32)
+        } else {
+            (bmp.width as f32, bmp.height as f32)
+        };
+        let w = ew * self.zoom;
+        let h = eh * self.zoom;
         let vw = self.viewport_w as f32;
         let vh = self.viewport_h as f32;
         self.offset_x = if w <= vw {
