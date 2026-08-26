@@ -2,7 +2,9 @@
 
 **High-performance GPU-native image viewer for Windows.**
 
-Rust rewrite of [Aperture Neo](https://github.com/your-org/ApertureNeo) focused on maximum decode + render throughput. All GPU paths (decode → upload → composite → animate) stay on the GPU; CPU only handles transform parameters and I/O.
+Rust rewrite of [Aperture Neo](https://github.com/DuJunxi1993/Aperture-Neo) focused on maximum decode + render throughput. All GPU paths (decode → upload → composite → animate) stay on the GPU; CPU only handles transform parameters and I/O.
+
+> v1.0.0 — independent project (code and repo), ships its own Inno Setup installer. No runtime dependencies to install (statically linked exe).
 
 ## Goals
 
@@ -84,9 +86,9 @@ cargo run --release -- "C:\Users\you\Pictures"
 | P4 | Slide/zoom GPU animations | ✅ Compiles (animator done) |
 | P5 | winit + egui chrome integration | Skeleton ✅ |
 | P6 | SQLite thumbnail cache | Skeleton ✅ |
-| P7 | File system watch + navigation | Skeleton ✅ |
-| P8 | HiDPI, multi-monitor, fullscreen | TBD |
-| P9 | Inno Setup installer | TBD |
+| P7 | File system watch + navigation | ✅ Done |
+| P8 | HiDPI, multi-monitor, fullscreen, rotation, slide show | ✅ Done |
+| P9 | Inno Setup installer + default image viewer | ✅ v1.0.0 |
 
 ## Performance Constraints
 
@@ -97,4 +99,4 @@ cargo run --release -- "C:\Users\you\Pictures"
 
 ## License
 
-TBD
+MIT

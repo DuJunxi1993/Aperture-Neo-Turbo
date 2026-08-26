@@ -1,12 +1,18 @@
 [package]
 name = "aperture-neo-turbo"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
-description = "Aperture Neo Turbo — High-performance GPU image viewer"
+description = "Aperture Neo Turbo - High-performance GPU image viewer"
+license = "MIT"
+repository = "https://github.com/DuJunxi1993/Aperture-Neo-Turbo"
+authors = ["DuJunxi1993"]
 
 [[bin]]
 name = "aperture-neo-turbo"
 path = "src/main.rs"
+
+[build-dependencies]
+winresource = "0.1"
 
 [dependencies]
 aperture-core = { path = "../core" }

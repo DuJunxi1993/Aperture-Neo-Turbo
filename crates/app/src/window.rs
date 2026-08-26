@@ -596,7 +596,6 @@ impl MainWindow {
         if let Ok(handle) = window.window_handle() {
             if let RawWindowHandle::Win32(win32) = handle.as_raw() {
                 MAIN_HWND.store(win32.hwnd.get() as isize, std::sync::atomic::Ordering::Relaxed);
-                tracing::info!("MAIN_HWND stored: {:?}", win32.hwnd);
             }
         }
 
@@ -2870,10 +2869,9 @@ impl MainWindow {
         // conflicted with winit's pump). cursor is PHYSICAL pixels (the
         // router position) — passed straight through for the Win32
         // anchor.
-        let sent = self.event_loop_proxy.send_event(AppMessage::ShowImageMenu {
+        let _ = self.event_loop_proxy.send_event(AppMessage::ShowImageMenu {
             pos_phys: (cursor.x as i32, cursor.y as i32),
         });
-        tracing::info!("open_image_context_menu sent: {:?} at {:?}", sent, cursor);
     }
 
     /// Phase 16: pop the native image right-click menu (Win32
@@ -2896,7 +2894,10 @@ impl MainWindow {
         let parent = current.parent().map(|p| p.to_path_buf());
 
         let cmd = unsafe {
-            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let Some(menu) = CreatePopupMenu().ok() else {
+                tracing::warn!("CreatePopupMenu failed; skipping image context menu");
+                return;
+            };
             let item = |menu: HMENU, id: u32, text: &str| {
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
@@ -2955,7 +2956,10 @@ impl MainWindow {
         const ID_REVEAL_TREE: u32 = 5;
 
         let cmd = unsafe {
-            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let Some(menu) = CreatePopupMenu().ok() else {
+                tracing::warn!("CreatePopupMenu failed; skipping tree context menu");
+                return;
+            };
             let item = |menu: HMENU, id: u32, text: &str| {
                 let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
                 let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
@@ -3123,7 +3127,6 @@ impl ApplicationHandler<AppMessage> for MainWindow {
     }
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, message: AppMessage) {
-        tracing::info!("user_event: {:?}", message);
         match message {
             AppMessage::ShowImageMenu { pos_phys } => self.show_native_image_menu(pos_phys),
             AppMessage::ShowTreeMenu { pos_phys, path, root_idx, is_favorite } => {
