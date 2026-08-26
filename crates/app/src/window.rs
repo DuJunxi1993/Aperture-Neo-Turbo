@@ -1810,12 +1810,43 @@ impl MainWindow {
                         .color(pal.text_dim),
                 );
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    // Phase 4: back-to-top button. The previous
-                    // `↑` (U+2191) read as a stock Unicode arrow.
-                    // Replaced with `▲` (U+25B2) which sits tighter
-                    // visually and pairs better with the Linear
-                    // minimal language. Functionality unchanged.
-                    if ui.small_button("▲").on_hover_text("Back to top").clicked() {
+                    // Phase 7: back-to-top button. Phase 4 用了 `▲`
+                    // (U+25B2) Unicode 三角形，但实际渲染时感觉
+                    // 纵向偏窄（Unicode 三角形 glyph 的视觉高度
+                    // 比同等 size 的正方形小一截，跟按钮的
+                    // 32px 高度不协调）。
+                    //
+                    // 改用 Path 绘制一个填充三角形：顶点在
+                    // (cx, top)，左下 (cx - half, bottom)，
+                    // 右下 (cx + half, bottom)。Painter
+                    // 直接画到按钮位置，跟随主题 text_secondary
+                    // 颜色，跟随 Linear 极简风格。按钮整体仍
+                    // 是 egui::Button 负责 hover/click hit-testing
+                    // 和 hover_fill 背景。
+                    let (rect, btn_resp) = ui.allocate_exact_size(
+                        egui::vec2(28.0, 26.0),
+                        egui::Sense::click(),
+                    );
+                    if btn_resp.hovered() {
+                        ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
+                    }
+                    let cx = rect.center().x;
+                    let top_y = rect.top() + 5.0;
+                    let bot_y = rect.bottom() - 5.0;
+                    let half_w = (rect.width() * 0.32).max(4.5);
+                    let tri = [
+                        egui::pos2(cx, top_y),
+                        egui::pos2(cx - half_w, bot_y),
+                        egui::pos2(cx + half_w, bot_y),
+                    ];
+                    ui.painter().add(egui::Shape::convex_polygon(
+                        tri.to_vec(),
+                        pal.text_secondary,
+                        egui::Stroke::NONE,
+                    ));
+                    let btn_resp = btn_resp.on_hover_cursor(egui::CursorIcon::PointingHand)
+                        .on_hover_text("Back to top");
+                    if btn_resp.clicked() {
                         tree.state.lock().scroll_to_top = true;
                     }
                 });
