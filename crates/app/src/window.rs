@@ -1321,7 +1321,10 @@ impl MainWindow {
                 .frame(
                     egui::Frame::default()
                         .fill(pal.panel_bg)
-                        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                        // Phase 14: drop the 1px stroke (same reason as
+                        // the context menus) — it painted 0.5px inside
+                        // the frame rect and leaked past the hole.
+                        .stroke(egui::Stroke::NONE)
                         .rounding(8.0)
                         .outer_margin(egui::Margin::same(2.0))
                         .inner_margin(egui::Margin::same(12.0))
@@ -1426,7 +1429,7 @@ impl MainWindow {
                 let ctx = egui_state.ctx.clone();
                 let screen = ctx.input(|i| i.screen_rect);
                 let bg = pal.panel_bg;
-                let stroke = pal.card_stroke;
+                let _stroke = pal.card_stroke;
                 let text = pal.text_primary;
                 let text_dim = pal.text_tertiary;
                 let hover_fill = pal.hover_fill;
