@@ -784,7 +784,23 @@ impl MainWindow {
         let pal = self.pal();
         // 1. Poll decode coordinator
         if let Some(coordinator) = &self.coordinator {
+            // coordinator.poll() applies any in-flight decoded
+            // bitmap to the viewer (calls set_image on the
+            // Direct2DViewer). The image upload happens on the
+            // NEXT render, so re-arm a redraw unconditionally
+            // — without this, the first image after startup or
+            // after a navigation stays blank until the user
+            // moves the mouse (which Phase 5's input
+            // catch-all also re-arms, but only as a side
+            // effect; making it explicit here removes the
+            // 'image takes a while to appear' symptom).
+            let was_idle = !coordinator.has_queued();
             coordinator.poll();
+            if was_idle {
+                // Apply happened — schedule a frame so the
+                // viewer picks up the new bitmap this turn.
+                self.needs_redraw = true;
+            }
         }
 
         // Phase 5: re-arm a redraw if anything is still animating
@@ -3094,6 +3110,17 @@ impl ApplicationHandler for MainWindow {
                 | WindowEvent::MouseInput { .. }
                 | WindowEvent::KeyboardInput { .. }) => {
                 event_router::forward_to_egui(&mut self.router, ev);
+                // Phase 5 follow-up: any input event mutates
+                // egui's internal state (hover, click, drag,
+                // text). The next render is what makes those
+                // changes visible — without re-arming here, the
+                // UI would respond to clicks (egui's input is
+                // updated) but the visual hover/press feedback
+                // would never appear (no frame is requested).
+                // This was the root cause of the 'all content
+                // is unclickable' symptom reported after
+                // shipping the Phase 5 commit.
+                self.request_redraw();
             }
 
             _ => {}
