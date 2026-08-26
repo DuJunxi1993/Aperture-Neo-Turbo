@@ -1421,9 +1421,25 @@ impl MainWindow {
 
                 // --- Image right-click popup ---
                 if let Some(initial_pos) = self.image_ctx_menu {
-                    const EST_W: f32 = 190.0;
+                    // Phase 12: width fits the longest label (measured
+                    // through the font system) + horizontal padding —
+                    // the previous hardcoded 190px left a wide dead
+                    // strip on the right of short menus.
                     const EST_H: f32 = 190.0;
-                    let pos = edge_clamp(initial_pos, screen, EST_W, EST_H);
+                    let label_font = egui::FontId::proportional(13.0);
+                    let image_labels = [
+                        "复制图片路径",
+                        "在资源管理器中打开",
+                        "打印",
+                        "设为桌面壁纸",
+                        "在目录树中定位",
+                    ];
+                    let menu_w = image_labels.iter()
+                        .map(|l| ctx.fonts(|f|
+                            f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
+                        .fold(0.0f32, f32::max)
+                        + 28.0; // row padding (10 left + ~4 right) + frame margins
+                    let pos = edge_clamp(initial_pos, screen, menu_w, EST_H);
                     let mut close = false;
 
                     let win_resp = egui::Window::new("image_ctx_menu")
@@ -1431,7 +1447,6 @@ impl MainWindow {
                         .resizable(false)
                         .collapsible(false)
                         .fixed_pos(pos)
-                        .min_width(EST_W)
                         // Phase 11: outer_margin paints panel_bg over the
                         // hole's 1px ring (see apply_child_holes) so no
                         // light halo shows around the menu over images.
@@ -1443,7 +1458,7 @@ impl MainWindow {
                             .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
-                            ui.set_min_width(EST_W - 8.0);
+                            ui.set_min_width(menu_w);
                             let path_enabled = current_path.is_some();
                             if row(ui, "复制图片路径", path_enabled, false) {
                                 out.push(UiAction::CopyPath);
@@ -1493,9 +1508,25 @@ impl MainWindow {
                 }
                 // --- Tree right-click popup ---
                 if let Some(menu) = self.tree_ctx_menu.clone() {
-                    const EST_W: f32 = 190.0;
+                    // Phase 12: measured width (superset of all item
+                    // labels — items shown vary by root/depth, sizing to
+                    // the widest keeps every variant identical).
                     const EST_H: f32 = 210.0;
-                    let pos = edge_clamp(menu.pos, screen, EST_W, EST_H);
+                    let label_font = egui::FontId::proportional(13.0);
+                    let tree_labels = [
+                        "在资源管理器中打开",
+                        "浏览图片",
+                        "添加到收藏",
+                        "取消收藏",
+                        "从 Recent 移除",
+                        "在目录树中定位",
+                    ];
+                    let menu_w = tree_labels.iter()
+                        .map(|l| ctx.fonts(|f|
+                            f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
+                        .fold(0.0f32, f32::max)
+                        + 28.0;
+                    let pos = edge_clamp(menu.pos, screen, menu_w, EST_H);
 
                     let mut close = false;
 
@@ -1504,7 +1535,6 @@ impl MainWindow {
                         .resizable(false)
                         .collapsible(false)
                         .fixed_pos(pos)
-                        .min_width(EST_W)
                         // Phase 11: outer_margin paints panel_bg over the
                         // hole's 1px ring (see apply_child_holes) so no
                         // light halo shows around the menu over images.
@@ -1516,7 +1546,7 @@ impl MainWindow {
                             .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
-                            ui.set_min_width(EST_W - 8.0);
+                            ui.set_min_width(menu_w);
                             if menu.depth > 0 {
                                 if row(ui, "在资源管理器中打开", true, false) {
                                     out.push(UiAction::RevealInExplorer(menu.path.clone()));
