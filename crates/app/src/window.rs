@@ -27,7 +27,7 @@ use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_SETDESKWALLPAPER, SPIF_UPDATEINIFILE, SPIF_SENDCHANGE,
 };
 use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, CombineRgn, SetWindowRgn, RGN_DIFF, HRGN,
+    CreateRectRgn, CreateRoundRectRgn, CombineRgn, SetWindowRgn, RGN_DIFF, HRGN,
 };
 
 use aperture_core::{
@@ -2721,7 +2721,14 @@ impl MainWindow {
                 let ht = ((r.min.y - 1.0) * ppp - cy).round() as i32;
                 let hr = ((r.max.x + 1.0) * ppp - cx).round() as i32;
                 let hb = ((r.max.y + 1.0) * ppp - cy).round() as i32;
-                let hole = CreateRectRgn(hl, ht, hr, hb);
+                // Phase 12: ROUNDED hole. The menus have 8px-rounded
+                // corners; a rectangular hole exposed the four corners
+                // outside the menu's rounding, showing canvas-clear
+                // slivers that read as a halo no matter how tight the
+                // rect got. CreateRoundRectRgn matches the menu's shape
+                // (8 logical px + 1 for the expand, scaled to physical).
+                let radius = (9.0 * ppp).round() as i32;
+                let hole = CreateRoundRectRgn(hl, ht, hr, hb, radius, radius);
                 CombineRgn(full, full, hole, RGN_DIFF);
             }
             let _ = SetWindowRgn(child.hwnd, full, true);
@@ -2927,6 +2934,11 @@ impl MainWindow {
 
     fn action_toggle_fullscreen(&mut self) {
         self.close_shortcut_help();
+        // Phase 12: close the right-click menus too — the hole-punch
+        // region cannot track the child window through the fullscreen
+        // transition (move + resize), leaving stale transparent areas.
+        self.image_ctx_menu = None;
+        self.tree_ctx_menu = None;
         let Some(window) = &self.window else { return; };
         self.is_fullscreen = !self.is_fullscreen;
         IS_FULLSCREEN.store(self.is_fullscreen, std::sync::atomic::Ordering::Relaxed);
@@ -3407,7 +3419,10 @@ impl ApplicationHandler for MainWindow {
                     if let Some(edge) = self.panel_edge_at(cursor.x, cursor.y) {
                         // The popover's hole region can't track the child
                         // while the layout moves — close it first.
+                        // Phase 12: the right-click menus too.
                         self.close_shortcut_help();
+                        self.image_ctx_menu = None;
+                        self.tree_ctx_menu = None;
                         self.drag_panel = Some(edge);
                         self.panel_edge_hover = Some(edge);
                         return;
