@@ -1064,7 +1064,11 @@ impl MainWindow {
                                 pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
                                 (235.0 * a) as u8,
                             ))
-                            .inner_margin(egui::Margin::symmetric(0.0, 8.0 * a)),
+                            // Phase 9: zero margin — the bar draws its own
+                            // full-height centered rows; a vertical margin
+                            // here squeezed the interior to 32px for 30px
+                            // buttons (top-edge clipping).
+                            .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
                     )
                     .exact_height(bar_h)
                     .show(&egui_state.ctx, |ui| {
@@ -1500,6 +1504,15 @@ impl MainWindow {
             // controls center / info + help right) for a consistent UI.
             if !self.is_fullscreen {
                 egui::TopBottomPanel::bottom("statusbar")
+                    // Phase 9: explicit zero-margin frame — the default
+                    // panel frame's inner margin ate into the 48px bar
+                    // height, leaving the button row top-anchored and
+                    // visually clipped by the bar edge.
+                    .frame(
+                        egui::Frame::default()
+                            .fill(pal.panel_bg)
+                            .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
+                    )
                     .exact_height(STATUS_BAR_HEIGHT as f32)
                     .show(&egui_state.ctx, |ui| {
                         Self::draw_fullscreen_bar(
@@ -1750,28 +1763,35 @@ impl MainWindow {
             .clicked()
         };
 
-        // LEFT GROUP: navigation + view controls. The whole row is
-        // left-aligned (no centering attempt). `horizontal()` uses
-        // Layout::left_to_right(Align::Center), which vertically
-        // centers the buttons within the bar height.
-        ui.horizontal(|ui| {
-            ui.add_space(14.0);
-            if nav_btn(ui, "后退") { actions.push(UiAction::Prev); }
-            if nav_btn(ui, "前进") { actions.push(UiAction::Next); }
-            ui.add_space(8.0);
-            ui.add(egui::Separator::default().vertical().spacing(8.0));
-            ui.add_space(8.0);
-            if neutral_btn(ui, "适应/1:1") { actions.push(UiAction::FitOrOriginal); }
-            ui.add_space(4.0);
-            let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
-            if neutral_btn(ui, slide_glyph) { actions.push(UiAction::ToggleSlideShow); }
-            ui.add_space(4.0);
-            if neutral_btn(ui, "↻") { actions.push(UiAction::RotateImage(1)); }
-            ui.add_space(8.0);
-            ui.add(egui::Separator::default().vertical().spacing(8.0));
-            ui.add_space(8.0);
-            if neutral_btn(ui, "⛶") { actions.push(UiAction::ToggleFullscreen); }
-        });
+        // LEFT GROUP: navigation + view controls. Phase 9 fix: build
+        // the row over the FULL bar rect via new_child (same pattern
+        // that fixed the titlebar). Plain ui.horizontal() inherits
+        // whatever interior height the panel's default margins leave,
+        // which squeezed the buttons against the bar's top edge;
+        // max_rect(bar) + Align::Center guarantees true vertical
+        // centering regardless of panel chrome.
+        let mut left_row = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(bar)
+                .id_salt("fs-bar-left-row")
+                .layout(egui::Layout::left_to_right(egui::Align::Center)),
+        );
+        left_row.add_space(14.0);
+        if nav_btn(&mut left_row, "后退") { actions.push(UiAction::Prev); }
+        if nav_btn(&mut left_row, "前进") { actions.push(UiAction::Next); }
+        left_row.add_space(8.0);
+        left_row.add(egui::Separator::default().vertical().spacing(8.0));
+        left_row.add_space(8.0);
+        if neutral_btn(&mut left_row, "适应/1:1") { actions.push(UiAction::FitOrOriginal); }
+        left_row.add_space(4.0);
+        let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
+        if neutral_btn(&mut left_row, slide_glyph) { actions.push(UiAction::ToggleSlideShow); }
+        left_row.add_space(4.0);
+        if neutral_btn(&mut left_row, "↻") { actions.push(UiAction::RotateImage(1)); }
+        left_row.add_space(8.0);
+        left_row.add(egui::Separator::default().vertical().spacing(8.0));
+        left_row.add_space(8.0);
+        if neutral_btn(&mut left_row, "⛶") { actions.push(UiAction::ToggleFullscreen); }
 
         // RIGHT GROUP: filename (when there's a current image) OR
         // zoom% · resolution. Right-aligned, fixed at the right
