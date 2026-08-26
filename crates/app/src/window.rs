@@ -1066,6 +1066,48 @@ impl MainWindow {
             // Merge side panel actions into the main queue.
             actions.extend(side_actions);
 
+            // Phase 7 修复: 之前 D2D viewer 只在 ToggleTree/ToggleThumbs
+            // action 触发的 relayout_viewer() 里 resize 一次。tree_panel
+            // 和 thumb_panel 的 .anim 字段是每帧在 render_frame 开头
+            // 推进的（tick 方法返回当前动画宽度），但 viewer 的物理
+            // 大小是上一帧 toggle 时的快照。导致 tree 栏展开/收起
+            // 时，图片"等动画结束才适应"或"瞬间跳到目标位置"。
+            // thumbs 看起来好的原因可能是 wgpu/egui 的副作用。
+            //
+            // 修复: 每帧根据 tree_anim / thumb_anim 重新计算 D2D
+            // viewer 大小。relayout_viewer 已经做了相同的事，这里
+            // 直接 inline：调用 child.resize() (它会调 viewer
+            // .lock().resize() 触发 compute_fit()，图片随之
+            // 丝滑重计算 fit)。只在尺寸真正变化时调，避免
+            // 每帧的 ResizeBuffers。
+            if !self.is_fullscreen {
+                if let Some(window) = &self.window {
+                    let size = window.inner_size();
+                    let ppp_now = self
+                        .wgpu_state
+                        .as_ref()
+                        .map(|w| w.pixels_per_point)
+                        .unwrap_or(1.0)
+                        .max(0.1);
+                    let tree_w_phys =
+                        (if self.show_tree { self.tree_panel.anim.round() as u32 } else { 0 }) as f32
+                            * ppp_now;
+                    let thumb_w_phys =
+                        (if self.show_thumbs { self.thumb_panel.anim.round() as u32 } else { 0 }) as f32
+                            * ppp_now;
+                    let toolbar_phys = (TOOLBAR_HEIGHT as f32 * ppp_now).round() as u32;
+                    let status_phys = (STATUS_BAR_HEIGHT as f32 * ppp_now).round() as u32;
+                    let vx = tree_w_phys as i32;
+                    let vy = toolbar_phys as i32;
+                    let vw = size.width.saturating_sub(tree_w_phys as u32 + thumb_w_phys as u32);
+                    let vh = size.height.saturating_sub(toolbar_phys + status_phys);
+                    if let Some(child) = &mut self.viewer_child {
+                        let _ = child.resize(vx, vy, vw, vh);
+                        child.apply_position(vx, vy, vw, vh);
+                    }
+                }
+            }
+
             // ----- SHORTCUT HELP (popover directly above the "?" button) -----
             if self.show_shortcut_help {
                 let anchor = HELP_ANCHOR.with(|c| c.get());
