@@ -888,16 +888,24 @@ impl MainWindow {
             v.lock().bg = pal.d2d_clear;
         }
 
-        // The shortcuts popover must render above the image. The D2D child
-        // HWND always paints over parent content, so instead of hiding it
-        // we punch a hole in it with SetWindowRgn — the image stays visible
-        // and the popover is genuinely topmost.
-        if self.show_shortcut_help != self.help_child_hidden && !self.show_shortcut_help {
-            // Popover closed → restore the full child region.
-            self.help_child_hidden = false;
-            if let Some(child) = &self.viewer_child {
-                unsafe {
-                    let _ = SetWindowRgn(child.hwnd, HRGN::default(), true);
+        // Popovers must render above the image. The D2D child HWND
+        // always paints over parent content, so instead of hiding it
+        // we punch a hole in it with SetWindowRgn — the image stays
+        // visible and the popover is genuinely topmost. Phase 9:
+        // generalized — BOTH the shortcuts popover AND the image
+        // right-click menu need holes; the region is rebuilt from the
+        // union of visible popover rects each frame (see the punch
+        // step after the egui popup block). This pre-pass only handles
+        // the "everything closed → restore full region" transition.
+        {
+            let any_hole_popover =
+                self.show_shortcut_help || self.image_ctx_menu.is_some();
+            if !any_hole_popover && self.help_child_hidden {
+                self.help_child_hidden = false;
+                if let Some(child) = &self.viewer_child {
+                    unsafe {
+                        let _ = SetWindowRgn(child.hwnd, HRGN::default(), true);
+                    }
                 }
             }
         }
@@ -1188,18 +1196,29 @@ impl MainWindow {
                 }
             }
 
-            // ----- SHORTCUT HELP (popover directly above the "?" button) -----
+            // ----- SHORTCUT HELP (popover anchored below the "?" button) -----
+            // Phase 9: rects of all popovers that need a hole punched in
+            // the D2D child this frame. Collected while drawing, applied
+            // once after the popup block (combined region — punching
+            // twice would let the second SetWindowRgn overwrite the first).
+            let mut popover_rects: Vec<egui::Rect> = Vec::new();
             if self.show_shortcut_help {
                 let anchor = HELP_ANCHOR.with(|c| c.get());
                 let screen = egui_state.ctx.input(|i| i.screen_rect);
+                // Phase 9 fix: anchor BELOW the top-bar "?" button,
+                // right-aligned (pivot RIGHT_TOP extends the window
+                // left+down from the anchor). The previous
+                // RIGHT_BOTTOM pivot at (right+8, top-8) expanded the
+                // window UP across the title bar, covering the very
+                // button that opened it.
                 let anchor_pos = if anchor.any_nan() || anchor == egui::Rect::NOTHING {
-                    // Fallback: above the status bar's right side.
+                    // Fallback: below the title bar's right side.
                     egui::pos2(
                         screen.right() - 60.0,
-                        screen.bottom() - STATUS_BAR_HEIGHT as f32,
+                        TOOLBAR_HEIGHT as f32 + 8.0,
                     )
                 } else {
-                    egui::pos2(anchor.right() + 8.0, anchor.top() - 8.0)
+                    egui::pos2(anchor.right() + 4.0, anchor.bottom() + 6.0)
                 };
                 let help_resp = egui::Window::new(
                     egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
@@ -1215,7 +1234,7 @@ impl MainWindow {
                         .shadow(egui::Shadow::NONE),
                 )
                 .fixed_pos(anchor_pos)
-                .pivot(egui::Align2::RIGHT_BOTTOM)
+                .pivot(egui::Align2::RIGHT_TOP)
                 .resizable(false)
                 .collapsible(false)
                 .fade_in(false)
@@ -1257,28 +1276,16 @@ impl MainWindow {
                             shortcut!("Esc", "Exit fullscreen / Quit");
                         });
                 });
-                // Punch a hole in the D2D child so the popover is truly
-                // topmost over the image (region = child − popover rect).
-                if let (Some(child), Some(resp)) = (&self.viewer_child, help_resp) {
-                    let pr = resp.response.rect;
-                    let ppp = egui_state.ctx.pixels_per_point();
-                    let (cx, cy, cw, ch) = (
-                        child.hit_rect.left as f32,
-                        child.hit_rect.top as f32,
-                        child.hit_rect.right - child.hit_rect.left,
-                        child.hit_rect.bottom - child.hit_rect.top,
-                    );
-                    let hl = ((pr.min.x - 10.0) * ppp - cx).round() as i32;
-                    let ht = ((pr.min.y - 10.0) * ppp - cy).round() as i32;
-                    let hr = ((pr.max.x + 10.0) * ppp - cx).round() as i32;
-                    let hb = ((pr.max.y + 10.0) * ppp - cy).round() as i32;
-                    unsafe {
-                        let full = CreateRectRgn(0, 0, cw, ch);
-                        let hole = CreateRectRgn(hl, ht, hr, hb);
-                        CombineRgn(full, full, hole, RGN_DIFF);
-                        let _ = SetWindowRgn(child.hwnd, full, true);
+                // Phase 9: record the popover rect for the unified hole
+                // punch after the popup block, and close on any click
+                // outside the window (the ? button itself toggles via
+                // its own action — both paths converge on "closed").
+                if let Some(resp) = help_resp {
+                    if resp.response.clicked_elsewhere() {
+                        self.show_shortcut_help = false;
+                    } else {
+                        popover_rects.push(resp.response.rect);
                     }
-                    self.help_child_hidden = true;
                 }
             }
 
@@ -1313,7 +1320,7 @@ impl MainWindow {
                     let pos = edge_clamp(initial_pos, screen, EST_W, EST_H);
                     let mut close = false;
 
-                    egui::Window::new("image_ctx_menu")
+                    let win_resp = egui::Window::new("image_ctx_menu")
                         .title_bar(false)
                         .resizable(false)
                         .collapsible(false)
@@ -1372,7 +1379,20 @@ impl MainWindow {
                                 }
                             });
                         });
-                    if close {
+                    // Phase 9: close on click outside the menu window
+                    // too (item clicks set `close` above; this covers
+                    // plain dismissal). Record the rect for the hole
+                    // punch only while staying open.
+                    if let Some(resp) = win_resp {
+                        if resp.response.clicked_elsewhere() {
+                            close = true;
+                        }
+                        if close {
+                            self.image_ctx_menu = None;
+                        } else {
+                            popover_rects.push(resp.response.rect);
+                        }
+                    } else {
                         self.image_ctx_menu = None;
                     }
                 }
@@ -1384,7 +1404,7 @@ impl MainWindow {
 
                     let mut close = false;
 
-                    egui::Window::new("tree_ctx_menu")
+                    let win_resp = egui::Window::new("tree_ctx_menu")
                         .title_bar(false)
                         .resizable(false)
                         .collapsible(false)
@@ -1445,8 +1465,13 @@ impl MainWindow {
                                         close = true;
                                     }
                                 }
-                            });
+                             });
                         });
+                    if let Some(resp) = win_resp {
+                        if resp.response.clicked_elsewhere() {
+                            close = true;
+                        }
+                    }
                     if close {
                         self.tree_ctx_menu = None;
                     }
@@ -1454,6 +1479,21 @@ impl MainWindow {
                 out
             };
             self.actions.extend(popup_actions);
+
+            // ----- Phase 9: unified hole punch -----
+            // Rebuild the D2D child's window region as
+            // (child rect − Σ popover rects) in one SetWindowRgn call.
+            // Punching per-popover would let each successive call
+            // overwrite the previous region, losing earlier holes.
+            {
+                let ppp = egui_state.ctx.pixels_per_point();
+                Self::apply_child_holes(
+                    self.viewer_child.as_ref(),
+                    &mut self.help_child_hidden,
+                    &popover_rects,
+                    ppp,
+                );
+            }
 
             // ----- STATUS BAR -----
             // Same three-zone layout as the fullscreen bar (filename left /
@@ -1647,28 +1687,11 @@ impl MainWindow {
             self.apply_action(action);
         }
 
-        // Phase 2: a tree node was right-clicked during the egui frame.
-        // The egui closure couldn't call show_tree_context_menu (it
-        // requires &mut self while the egui frame holds &mut self);
-        // drain the deferred request now that the egui borrows are
-        // released. The chosen action(s) are pushed straight into
-        // self.actions so they go through the same apply_action loop
-        // below in the *next* frame (this frame's loop already
-        // completed above). Phase 8: the field is now a structured
-        // TreeCtxMenu and the actual popup is drawn by
-        // render_tree_context_menu further down — we just consume
-        // the field (set by the egui closure) and call
-        // open_tree_context_menu to populate self.tree_ctx_menu
-        // (which render_tree_context_menu reads).
-        if let Some(ctx) = self.tree_ctx_menu.take() {
-            // Re-store as the proper field used by the popup drawer.
-            // (Both are the same field — `self.tree_ctx_menu`. The
-            // egui closure wrote directly into it via the out-param;
-            // the take() consumed it. Re-storing into the same field
-            // is a no-op semantically; open_tree_context_menu is
-            // the public API for non-egui callers.)
-            self.tree_ctx_menu = Some(ctx);
-        }
+        // Phase 9: the old take/restore drain block here was a no-op
+        // (it consumed self.tree_ctx_menu and immediately re-stored
+        // it). The popup block inside the egui frame owns the full
+        // lifecycle now: it draws while Some(...) and clears on item
+        // pick / outside click.
 
         Ok(())
     }
@@ -2112,9 +2135,11 @@ impl MainWindow {
                     let mut recent_scroll = state.recent_scroll_target.take();
                     // Phase 2 + Phase 8 修复: 之前用闭包内局部 `pending` 变量，
                     // 闭包返回时被 drop 导致右键事件被静默丢弃。Phase 8 改用
-                    // 传入 `&mut Option<TreeCtxMenu>` 指向 self.tree_ctx_menu，
-                    // 闭包写入的字段在闭包返回后仍然存在。
-                    *pending_ctx = None;
+                    // 传入 `&mut Option<TreeCtxMenu>` 指向 self.tree_ctx_menu。
+                    // Phase 9 修复: 不再在此处清空！之前每帧 `*pending_ctx =
+                    // None` 会把上一帧刚写入的右键请求在 popup 绘制前抹掉，
+                    // 菜单只显示 1 帧即消失。现在字段只在用户选中菜单项或
+                    // 点击外部时由 popup 绘制块显式清除。
                     let mut max_w: f32 = 0.0;
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
@@ -2465,6 +2490,54 @@ impl MainWindow {
                     }
                 });
         });
+    }
+
+    /// Phase 9: rebuild the D2D child's window region as
+    /// (child rect − Σ popover rects), converting each logical rect
+    /// to child-local physical pixels. Static method (no `&mut self`)
+    /// so it can be called inside the egui frame where
+    /// `self.egui_state.as_mut()` holds a conflicting borrow — only
+    /// the specific fields are passed in.
+    ///
+    /// `hidden` is `help_child_hidden`: true once a region with holes
+    /// has been applied, false after a restore. When `rects` is empty
+    /// and `hidden` is set, the full (unclipped) region is restored.
+    fn apply_child_holes(
+        child: Option<&ViewerChildWindow>,
+        hidden: &mut bool,
+        rects: &[egui::Rect],
+        ppp: f32,
+    ) {
+        let Some(child) = child else { return };
+        if rects.is_empty() {
+            if !*hidden { return; }
+            *hidden = false;
+            unsafe {
+                let _ = SetWindowRgn(child.hwnd, HRGN::default(), true);
+            }
+            return;
+        }
+        let (cx, cy, cw, ch) = (
+            child.hit_rect.left as f32,
+            child.hit_rect.top as f32,
+            child.hit_rect.right - child.hit_rect.left,
+            child.hit_rect.bottom - child.hit_rect.top,
+        );
+        unsafe {
+            let full = CreateRectRgn(0, 0, cw, ch);
+            for r in rects {
+                // 10px logical padding so the popover's stroke/rounding
+                // isn't clipped by the hole edge.
+                let hl = ((r.min.x - 10.0) * ppp - cx).round() as i32;
+                let ht = ((r.min.y - 10.0) * ppp - cy).round() as i32;
+                let hr = ((r.max.x + 10.0) * ppp - cx).round() as i32;
+                let hb = ((r.max.y + 10.0) * ppp - cy).round() as i32;
+                let hole = CreateRectRgn(hl, ht, hr, hb);
+                CombineRgn(full, full, hole, RGN_DIFF);
+            }
+            let _ = SetWindowRgn(child.hwnd, full, true);
+        }
+        *hidden = true;
     }
 
     fn apply_action(&mut self, action: UiAction) {
@@ -3119,11 +3192,19 @@ impl ApplicationHandler for MainWindow {
                 && matches!(state, ElementState::Pressed)
             {
                 // Phase 8: open the image right-click context menu as
-                // an egui::Window (rendered by render_image_context_menu
-                // after the egui frame). The popup is positioned at the
+                // an egui::Window. The popup is positioned at the
                 // cursor (edge-clamped to the screen) and shows copy
                 // path / reveal / print / wallpaper / reveal-in-tree.
-                self.open_image_context_menu(egui::pos2(cursor.x, cursor.y));
+                // Phase 9 fix: router.cursor_pos is PHYSICAL pixels;
+                // egui popup positions are LOGICAL points — divide by
+                // pixels_per_point or the menu lands 25%+ off-target
+                // at 125% DPI.
+                let ppp = self.wgpu_state
+                    .as_ref()
+                    .map(|w| w.pixels_per_point)
+                    .unwrap_or(1.0)
+                    .max(0.1);
+                self.open_image_context_menu(egui::pos2(cursor.x / ppp, cursor.y / ppp));
                 return;
             }
 
