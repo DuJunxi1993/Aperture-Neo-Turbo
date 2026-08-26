@@ -53,19 +53,6 @@ pub struct Direct2DViewer {
     /// lossless; the actual transform is `rotation * 90°` degrees.
     /// NOT persisted across images (each new image starts at 0).
     rotation: u8,
-    /// Phase 8: D2D skip-when-idle flag. Set by every mutating
-    /// method (set_image / pan / wheel / zoom / rotate / resize);
-    /// cleared by render() after a successful draw. When false AND
-    /// no animation is running AND the background color is
-    /// unchanged, render() skips BeginDraw/Clear/DrawBitmap entirely
-    /// and just re-presents the existing buffer — idle frames drop
-    /// from ~2ms of D2D work to a bare Present call.
-    dirty: bool,
-    /// Last background color actually drawn. Compared against
-    /// `bg` (which render_frame re-assigns every frame for theme
-    /// sync) so a theme switch triggers exactly one redraw instead
-    /// of defeating the dirty tracking.
-    drawn_bg: [f32; 3],
 }
 
 /// Screen-rect transition between two on-screen image rectangles.
@@ -103,8 +90,6 @@ impl Direct2DViewer {
             rect_anim: None,
             pending_viewport_anim_from: None,
             rotation: 0,
-            dirty: true,
-            drawn_bg: [0.059, 0.063, 0.067],
         }
     }
 
@@ -132,7 +117,6 @@ impl Direct2DViewer {
             self.previous = None;
             self.animator.reset();
         }
-        self.dirty = true;
     }
 
     /// Phase 3: build a transform that rotates the current image
@@ -184,19 +168,12 @@ impl Direct2DViewer {
     }
 
     pub fn render(&mut self, swapchain: &SwapchainHandle, buffer_w: u32, buffer_h: u32) -> Result<()> {
-        // Phase 8: skip-when-idle. When nothing has mutated the
-        // viewer state, no animation is running, and the background
-        // color matches what was last drawn, skip the entire
-        // BeginDraw/Clear/DrawBitmap pass and just re-present the
-        // existing buffer. Idle D2D cost drops from ~2ms of draw
-        // work to a bare Present call. The swapchain keeps its last
-        // frame (DXGI flip model), so the on-screen image is
-        // unchanged.
-        let animating = self.animator.is_animating() || self.rect_anim.is_some();
-        if !self.dirty && !animating && self.bg == self.drawn_bg {
-            crate::swapchain::present(swapchain)?;
-            return Ok(());
-        }
+        // NOTE: do NOT skip the draw pass when "nothing changed".
+        // A multi-buffer DXGI flip-model swapchain rotates buffers on
+        // every Present, so presenting without redrawing shows a
+        // STALE back buffer (the frame from 2 presents ago), which
+        // alternates with freshly drawn frames as an visible flicker.
+        // Every frame must fully redraw BeginDraw/Clear/DrawBitmap.
         unsafe {
             self.gpu.d2d_dc.BeginDraw();
 
@@ -299,10 +276,6 @@ impl Direct2DViewer {
             self.gpu.d2d_dc.EndDraw(None, None)?;
             crate::swapchain::present(swapchain)?;
         }
-        // Phase 8: frame drawn — clear the dirty flag and remember
-        // the background color that was just painted.
-        self.dirty = false;
-        self.drawn_bg = self.bg;
         Ok(())
     }
 
@@ -337,7 +310,6 @@ impl Direct2DViewer {
         self.clamp_pan();
         // Instant — animated per-tick zoom feels laggy/jumpy.
         self.animator.reset();
-        self.dirty = true;
     }
 
     /// Step zoom by a multiplier (Ctrl + +/-), clamped to 50%..500%.
@@ -352,7 +324,6 @@ impl Direct2DViewer {
         self.offset_y = cy - rel_y * factor;
         self.clamp_pan();
         self.animator.reset();
-        self.dirty = true;
     }
 
     pub fn on_pan(&mut self, dx: f32, dy: f32) {
@@ -360,7 +331,6 @@ impl Direct2DViewer {
         self.offset_y += dy;
         self.clamp_pan();
         self.rect_anim = None;
-        self.dirty = true;
     }
 
     /// Clamp offsets so the image can never be dragged fully out of view:
@@ -405,7 +375,6 @@ impl Direct2DViewer {
             return; // already there
         }
         self.rect_anim = Some(RectAnim { from, to: target, start: std::time::Instant::now(), dur: 0.28 });
-        self.dirty = true;
     }
 
     /// Capture the current image rect as the "from" of an upcoming
@@ -479,7 +448,6 @@ impl Direct2DViewer {
         self.viewport_origin = (x, y);
         self.compute_fit();
         if size_changed || origin_changed {
-            self.dirty = true;
         }
         // Fullscreen (or panel-layout) transitions: animate the image from
         // where it was to the new fit — a path animation, not a zoom.
@@ -526,7 +494,6 @@ impl Direct2DViewer {
     /// next set_image (which resets to 0).
     pub fn set_rotation(&mut self, q: u8) {
         self.rotation = q & 3;
-        self.dirty = true;
         self.fit_to_screen();
     }
 
