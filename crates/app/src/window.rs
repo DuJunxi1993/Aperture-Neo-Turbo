@@ -713,6 +713,35 @@ impl MainWindow {
     fn compute_viewer_rect(&self, win_w: u32, win_h: u32) -> (i32, i32, u32, u32) {
         let tree_w = if self.show_tree { self.tree_panel.anim.round() as u32 } else { 0 };
         let thumb_w = if self.show_thumbs { self.thumb_panel.anim.round() as u32 } else { 0 };
+        self.viewer_rect_with_widths(win_w, win_h, tree_w, thumb_w)
+    }
+
+    /// Phase 11: the viewer rect after the panel animations SETTLE —
+    /// uses the panels' user widths instead of the mid-flight `anim`
+    /// values. Used to compute the fullscreen animation target in
+    /// window coords so the image glides to where it will actually
+    /// end up, independent of the panels' collapse/expand tween.
+    fn compute_final_viewer_rect(&self, win_w: u32, win_h: u32) -> (i32, i32, u32, u32) {
+        if self.is_fullscreen {
+            // Chrome hidden: the viewer covers the whole window.
+            return (0, 0, win_w, win_h);
+        }
+        let tree_w = if self.show_tree {
+            self.tree_panel.user_width.max(self.tree_panel.content_min).round() as u32
+        } else {
+            0
+        };
+        let thumb_w = if self.show_thumbs {
+            self.thumb_panel.user_width.max(self.thumb_panel.content_min).round() as u32
+        } else {
+            0
+        };
+        self.viewer_rect_with_widths(win_w, win_h, tree_w, thumb_w)
+    }
+
+    fn viewer_rect_with_widths(
+        &self, win_w: u32, win_h: u32, tree_w: u32, thumb_w: u32,
+    ) -> (i32, i32, u32, u32) {
         // Scale ALL panel sizes to physical pixels using the same
         // pixels_per_point that egui renders at, so the D2D viewer aligns
         // exactly beneath the egui panels.
@@ -2893,6 +2922,17 @@ impl MainWindow {
         } else {
             None
         });
+        // Phase 11: supply the fullscreen animation TARGET in window
+        // coords, computed from the FINAL panel layout (user widths).
+        // The image's path is then independent of the tree/thumb
+        // collapse animation — the viewport churns underneath while
+        // the image glides straight to its settled position.
+        let size = window.inner_size();
+        let (fx, fy, fw, fh) = self.compute_final_viewer_rect(size.width, size.height);
+        if let Some(v) = &self.viewer {
+            let target = v.lock().window_target_for_viewport(fx as f32, fy as f32, fw, fh);
+            v.lock().set_viewport_target(target);
+        }
     }
 
     /// Set the current image as desktop wallpaper (single monitor via SystemParametersInfo).

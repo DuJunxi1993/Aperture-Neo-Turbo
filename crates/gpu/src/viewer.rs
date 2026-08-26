@@ -47,6 +47,14 @@ pub struct Direct2DViewer {
     /// Captured image rect before a viewport change (fullscreen toggle) —
     /// the "from" of the transition once the new viewport arrives.
     pending_viewport_anim_from: Option<(f32, f32, f32, f32)>,
+    /// Phase 11: the fullscreen transition TARGET in window coords,
+    /// supplied by the host (which knows the FINAL panel layout).
+    /// Consumed together with `pending_viewport_anim_from` on the
+    /// first resize after the toggle. Keeping the target in window
+    /// coords makes the image's animation path independent of the
+    /// tree/thumb panels' collapse animation — the viewport origin
+    /// churns during the transition but the path does not.
+    pending_viewport_target: Option<(f32, f32, f32, f32)>,
     /// Phase 3: image rotation in quarter-turns (0 / 1 / 2 / 3 =
     /// 0° / 90° / 180° / 270° clockwise). Stored as an integer so
     /// round-tripping through set_image (which resets to 0) is
@@ -56,11 +64,17 @@ pub struct Direct2DViewer {
 }
 
 /// Screen-rect transition between two on-screen image rectangles.
+/// `window_space`: when true, `from`/`to` are in WINDOW coordinates
+/// and the render step subtracts the CURRENT viewport origin each
+/// frame (fullscreen transitions — the viewport moves under the
+/// animation); when false they are viewer-relative (fit / 1:1 — the
+/// viewport is static).
 struct RectAnim {
     from: (f32, f32, f32, f32),
     to: (f32, f32, f32, f32),
     start: std::time::Instant,
     dur: f32,
+    window_space: bool,
 }
 
 /// The image that is sliding out, plus the transform it was displayed with.
@@ -89,6 +103,7 @@ impl Direct2DViewer {
             bg: [0.059, 0.063, 0.067],
             rect_anim: None,
             pending_viewport_anim_from: None,
+            pending_viewport_target: None,
             rotation: 0,
         }
     }
@@ -264,10 +279,17 @@ impl Direct2DViewer {
                     if anim.start.elapsed().as_secs_f32() >= anim.dur {
                         let to = anim.to;
                         self.zoom = if disp_w > 0.0 { to.2 / disp_w } else { self.zoom };
-                        // Phase 8: `to` is viewer-relative — matches
-                        // offset_x/offset_y directly, no origin math.
-                        self.offset_x = to.0;
-                        self.offset_y = to.1;
+                        if anim.window_space {
+                            // Phase 11: window-space target — convert
+                            // back to viewer-relative using the CURRENT
+                            // origin (panels have settled by commit time;
+                            // the anim outlives the 120ms panel tween).
+                            self.offset_x = to.0 - self.viewport_origin.0;
+                            self.offset_y = to.1 - self.viewport_origin.1;
+                        } else {
+                            self.offset_x = to.0;
+                            self.offset_y = to.1;
+                        }
                         self.rect_anim = None;
                     }
                 }
@@ -290,9 +312,21 @@ impl Direct2DViewer {
                         anim.from.3 + (anim.to.3 - anim.from.3) * t,
                     );
                     let s = if disp_w > 0.0 { r.2 / disp_w } else { 1.0 };
-                    // Phase 10: full T·R·T·S chain with rotation in the
-                    // correct slot (see display_transform).
-                    self.display_transform(r.0, r.1, s)
+                    if anim.window_space {
+                        // Phase 11: subtract the CURRENT viewport origin
+                        // each frame — the image's window-space path is
+                        // fixed while the viewport (panel widths) churns
+                        // underneath, so the motion cannot sway.
+                        self.display_transform(
+                            r.0 - self.viewport_origin.0,
+                            r.1 - self.viewport_origin.1,
+                            s,
+                        )
+                    } else {
+                        // Phase 10: full per-quadrant chain (see
+                        // display_transform).
+                        self.display_transform(r.0, r.1, s)
+                    }
                 } else if !self.animator.is_sliding() && self.rotation != 0 {
                     // Phase 10: resting frame with rotation — build the
                     // full chain directly (animator's transform has no
@@ -415,34 +449,61 @@ impl Direct2DViewer {
         if (from.2 - target.2).abs() < 0.5 && (from.0 - target.0).abs() < 0.5 {
             return; // already there
         }
-        self.rect_anim = Some(RectAnim { from, to: target, start: std::time::Instant::now(), dur: 0.28 });
+        self.rect_anim = Some(RectAnim {
+            from,
+            to: target,
+            start: std::time::Instant::now(),
+            dur: 0.28,
+            window_space: false,
+        });
     }
 
     /// Capture the current image rect as the "from" of an upcoming
-    /// viewport transition (fullscreen toggle).
-    ///
-    /// Phase 7 修复: 之前 capture 的是屏幕坐标
-    /// `(viewport_origin.x + offset_x, ...)`。但 resize() 之后
-    /// viewport_origin 变成新值（例如全屏时变成 (0, 0)），而
-    /// `from` 还保留着旧值。render 里的插值是
-    /// `r.0 - viewport_origin.0`（新的 origin），所以 t=0 时
-    /// 图片出现在 `old_origin.x + old_offset - new_origin.x`
-    /// 位置 — 在全屏情况下是 `0 + 240 - 0 = 240`（windowed
-    /// 模式下的 x），然后插值到全屏居中位置 ~660，看起来图片
-    /// "向右弹"。
-    ///
-    /// 修复: 直接 capture 视口相对坐标（去掉 viewport_origin），
-    /// 渲染端的 `r.0 - viewport_origin.0` 就始终正确。
+    /// viewport transition (fullscreen toggle). Phase 11: captured in
+    /// WINDOW coords (origin + offset) — the fullscreen animation runs
+    /// in window space so the tree/thumb panels' collapse animation
+    /// (which churns the viewport origin every frame) cannot bend the
+    /// image's path.
     pub fn mark_viewport_transition(&mut self) {
         if self.current.is_some() {
             let (ew, eh) = self.effective_size();
             self.pending_viewport_anim_from = Some((
-                self.offset_x,
-                self.offset_y,
+                self.viewport_origin.0 + self.offset_x,
+                self.viewport_origin.1 + self.offset_y,
                 ew * self.zoom,
                 eh * self.zoom,
             ));
         }
+    }
+
+    /// Phase 11: supply the fullscreen transition TARGET in window
+    /// coords. The host computes it from the FINAL panel layout
+    /// (panel user-widths, not the mid-flight animation widths), so
+    /// the target is stable from the moment the toggle happens and
+    /// the image glides straight to it while the viewport settles
+    /// underneath.
+    pub fn set_viewport_target(&mut self, target: (f32, f32, f32, f32)) {
+        self.pending_viewport_target = Some(target);
+    }
+
+    /// Phase 11: where the image WILL sit once a viewport of
+    /// (fx, fy, fw, fh) settles — window coords, centered fit. Used
+    /// by the host to build the fullscreen animation target before
+    /// the viewport actually reaches that layout.
+    pub fn window_target_for_viewport(
+        &self, fx: f32, fy: f32, fw: u32, fh: u32,
+    ) -> (f32, f32, f32, f32) {
+        let (ew, eh) = self.effective_size();
+        if ew <= 0.0 || eh <= 0.0 || fw == 0 || fh == 0 {
+            return (fx, fy, 0.0, 0.0);
+        }
+        let z = (fw as f32 / ew).min(fh as f32 / eh);
+        (
+            fx + (fw as f32 - ew * z) * 0.5,
+            fy + (fh as f32 - eh * z) * 0.5,
+            ew * z,
+            eh * z,
+        )
     }
 
     pub fn fit_to_screen(&mut self) {
@@ -497,53 +558,43 @@ impl Direct2DViewer {
         self.viewport_w = w;
         self.viewport_h = h;
         self.viewport_origin = (x, y);
-        // Fullscreen (or panel-layout) transitions: animate the image from
-        // where it was to the new fit — a path animation, not a zoom.
-        // Both `from` (captured by mark_viewport_transition) and
-        // `target` are in VIEWER-RELATIVE coords, so the interpolation
-        // stays in one coord system even when the viewport origin
-        // changes.
-        //
-        // Phase 10: three branches instead of the old
-        // "skip-compute_fit-mid-flight" rule.
-        //   1. Transition just triggered (pending captured) → fit +
-        //      start the anim (unchanged).
-        //   2. Anim ALREADY in flight and the viewport changed AGAIN →
-        //      re-target: compute_fit for the new viewport and rewrite
-        //      anim.to in place, keeping the original start time so
-        //      the motion stays continuous. winit can deliver several
-        //      Resized events per toggle (restore → deferred
-        //      re-maximize), and the old code let the anim land on a
-        //      target computed for the FIRST size — the completion
-        //      commit then wrote a stale fit and the next resize
-        //      snapped it, which read as a drift/jump at the end of
-        //      every exit-from-fullscreen. Re-targeting makes "the
-        //      animation always ends where the image belongs".
-        //   3. No anim → plain compute_fit.
-        let new_fit = |viewer: &Self| -> (f32, f32, f32, f32) {
-            let (ew, eh) = viewer.effective_size();
-            (viewer.offset_x, viewer.offset_y, ew * viewer.zoom, eh * viewer.zoom)
-        };
+
+        // Phase 11: fullscreen transition — the target was supplied by
+        // the host in WINDOW coords (final panel layout), and the from
+        // was captured in window coords at toggle time. Create the
+        // window-space anim on the first resize after the toggle;
+        // afterwards the viewport can churn freely (panels collapsing)
+        // without touching the path. Re-target only when the actual
+        // WINDOW size changes (rare mid-transition).
+        if let (Some(from), Some(to)) = (
+            self.pending_viewport_anim_from.take(),
+            self.pending_viewport_target.take(),
+        ) {
+            self.rect_anim = Some(RectAnim {
+                from,
+                to,
+                start: std::time::Instant::now(),
+                dur: 0.35,
+                window_space: true,
+            });
+        }
+
+        // Fit for the new viewport (drives zoom/offset once any anim
+        // completes; the completion commit converts the window-space
+        // target back using the CURRENT origin).
+        self.compute_fit();
+
         if let Some(mut anim) = self.rect_anim.take() {
-            // Branch 2: anim in flight and the viewport changed again
-            // → re-target in place (continuous motion, correct landing).
-            if size_changed || origin_changed {
-                self.compute_fit();
-                anim.to = new_fit(self);
+            // Re-target only on a real window resize (not viewport
+            // churn): recompute the window-space target against the
+            // new window size. The host refreshes pending target via
+            // set_viewport_target on toggle; here we keep the existing
+            // target unless the anim is viewer-local (fit / 1:1).
+            if !anim.window_space && (size_changed || origin_changed) {
+                let (ew, eh) = self.effective_size();
+                anim.to = (self.offset_x, self.offset_y, ew * self.zoom, eh * self.zoom);
             }
             self.rect_anim = Some(anim);
-        } else {
-            self.compute_fit();
-            if (size_changed || origin_changed) && !self.animator.is_sliding() {
-                if let Some(from) = self.pending_viewport_anim_from.take() {
-                    self.rect_anim = Some(RectAnim {
-                        from,
-                        to: new_fit(self),
-                        start: std::time::Instant::now(),
-                        dur: 0.35,
-                    });
-                }
-            }
         }
     }
 
@@ -578,6 +629,7 @@ impl Direct2DViewer {
         self.rotation = q & 3;
         self.rect_anim = None;
         self.pending_viewport_anim_from = None;
+        self.pending_viewport_target = None;
         self.compute_fit();
     }
 
