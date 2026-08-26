@@ -1651,10 +1651,17 @@ impl MainWindow {
     }
 
     /// Fullscreen overlay control bar (auto-hides; slides up from the
-    /// bottom edge — see chrome_anim). Layout: filename left, controls
-    /// centered, zoom/res + help toggle right.
-    // Fullscreen flag: true when running as the immersive top bar (label
-    // shows "Exit"), false in the windowed status bar ("Fullscreen").
+    /// Phase 8: bottom-bar layout, redesigned.
+    /// Buttons on the LEFT (left-aligned, fixed order per the spec):
+    ///   `后退 | 前进 | 适应/1:1 | ⏵/⏸ | ↻ | ⛶`
+    /// Filename (or zoom% · resolution) on the RIGHT.
+    /// The egui `vertical_centered` helper doesn't actually center
+    /// vertically (it uses `Layout::top_down(Align::Center)`), so
+    /// the previous center-group layout always looked top-anchored.
+    /// Left-aligning the buttons + right-aligning the info is
+    /// simpler, looks more deliberate, and matches the user's
+    /// request to skip the fragile centering logic.
+    // Fullscreen flag: true when running as the immersive top bar.
     #[allow(clippy::too_many_arguments)]
     fn draw_fullscreen_bar(
         ui: &mut egui::Ui,
@@ -1670,89 +1677,6 @@ impl MainWindow {
     ) {
         let _ = nav_count;
         let bar = ui.max_rect();
-        // Side regions shrink on narrow windows so the three zones never
-        // overlap; the center keeps the controls truly centered.
-        let side_w = ((bar.width() - 480.0) / 2.0).clamp(120.0, 340.0);
-
-        // Left: file name.
-        let mut left = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(
-                    bar.min,
-                    egui::pos2(bar.left() + side_w, bar.bottom()),
-                ))
-                .id_salt("fs-bar-left")
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        left.add_space(14.0);
-        let name = current_path
-            .as_ref()
-            .and_then(|p| p.file_name())
-            .map(|n| n.to_string_lossy().into_owned())
-            .unwrap_or_else(|| "—".into());
-        left.add(
-            egui::Label::new(
-                egui::RichText::new(name).size(13.0).strong().color(pal.text_secondary),
-            )
-            .truncate(),
-        );
-
-        // Right: zoom% · resolution + "?" help toggle.
-        let mut right = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(egui::Rect::from_min_max(
-                    egui::pos2(bar.right() - side_w, bar.top()),
-                    bar.max,
-                ))
-                .id_salt("fs-bar-right")
-                .layout(egui::Layout::right_to_left(egui::Align::Center)),
-        );
-        right.add_space(10.0);
-        // Phase 7 修复: 底栏的 `?` 按钮已迁移到顶栏（Phase 4），
-        // 这里只保留缩放% · 分辨率 + 全屏图标。删除底栏的 `?` 块
-        // 及其 HELP_ANCHOR 写入（之前会指向底栏 `?` 位置，导致
-        // 快捷键面板在底栏弹出，跟我们想要的"在顶栏 `?` 上方"
-        // 的位置不一致）。
-        if let Some((w, h)) = current_size {
-            right.label(
-                egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
-                    .size(12.5)
-                    .color(pal.text_tertiary),
-            );
-        }
-
-        // Center: navigation + view controls — truly centered as a row.
-        let center_rect = egui::Rect::from_center_size(bar.center(), egui::vec2(480.0, bar.height()));
-        let mut center = ui.new_child(
-            egui::UiBuilder::new()
-                .max_rect(center_rect)
-                .id_salt("fs-bar-center")
-                .layout(egui::Layout::left_to_right(egui::Align::Center)),
-        );
-        // `centered_and_justified` STRETCHES children (one giant button);
-        // `vertical_centered` centers the row horizontally, the inner
-        // `horizontal` lays the buttons at normal size.
-        center.vertical_centered(|ui| {
-            ui.horizontal(|ui| {
-                Self::draw_nav_buttons(ui, actions, fullscreen, slide_show_running, pal);
-            });
-        });
-    }
-
-    /// Phase 3: bottom-bar controls, new layout.
-    /// `后退 (Prev) | fit (FitOrOriginal) | 幻灯片 (ToggleSlideShow) |
-    /// 旋转 (RotateImage) | 前进 (Next)`. The fullscreen button
-    /// (`⛶`) is now a Unicode glyph in both states (it moved off
-    /// the centre group to the right side of the bar; the right
-    /// side already hosts the zoom% · resolution label, so the
-    /// fullscreen glyph was added to that right-side cluster).
-    fn draw_nav_buttons(
-        ui: &mut egui::Ui,
-        actions: &mut Vec<UiAction>,
-        fullscreen: bool,
-        slide_show_running: bool,
-        pal: &Palette,
-    ) {
         // Accent-filled buttons always use white text (both themes).
         let nav_btn = |ui: &mut egui::Ui, label: &str| -> bool {
             ui.add(
@@ -1766,13 +1690,8 @@ impl MainWindow {
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
-        if nav_btn(ui, "<  后退") {
-            actions.push(UiAction::Prev);
-        }
-        ui.add_space(6.0);
-
-        // Neutral buttons: theme fill + subtle stroke so they read on both
-        // dark and light backgrounds.
+        // Neutral buttons: theme fill + subtle stroke so they read
+        // on both dark and light backgrounds.
         let neutral_btn = |ui: &mut egui::Ui, label: &str| -> bool {
             ui.add(
                 egui::Button::new(egui::RichText::new(label).size(13.0).strong())
@@ -1785,43 +1704,65 @@ impl MainWindow {
             .clicked()
         };
 
-        // fit↔1:1 cycle (Phase 3-5: single button). The label
-        // toggles between "适应" and "1:1" so the user can see
-        // the current state at a glance.
-        let fit_label = if fullscreen { "适应" } else { "适应" };
-        // (We don't have a "is_fit" view from here cheaply; the
-        // button label is a fixed string for now. Future: read
-        // is_fit_scale out of the viewer state and toggle.)
-        let _ = fit_label;
-        if neutral_btn(ui, "适应/1:1") {
-            actions.push(UiAction::FitOrOriginal);
-        }
-        ui.add_space(6.0);
+        // LEFT GROUP: navigation + view controls. The whole row is
+        // left-aligned (no centering attempt). `horizontal()` uses
+        // Layout::left_to_right(Align::Center), which vertically
+        // centers the buttons within the bar height.
+        ui.horizontal(|ui| {
+            ui.add_space(14.0);
+            if nav_btn(ui, "后退") { actions.push(UiAction::Prev); }
+            if nav_btn(ui, "前进") { actions.push(UiAction::Next); }
+            ui.add_space(8.0);
+            ui.add(egui::Separator::default().vertical().spacing(8.0));
+            ui.add_space(8.0);
+            if neutral_btn(ui, "适应/1:1") { actions.push(UiAction::FitOrOriginal); }
+            ui.add_space(4.0);
+            let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
+            if neutral_btn(ui, slide_glyph) { actions.push(UiAction::ToggleSlideShow); }
+            ui.add_space(4.0);
+            if neutral_btn(ui, "↻") { actions.push(UiAction::RotateImage(1)); }
+            ui.add_space(8.0);
+            ui.add(egui::Separator::default().vertical().spacing(8.0));
+            ui.add_space(8.0);
+            if neutral_btn(ui, "⛶") { actions.push(UiAction::ToggleFullscreen); }
+        });
 
-        // Slide show toggle (Phase 3-3): ⏵ when stopped, ⏸ when running.
-        let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
-        if neutral_btn(ui, slide_glyph) {
-            actions.push(UiAction::ToggleSlideShow);
+        // RIGHT GROUP: filename (when there's a current image) OR
+        // zoom% · resolution. Right-aligned, fixed at the right
+        // edge of the bar. Uses a separate horizontal layout with
+        // a max_rect anchored to the right side.
+        let right_rect = egui::Rect::from_min_max(
+            egui::pos2(bar.right() - 360.0, bar.top()),
+            egui::pos2(bar.right() - 14.0, bar.bottom()),
+        );
+        let mut right = ui.new_child(
+            egui::UiBuilder::new()
+                .max_rect(right_rect)
+                .id_salt("fs-bar-right")
+                .layout(egui::Layout::right_to_left(egui::Align::Center)),
+        );
+        if let Some(p) = current_path {
+            let name = p
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "—".into());
+            right.add(
+                egui::Label::new(
+                    egui::RichText::new(name)
+                        .size(13.0)
+                        .strong()
+                        .color(pal.text_secondary),
+                )
+                .truncate(),
+            );
+            right.add_space(12.0);
         }
-        ui.add_space(6.0);
-
-        // Rotate (Phase 3-2): ↻ single button, +90° clockwise.
-        if neutral_btn(ui, "↻") {
-            actions.push(UiAction::RotateImage(1));
-        }
-        ui.add_space(6.0);
-
-        if nav_btn(ui, "前进  >") {
-            actions.push(UiAction::Next);
-        }
-
-        // Fullscreen button (Phase 3-6): icon ⛶ in both states
-        // (semantic of "currently fullscreen" is conveyed by the
-        // bar's collapsed shape + the absence of chrome, not by
-        // a separate "Exit" label).
-        ui.add_space(10.0);
-        if neutral_btn(ui, "⛶") {
-            actions.push(UiAction::ToggleFullscreen);
+        if let Some((w, h)) = current_size {
+            right.label(
+                egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
+                    .size(12.5)
+                    .color(pal.text_tertiary),
+            );
         }
     }
 
