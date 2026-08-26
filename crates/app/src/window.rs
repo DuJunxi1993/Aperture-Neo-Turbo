@@ -2086,17 +2086,24 @@ impl MainWindow {
                     // 颜色，跟随 Linear 极简风格。按钮整体仍
                     // 是 egui::Button 负责 hover/click hit-testing
                     // 和 hover_fill 背景。
+                    // Phase 9: shrunk 28x26 → 20x20 and inset the
+                    // triangle 4px top/bottom with a 0.26 half-width
+                    // factor — the previous triangle dominated the
+                    // header row and sat visually heavier than the
+                    // "FOLDERS" label next to it. The hit area stays
+                    // comfortable at 20px and the row's Align::Center
+                    // layout keeps it vertically aligned with the text.
                     let (rect, btn_resp) = ui.allocate_exact_size(
-                        egui::vec2(28.0, 26.0),
+                        egui::vec2(20.0, 20.0),
                         egui::Sense::click(),
                     );
                     if btn_resp.hovered() {
                         ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
                     }
                     let cx = rect.center().x;
-                    let top_y = rect.top() + 5.0;
-                    let bot_y = rect.bottom() - 5.0;
-                    let half_w = (rect.width() * 0.32).max(4.5);
+                    let top_y = rect.top() + 4.0;
+                    let bot_y = rect.bottom() - 4.0;
+                    let half_w = (rect.width() * 0.26).max(3.5);
                     let tri = [
                         egui::pos2(cx, top_y),
                         egui::pos2(cx - half_w, bot_y),
