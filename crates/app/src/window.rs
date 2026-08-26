@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::ActiveEventLoop;
+use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -40,6 +40,32 @@ use aperture_ui::ViewerPanel;
 use crate::viewer_child::ViewerChildWindow;
 use crate::event_router::{self, RouterState};
 
+/// Phase 16: custom winit event that pops a native right-click
+/// TrackPopupMenu OUTSIDE the MouseInput handler. Popping a modal
+/// TrackPopupMenu synchronously inside the winit window_event callback
+/// conflicts with winit's own message pump (the popup's modal loop
+/// re-enters winit and the menu fails to appear), so the right-click
+/// handler records an intent and we post this event; `user_event` shows
+/// the menu in a clean context.
+#[derive(Debug, Clone)]
+pub enum AppMessage {
+    ShowImageMenu { pos_phys: (i32, i32) },
+    ShowTreeMenu {
+        pos_phys: (i32, i32),
+        path: PathBuf,
+        root_idx: usize,
+        is_favorite: bool,
+    },
+}
+
+/// Captured by the tree right-click handler, consumed when the native
+/// menu is shown.
+#[derive(Debug, Clone)]
+pub struct TreeCtxIntent {
+    pub pos_phys: (i32, i32),
+    pub path: PathBuf,
+    pub root_idx: usize,
+}
 const TREE_WIDTH: u32 = 240;
 const THUMB_WIDTH: u32 = 220;
 const TOOLBAR_HEIGHT: u32 = 40;
@@ -148,13 +174,6 @@ enum WindowGlyph {
 /// anchors); `path`/`root_idx`/`depth` drive the items shown (Recent
 /// gets "添加到收藏" / "从 Recent 移除", Favorites gets "取消收藏",
 /// This PC gets the full set including "在目录树中定位").
-#[derive(Clone)]
-struct TreeCtxMenu {
-    pos: egui::Pos2,
-    path: PathBuf,
-    root_idx: usize,
-    depth: usize,
-}
 
 /// UI theme — Dark (default) and Light, per the Aperture Neo design spec.
 /// `System` is reserved for future follow-the-OS support.
@@ -281,19 +300,14 @@ pub struct MainWindow {
     file_tree: crate::file_tree::FileTree,
     texture_cache: Arc<crate::texture_cache::TextureCache>,
     actions: Vec<UiAction>,
-    /// Phase 2: a tree node was right-clicked this frame; the egui
-    /// Phase 8: image right-click context menu state. Set by the
-    /// `WindowEvent::MouseInput` handler when the user right-clicks
-    /// over the image. Drained by `render_image_context_menu` after
-    /// the egui frame draws the popup; the picked action is pushed
-    /// into `self.actions` for the next frame's `apply_action` pass.
-    image_ctx_menu: Option<egui::Pos2>,
-    /// Phase 8: tree right-click context menu state. Similar to
-    /// `image_ctx_menu` but carries the path/root/depth so the
-    /// popup shows the right items. The egui frame can't call
-    /// show_tree_context_menu directly (needs &mut self while the
-    /// egui frame holds &mut self), so we defer to render_frame.
-    tree_ctx_menu: Option<TreeCtxMenu>,
+    /// Phase 16: proxy to post a custom AppMessage (pop a native
+    /// right-click TrackPopupMenu) into the winit event loop. Held here
+    /// so any event handler can send without owning the loop.
+    event_loop_proxy: EventLoopProxy<AppMessage>,
+    /// Phase 8: tree right-click intent recorded during the egui
+    /// frame (the tree closure can't post the AppMessage itself);
+    /// drained post-frame and sent via event_loop_proxy.
+    pending_tree_intent: Option<TreeCtxIntent>,
     /// Phase 3: slide-show state. `running` is bound by the
     /// bottom-bar play/pause button; `last` is the timestamp of
     /// the last auto-advance, used by render_frame to fire the
@@ -370,34 +384,9 @@ pub struct EguiState {
     pub renderer: egui_wgpu::Renderer,
 }
 
-/// Phase 8: shift a popup's anchor position so the popup stays
-/// fully on-screen. Phase 11: clamps ALL FOUR sides — the tree menu
-/// opens near the window's left edge and previously extended past it
-/// (only right/bottom were handled). Module-level free function —
-/// the popup drawers call it from inside egui closures that don't
-/// have access to `self`.
-fn edge_clamp(pos: egui::Pos2, screen: egui::Rect, est_w: f32, est_h: f32) -> egui::Pos2 {
-    let mut x = pos.x;
-    let mut y = pos.y;
-    const MARGIN: f32 = 4.0;
-    if x < screen.left() + MARGIN {
-        x = screen.left() + MARGIN;
-    }
-    if y < screen.top() + MARGIN {
-        y = screen.top() + MARGIN;
-    }
-    if x + est_w > screen.right() - MARGIN {
-        x = (screen.right() - est_w - MARGIN).max(screen.left() + MARGIN);
-    }
-    if y + est_h > screen.bottom() - MARGIN {
-        y = (screen.bottom() - est_h - MARGIN).max(screen.top() + MARGIN);
-    }
-    egui::pos2(x, y)
-}
-
 impl MainWindow {
 
-    pub fn new(target: LaunchTarget) -> Self {
+    pub fn new(target: LaunchTarget, event_loop_proxy: EventLoopProxy<AppMessage>) -> Self {
         let nav = Arc::new(parking_lot::Mutex::new(NavigationService::new()));
         let settings = SettingsStore::new().expect("failed to load settings");
         let last = settings.window_size().unwrap_or((DEFAULT_W, DEFAULT_H));
@@ -469,8 +458,8 @@ impl MainWindow {
                 crate::texture_cache::TextureCache::new(thumb_cache.clone())
             ),
             actions: Vec::new(),
-            image_ctx_menu: None,
-            tree_ctx_menu: None,
+            event_loop_proxy,
+            pending_tree_intent: None,
             slide_show_running: false,
             slide_show_last: None,
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
@@ -932,8 +921,7 @@ impl MainWindow {
         // step after the egui popup block). This pre-pass only handles
         // the "everything closed → restore full region" transition.
         {
-            let any_hole_popover =
-                self.show_shortcut_help || self.image_ctx_menu.is_some();
+            let any_hole_popover = self.show_shortcut_help;
             if !any_hole_popover && self.help_child_hidden {
                 self.help_child_hidden = false;
                 if let Some(child) = &self.viewer_child {
@@ -1161,7 +1149,7 @@ impl MainWindow {
                             &folder,
                             nav_count,
                             &mut side_actions,
-                            &mut self.tree_ctx_menu,
+                            &mut self.pending_tree_intent,
                             &pal,
                         );
                         self.tree_panel.content_min = min_w;
@@ -1271,7 +1259,6 @@ impl MainWindow {
             // the D2D child this frame. Collected while drawing, applied
             // once after the popup block (combined region — punching
             // twice would let the second SetWindowRgn overwrite the first).
-            let mut popover_rects: Vec<egui::Rect> = Vec::new();
             if self.show_shortcut_help {
                 let anchor = HELP_ANCHOR.with(|c| c.get());
                 let screen = egui_state.ctx.input(|i| i.screen_rect);
@@ -1381,263 +1368,20 @@ impl MainWindow {
                     if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
                         self.show_shortcut_help = false;
                     } else {
-                        // Still open (or closing via the ? toggle this
-                        // frame — either way punch the hole so it stays
-                        // visible until the state actually flips).
-                        popover_rects.push(resp.response.rect);
+                        // Still open — punch a hole in the D2D child so
+                        // the popover shows over the image area. The
+                        // right-click menus are native now and need no
+                        // hole; only the shortcuts popover does.
+                        let rects = [resp.response.rect];
+                        Self::apply_child_holes(
+                            self.viewer_child.as_ref(),
+                            &mut self.help_child_hidden,
+                            &rects,
+                            egui_state.ctx.pixels_per_point(),
+                        );
                     }
                 }
             }
-
-            // ----- Phase 8: right-click context menus (inlined) -----
-            // Drawn LAST (after all panels and overlays) so they sit
-            // on top of everything. The same egui::Window approach
-            // the shortcut help uses (see above) — works reliably
-            // across the D2D child HWND. Inlined here because the
-            // outer `let Some(egui_state) = self.egui_state.as_mut()`
-            // holds a `&mut self.egui_state` borrow that prevents any
-            // `&mut self` method call. The closure therefore captures
-            // ONLY data (no `self`), and emits a `Vec<UiAction>` for
-            // the caller to push into `self.actions` after the egui
-            // frame releases the borrow. Palette values are pulled
-            // from the `pal` local (Palette is Copy) to avoid any
-            // self.* method calls inside the borrow scope.
-            let popup_actions: Vec<UiAction> = {
-                let ctx = egui_state.ctx.clone();
-                let screen = ctx.input(|i| i.screen_rect);
-                let bg = pal.panel_bg;
-                let _stroke = pal.card_stroke;
-                let text = pal.text_primary;
-                let text_dim = pal.text_tertiary;
-                let hover_fill = pal.hover_fill;
-                // Destructive (wallpaper) accent — readable on both
-                // themes; hover wash tints the row without hiding text.
-                let red = egui::Color32::from_rgb(0xef, 0x44, 0x44);
-                let red_hover =
-                    egui::Color32::from_rgba_unmultiplied(0xdc, 0x26, 0x26, 40);
-                let current_path = self.nav.lock().current().map(|i| i.path.clone());
-                let mut out: Vec<UiAction> = Vec::new();
-
-                // Phase 12: shared menu width = the longest label across
-                // both menus ("在资源管理器中打开" dominates) measured
-                // through the font system + horizontal padding. Rows take
-                // this as an EXPLICIT width — the previous
-                // `ui.available_width()` resolved against the window's
-                // unconstrained first-pass rect and blew the menu up to
-                // ~2x the text width (set_min_width is a floor, not a
-                // ceiling).
-                let label_font = egui::FontId::proportional(13.0);
-                let all_labels = [
-                    "复制图片路径",
-                    "在资源管理器中打开",
-                    "打印",
-                    "设为桌面壁纸",
-                    "在目录树中定位",
-                    "浏览图片",
-                    "添加到收藏",
-                    "取消收藏",
-                    "从 Recent 移除",
-                ];
-                let menu_w = all_labels.iter()
-                    .map(|l| ctx.fonts(|f|
-                        f.layout_no_wrap(l.to_string(), label_font.clone(), text).size().x))
-                    .fold(0.0f32, f32::max)
-                    + 28.0; // row padding (10 left + ~4 right) + frame margins
-                // Content width inside the frame's 4px inner + 2px outer
-                // margins (12 total horizontal).
-                let row_w = menu_w - 12.0;
-                let mut row = |ui: &mut egui::Ui,
-                               label: &str,
-                               enabled: bool,
-                               destructive: bool|
-                    -> bool {
-                    let (rect, resp) = ui.allocate_exact_size(
-                        egui::vec2(row_w, 30.0),
-                        egui::Sense::click(),
-                    );
-                    if resp.hovered() && enabled {
-                        let wash = if destructive { red_hover } else { hover_fill };
-                        ui.painter().rect_filled(rect, 6.0, wash);
-                    }
-                    let color = if !enabled {
-                        text_dim
-                    } else if destructive {
-                        red
-                    } else {
-                        text
-                    };
-                    ui.painter().text(
-                        egui::pos2(rect.left() + 10.0, rect.center().y),
-                        egui::Align2::LEFT_CENTER,
-                        label,
-                        egui::FontId::proportional(13.0),
-                        color,
-                    );
-                    resp.clicked() && enabled
-                };
-
-                // --- Image right-click popup ---
-                if let Some(initial_pos) = self.image_ctx_menu {
-                    const EST_H: f32 = 190.0;
-                    let pos = edge_clamp(initial_pos, screen, menu_w, EST_H);
-                    let mut close = false;
-
-                    let win_resp = egui::Window::new("image_ctx_menu")
-                        .title_bar(false)
-                        .resizable(false)
-                        .collapsible(false)
-                        .fixed_pos(pos)
-                        // Phase 11: outer_margin paints panel_bg over the
-                        // hole's 1px ring (see apply_child_holes) so no
-                        // light halo shows around the menu over images.
-                        .frame(egui::Frame::default()
-                            .fill(bg)
-                            .stroke(egui::Stroke::NONE)
-                            .rounding(8.0)
-                            .outer_margin(egui::Margin::same(2.0))
-                            .inner_margin(egui::Margin::same(4.0))
-                            .shadow(egui::Shadow::NONE))
-                        .show(&ctx, |ui| {
-                            ui.set_min_width(menu_w);
-                            let path_enabled = current_path.is_some();
-                            if row(ui, "复制图片路径", path_enabled, false) {
-                                out.push(UiAction::CopyPath);
-                                close = true;
-                            }
-                            if row(ui, "在资源管理器中打开", path_enabled, false) {
-                                if let Some(p) = current_path.clone() {
-                                    out.push(UiAction::OpenInExplorer);
-                                    out.push(UiAction::RevealInExplorer(p));
-                                }
-                                close = true;
-                            }
-                            if row(ui, "打印", path_enabled, false) {
-                                out.push(UiAction::Print);
-                                close = true;
-                            }
-                            if row(ui, "设为桌面壁纸", path_enabled, true) {
-                                out.push(UiAction::SetWallpaper);
-                                close = true;
-                            }
-                            if row(ui, "在目录树中定位", path_enabled, false) {
-                                if let Some(p) = current_path
-                                    .clone()
-                                    .and_then(|p| p.parent().map(|q| q.to_path_buf()))
-                                {
-                                    out.push(UiAction::RevealInTree(p));
-                                }
-                                close = true;
-                            }
-                        });
-                    // Phase 9: close on click outside the menu window
-                    // too (item clicks set `close` above; this covers
-                    // plain dismissal). Record the rect for the hole
-                    // punch only while staying open.
-                    if let Some(resp) = win_resp {
-                        if resp.response.clicked_elsewhere() {
-                            close = true;
-                        }
-                        if close {
-                            self.image_ctx_menu = None;
-                        } else {
-                            popover_rects.push(resp.response.rect);
-                        }
-                    } else {
-                        self.image_ctx_menu = None;
-                    }
-                }
-                // --- Tree right-click popup ---
-                if let Some(menu) = self.tree_ctx_menu.clone() {
-                    const EST_H: f32 = 210.0;
-                    let pos = edge_clamp(menu.pos, screen, menu_w, EST_H);
-
-                    let mut close = false;
-
-                    let win_resp = egui::Window::new("tree_ctx_menu")
-                        .title_bar(false)
-                        .resizable(false)
-                        .collapsible(false)
-                        .fixed_pos(pos)
-                        // Phase 11: outer_margin paints panel_bg over the
-                        // hole's 1px ring (see apply_child_holes) so no
-                        // light halo shows around the menu over images.
-                        .frame(egui::Frame::default()
-                            .fill(bg)
-                            .stroke(egui::Stroke::NONE)
-                            .rounding(8.0)
-                            .outer_margin(egui::Margin::same(2.0))
-                            .inner_margin(egui::Margin::same(4.0))
-                            .shadow(egui::Shadow::NONE))
-                        .show(&ctx, |ui| {
-                            ui.set_min_width(menu_w);
-                            // Phase 12: streamlined item set — we're
-                            // already IN the tree, so 浏览图片 and
-                            // 在目录树中定位 are no-ops from here and were
-                            // removed. Favorite add/remove is a single
-                            // mutually-exclusive row driven by the
-                            // folder's current favorite state (previously
-                            // 添加到收藏 was only offered in the Recent
-                            // root, which made favoriting a This PC
-                            // folder impossible from its own context
-                            // menu). Rows are uniformly spaced.
-                            let is_fav = self
-                                .settings
-                                .favorite_folders()
-                                .iter()
-                                .any(|f| f == &menu.path);
-                            if menu.depth > 0 {
-                                if row(ui, "在资源管理器中打开", true, false) {
-                                    out.push(UiAction::RevealInExplorer(menu.path.clone()));
-                                    close = true;
-                                }
-                                if is_fav {
-                                    if row(ui, "取消收藏", true, false) {
-                                        out.push(UiAction::RemoveFavorite(menu.path.clone()));
-                                        close = true;
-                                    }
-                                } else if row(ui, "添加到收藏", true, false) {
-                                    out.push(UiAction::AddFavorite(menu.path.clone()));
-                                    close = true;
-                                }
-                                if menu.root_idx == 1 {
-                                    if row(ui, "从 Recent 移除", true, false) {
-                                        out.push(UiAction::RemoveRecent(menu.path.clone()));
-                                        close = true;
-                                    }
-                                }
-                                // Phase 13: locate stays available from
-                                // Recent/Favorites (jumping back into the
-                                // This PC branch is meaningful there) but
-                                // is hidden under This PC itself — picking
-                                // a folder there already IS the locate.
-                                if menu.root_idx != 2 {
-                                    if row(ui, "在目录树中定位", true, false) {
-                                        out.push(UiAction::RevealInTree(menu.path.clone()));
-                                        close = true;
-                                    }
-                                }
-                            }
-                        });
-                    if let Some(resp) = win_resp {
-                        if resp.response.clicked_elsewhere() {
-                            close = true;
-                        }
-                        if close {
-                            self.tree_ctx_menu = None;
-                        } else {
-                            // Phase 11: the tree menu joins the unified hole
-                            // punch — when it overlaps the viewer area the
-                            // D2D child would otherwise hide that part (the
-                            // tree menu used to rely on staying within the
-                            // tree panel, which the wider 190px layout
-                            // breaks on narrow panels).
-                            popover_rects.push(resp.response.rect);
-                        }
-                    }
-                }
-                out
-            };
-            self.actions.extend(popup_actions);
 
             // ----- STATUS BAR -----
             // Same three-zone layout as the fullscreen bar (filename left /
@@ -1756,27 +1500,6 @@ impl MainWindow {
                 }
             }
 
-            // ----- Phase 10: unified hole punch (AFTER child positioning) -----
-            // Rebuild the D2D child's window region as
-            // (child rect − Σ popover rects) in one SetWindowRgn call.
-            // Phase 10 fix: this MUST run after the CentralPanel
-            // resize/apply_position above — the hole conversion
-            // subtracts child.hit_rect's origin, and mid-frame the
-            // hit_rect still held the PRE-layout position (e.g. before
-            // a tree-panel width change landed). Punching with a stale
-            // origin offset the hole relative to the menu, clipping the
-            // menu's left column. Here hit_rect is authoritative.
-            {
-                let ppp = egui_state.ctx.pixels_per_point();
-                Self::apply_child_holes(
-                    self.viewer_child.as_ref(),
-                    &mut self.help_child_hidden,
-                    &popover_rects,
-                    ppp,
-                );
-            }
-
-            // Render D2D viewer AFTER positioning so the swapchain is at the
             // correct size for this frame (not the previous frame's size).
             if let Some(child) = &self.viewer_child {
                 child.render()?;
@@ -1860,11 +1583,28 @@ impl MainWindow {
             self.apply_action(action);
         }
 
-        // Phase 9: the old take/restore drain block here was a no-op
-        // (it consumed self.tree_ctx_menu and immediately re-stored
-        // it). The popup block inside the egui frame owns the full
-        // lifecycle now: it draws while Some(...) and clears on item
-        // pick / outside click.
+        // Phase 16: drain any tree right-click intent recorded during
+        // the egui frame and post the native TrackPopupMenu event. The
+        // egui closure can't call open_tree_context_menu (needs &mut
+        // self while the frame holds it), so it writes to
+        // pending_tree_intent; we send the AppMessage now that the
+        // egui borrows are released.
+        if let Some(intent) = self.pending_tree_intent.take() {
+            let is_fav = self.settings.favorite_folders().iter().any(|f| f == &intent.path);
+            // intent.pos_phys holds egui LOGICAL points; the Win32 menu
+            // anchor needs physical pixels.
+            let ppp = self.wgpu_state
+                .as_ref()
+                .map(|w| w.pixels_per_point)
+                .unwrap_or(1.0)
+                .max(0.1);
+            let _ = self.event_loop_proxy.send_event(AppMessage::ShowTreeMenu {
+                pos_phys: ((intent.pos_phys.0 as f32 * ppp) as i32, (intent.pos_phys.1 as f32 * ppp) as i32),
+                path: intent.path,
+                root_idx: intent.root_idx,
+                is_favorite: is_fav,
+            });
+        }
 
         Ok(())
     }
@@ -2231,7 +1971,7 @@ impl MainWindow {
         folder: &Option<PathBuf>,
         nav_count: usize,
         actions: &mut Vec<UiAction>,
-        pending_ctx: &mut Option<TreeCtxMenu>,
+        pending_ctx: &mut Option<TreeCtxIntent>,
         pal: &Palette,
     ) -> f32 {
         let frame = egui::Frame::default()
@@ -2401,7 +2141,7 @@ impl MainWindow {
         // pending. Some(...) = the egui closure captured a
         // secondary-click on this node; render_frame's drain step
         // reads it and calls open_tree_context_menu.
-        pending: &mut Option<TreeCtxMenu>,
+        pending: &mut Option<TreeCtxIntent>,
         recent_scroll: &mut Option<PathBuf>,
         pal: &Palette,
     ) -> f32 {
@@ -2499,7 +2239,11 @@ impl MainWindow {
             // &mut self while the egui frame has &mut self borrowed).
             if resp.secondary_clicked() {
                 if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
-                    *pending = Some(TreeCtxMenu { pos, path: path_clone.clone(), root_idx, depth });
+                    *pending = Some(TreeCtxIntent {
+                        pos_phys: (pos.x as i32, pos.y as i32),
+                        path: path_clone.clone(),
+                        root_idx,
+                    });
                 }
             }
         } else {
@@ -2563,7 +2307,11 @@ impl MainWindow {
             // "取消收藏" but not "添加到收藏" etc.).
             if header.header_response.secondary_clicked() {
                 if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
-                    *pending = Some(TreeCtxMenu { pos, path: path_clone.clone(), root_idx, depth });
+                    *pending = Some(TreeCtxIntent {
+                        pos_phys: (pos.x as i32, pos.y as i32),
+                        path: path_clone.clone(),
+                        root_idx,
+                    });
                 }
             }
         }
@@ -2970,11 +2718,7 @@ impl MainWindow {
 
     fn action_toggle_fullscreen(&mut self) {
         self.close_shortcut_help();
-        // Phase 12: close the right-click menus too — the hole-punch
-        // region cannot track the child window through the fullscreen
-        // transition (move + resize), leaving stale transparent areas.
-        self.image_ctx_menu = None;
-        self.tree_ctx_menu = None;
+        self.pending_tree_intent = None;
         let Some(window) = &self.window else { return; };
         self.is_fullscreen = !self.is_fullscreen;
         IS_FULLSCREEN.store(self.is_fullscreen, std::sync::atomic::Ordering::Relaxed);
@@ -3108,14 +2852,132 @@ impl MainWindow {
     /// truncated.
     fn open_image_context_menu(&mut self, cursor: egui::Pos2) {
         if self.nav.lock().current().is_none() { return; }
-        self.image_ctx_menu = Some(cursor);
+        // Phase 16: post a custom event; the native TrackPopupMenu pops
+        // in user_event (a modal menu inside the MouseInput callback
+        // conflicted with winit's pump). cursor is PHYSICAL pixels (the
+        // router position) — passed straight through for the Win32
+        // anchor.
+        let _ = self.event_loop_proxy.send_event(AppMessage::ShowImageMenu {
+            pos_phys: (cursor.x as i32, cursor.y as i32),
+        });
     }
 
-    /// Phase 8: tree right-click context menu. Stores the
-    /// (path, root_idx, depth, cursor) for the popup; the actual
-    /// draw is in `render_tree_context_menu`.
-    fn open_tree_context_menu(&mut self, cursor: egui::Pos2, path: PathBuf, root_idx: usize, depth: usize) {
-        self.tree_ctx_menu = Some(TreeCtxMenu { pos: cursor, path, root_idx, depth });
+    /// Phase 16: pop the native image right-click menu (Win32
+    /// TrackPopupMenu). Runs in `user_event` — a clean winit context
+    /// after the MouseInput dispatch, avoiding the modal-loop
+    /// re-entrancy that previously suppressed the menu. The selected
+    /// command id is mapped straight into a UiAction and queued.
+    fn show_native_image_menu(&mut self, pos_phys: (i32, i32)) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
+            SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
+        };
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::Foundation::POINT;
+        use windows::core::PCWSTR;
+        let Some(current) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw == 0 { return; }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        let parent = current.parent().map(|p| p.to_path_buf());
+
+        let cmd = unsafe {
+            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let item = |menu: HMENU, id: u32, text: &str| {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
+            };
+            item(menu, 1, "复制图片路径");
+            item(menu, 2, "在资源管理器中打开");
+            item(menu, 3, "打印");
+            item(menu, 4, "设为桌面壁纸");
+            item(menu, 5, "在目录树中定位");
+
+            let mut pt = POINT { x: pos_phys.0, y: pos_phys.1 };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            let _ = SetForegroundWindow(hwnd);
+            let ret = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x, pt.y, 0, hwnd, None,
+            );
+            let _ = DestroyMenu(menu);
+            (ret.0 & 0xFFFF) as u32
+        };
+        match cmd {
+            1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
+            2 => self.reveal_in_explorer(&current),
+            3 => self.print_image(current),
+            4 => self.set_wallpaper(current),
+            5 => if let Some(p) = parent { self.actions.push(UiAction::RevealInTree(p)); },
+            _ => {}
+        }
+    }
+
+    /// Phase 16: pop the native tree right-click menu. Items depend on
+    /// the entry's root + favorite state (a single mutually-exclusive
+    /// 添加到收藏 / 取消收藏 row).
+    fn show_native_tree_menu(
+        &mut self,
+        pos_phys: (i32, i32),
+        path: PathBuf,
+        root_idx: usize,
+        is_favorite: bool,
+    ) {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
+            SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
+        };
+        use windows::Win32::Graphics::Gdi::ClientToScreen;
+        use windows::Win32::Foundation::POINT;
+        use windows::core::PCWSTR;
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        if hwnd_raw == 0 { return; }
+        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+        const ID_EXPLORER: u32 = 1;
+        const ID_ADD_FAV: u32 = 2;
+        const ID_REMOVE_FAV: u32 = 3;
+        const ID_REMOVE_RECENT: u32 = 4;
+        const ID_REVEAL_TREE: u32 = 5;
+
+        let cmd = unsafe {
+            let menu = CreatePopupMenu().unwrap_or_else(|e| panic!("CreatePopupMenu: {e}"));
+            let item = |menu: HMENU, id: u32, text: &str| {
+                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
+                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
+            };
+            item(menu, ID_EXPLORER, "在资源管理器中打开");
+            if is_favorite {
+                item(menu, ID_REMOVE_FAV, "取消收藏");
+            } else {
+                item(menu, ID_ADD_FAV, "添加到收藏");
+            }
+            if root_idx == 1 {
+                item(menu, ID_REMOVE_RECENT, "从 Recent 移除");
+            }
+            if root_idx != 2 {
+                item(menu, ID_REVEAL_TREE, "在目录树中定位");
+            }
+
+            let mut pt = POINT { x: pos_phys.0, y: pos_phys.1 };
+            let _ = ClientToScreen(hwnd, &mut pt);
+            let _ = SetForegroundWindow(hwnd);
+            let ret = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
+                pt.x, pt.y, 0, hwnd, None,
+            );
+            let _ = DestroyMenu(menu);
+            (ret.0 & 0xFFFF) as u32
+        };
+        match cmd {
+            ID_EXPLORER => self.actions.push(UiAction::RevealInExplorer(path.clone())),
+            ID_ADD_FAV => self.actions.push(UiAction::AddFavorite(path.clone())),
+            ID_REMOVE_FAV => self.actions.push(UiAction::RemoveFavorite(path.clone())),
+            ID_REMOVE_RECENT => self.actions.push(UiAction::RemoveRecent(path.clone())),
+            ID_REVEAL_TREE => self.actions.push(UiAction::RevealInTree(path.clone())),
+            _ => {}
+        }
     }
 
     /// Copy text to the clipboard (CF_UNICODETEXT).
@@ -3233,7 +3095,7 @@ impl MainWindow {
     }
 }
 
-impl ApplicationHandler for MainWindow {
+impl ApplicationHandler<AppMessage> for MainWindow {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             if let Err(e) = self.init_window(event_loop) {
@@ -3242,6 +3104,15 @@ impl ApplicationHandler for MainWindow {
             }
             if let Some(w) = &self.window {
                 w.request_redraw();
+            }
+        }
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, message: AppMessage) {
+        match message {
+            AppMessage::ShowImageMenu { pos_phys } => self.show_native_image_menu(pos_phys),
+            AppMessage::ShowTreeMenu { pos_phys, path, root_idx, is_favorite } => {
+                self.show_native_tree_menu(pos_phys, path, root_idx, is_favorite)
             }
         }
     }
@@ -3432,17 +3303,6 @@ impl ApplicationHandler for MainWindow {
         if let WindowEvent::MouseInput { state, button, .. } = &event {
             let cursor = self.router.cursor_pos;
 
-            // Phase 10: while the image context menu is open, ALL mouse
-            // input over the viewer must reach egui — the menu floats
-            // over the image, and the pan/right-click handlers below
-            // consume (and `return`) every click before egui ever sees
-            // it, which made the menu's items unclickable and outside
-            // clicks unable to dismiss it. Forward and bail.
-            if self.image_ctx_menu.is_some() {
-                event_router::forward_to_egui(&mut self.router, &event);
-                return;
-            }
-
             // Panel edge drag: press on an edge → start; release → end.
             if matches!(button, MouseButton::Left) {
                 if matches!(state, ElementState::Released) {
@@ -3453,12 +3313,9 @@ impl ApplicationHandler for MainWindow {
                 }
                 if matches!(state, ElementState::Pressed) && !self.is_fullscreen {
                     if let Some(edge) = self.panel_edge_at(cursor.x, cursor.y) {
-                        // The popover's hole region can't track the child
-                        // while the layout moves — close it first.
-                        // Phase 12: the right-click menus too.
+                        // The shortcuts popover's hole region can't track
+                        // the child while the layout moves — close it.
                         self.close_shortcut_help();
-                        self.image_ctx_menu = None;
-                        self.tree_ctx_menu = None;
                         self.drag_panel = Some(edge);
                         self.panel_edge_hover = Some(edge);
                         return;
@@ -3476,20 +3333,11 @@ impl ApplicationHandler for MainWindow {
                 && matches!(button, MouseButton::Right)
                 && matches!(state, ElementState::Pressed)
             {
-                // Phase 8: open the image right-click context menu as
-                // an egui::Window. The popup is positioned at the
-                // cursor (edge-clamped to the screen) and shows copy
-                // path / reveal / print / wallpaper / reveal-in-tree.
-                // Phase 9 fix: router.cursor_pos is PHYSICAL pixels;
-                // egui popup positions are LOGICAL points — divide by
-                // pixels_per_point or the menu lands 25%+ off-target
-                // at 125% DPI.
-                let ppp = self.wgpu_state
-                    .as_ref()
-                    .map(|w| w.pixels_per_point)
-                    .unwrap_or(1.0)
-                    .max(0.1);
-                self.open_image_context_menu(egui::pos2(cursor.x / ppp, cursor.y / ppp));
+                // Phase 16: right-click over the image posts a custom
+                // event; the native TrackPopupMenu pops in user_event.
+                // cursor (the router position) is already PHYSICAL — the
+                // Win32 menu anchor needs physical screen coords.
+                self.open_image_context_menu(cursor);
                 return;
             }
 
