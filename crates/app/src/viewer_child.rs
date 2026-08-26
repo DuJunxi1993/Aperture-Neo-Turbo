@@ -24,7 +24,9 @@ use std::sync::Once;
 /// buffer stays stale for the whole jump and DXGI_SCALING_STRETCH
 /// non-uniformly scales it, visibly distorting the image. Big jumps
 /// take the immediate path: ResizeBuffers + SetWindowPos in one call.
-const BIG_JUMP_PIXELS: u64 = 200;
+/// Phase 9: 200 → 100 px so mid-size layout jumps (panel toggle while
+/// an animation is starting) also stay in sync.
+const BIG_JUMP_PIXELS: u64 = 100;
 
 pub struct ViewerChildWindow {
     pub hwnd: HWND,
@@ -152,9 +154,17 @@ impl ViewerChildWindow {
 
     /// Run the deferred ResizeBuffers once the size has been stable for a
     /// moment (e.g. after a panel drag ends).
+    ///
+    /// Phase 9: flush IMMEDIATELY while the viewer is transitioning
+    /// (slide / rect path animation) — presenting a stale buffer during
+    /// an animation lets DXGI_STRETCH apply its non-uniform scale on
+    /// top of the animated transform, which reads as bounce/skew. The
+    /// 150 ms debounce remains for plain drags, where smoothness
+    /// matters more than buffer freshness.
     pub fn flush_pending_resize(&mut self) {
         let Some(since) = self.pending_resize_since else { return };
-        if since.elapsed() < std::time::Duration::from_millis(150) {
+        let transitioning = self.viewer.lock().is_transitioning();
+        if !transitioning && since.elapsed() < std::time::Duration::from_millis(150) {
             return;
         }
         self.pending_resize_since = None;

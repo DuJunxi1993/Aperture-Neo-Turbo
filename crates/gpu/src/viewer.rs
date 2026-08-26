@@ -267,7 +267,16 @@ impl Direct2DViewer {
                 }
                 let cur_t = if let Some(anim) = &self.rect_anim {
                     let raw = (anim.start.elapsed().as_secs_f32() / anim.dur).min(1.0);
-                    let t = 1.0 - (1.0 - raw).powi(4); // ease-out quart
+                    // Phase 9: ease-IN-OUT cubic (zero velocity at both
+                    // ends). The previous quart-OUT peaked in speed at
+                    // t=0, so the first frame of the path animation
+                    // visually teleported away from the resting
+                    // position before the eye could track it.
+                    let t = if raw < 0.5 {
+                        4.0 * raw * raw * raw
+                    } else {
+                        1.0 - (-2.0 * raw + 2.0).powi(3) / 2.0
+                    };
                     let r = (
                         anim.from.0 + (anim.to.0 - anim.from.0) * t,
                         anim.from.1 + (anim.to.1 - anim.from.1) * t,
@@ -481,9 +490,6 @@ impl Direct2DViewer {
         self.viewport_w = w;
         self.viewport_h = h;
         self.viewport_origin = (x, y);
-        self.compute_fit();
-        if size_changed || origin_changed {
-        }
         // Fullscreen (or panel-layout) transitions: animate the image from
         // where it was to the new fit — a path animation, not a zoom.
         // Phase 8: both `from` (captured by mark_viewport_transition)
@@ -494,24 +500,41 @@ impl Direct2DViewer {
         // in screen coords (`x + offset`) while `from` was
         // viewer-relative — a unit mismatch that made the image
         // teleport sideways when it was right of center.
+        //
+        // Phase 9: skip compute_fit while a rect anim is in flight —
+        // its completion commit writes the authoritative final
+        // zoom/offset, and recomputing mid-flight against an evolving
+        // viewport made the landing position drift frame to frame.
+        if !self.rect_anim.is_some() {
+            self.compute_fit();
+        }
         if (size_changed || origin_changed) && !self.animator.is_sliding() {
             if let Some(from) = self.pending_viewport_anim_from.take() {
-                if let Some(bmp) = &self.current {
-                    let target = (
-                        self.offset_x,
-                        self.offset_y,
-                        bmp.width as f32 * self.zoom,
-                        bmp.height as f32 * self.zoom,
-                    );
-                    self.rect_anim = Some(RectAnim {
-                        from,
-                        to: target,
-                        start: std::time::Instant::now(),
-                        dur: 0.30,
-                    });
-                }
+                let (ew, eh) = self.effective_size();
+                let target = (
+                    self.offset_x,
+                    self.offset_y,
+                    ew * self.zoom,
+                    eh * self.zoom,
+                );
+                self.rect_anim = Some(RectAnim {
+                    from,
+                    to: target,
+                    start: std::time::Instant::now(),
+                    dur: 0.30,
+                });
             }
         }
+    }
+
+    /// Phase 9: true while any visual transition is running (slide or
+    /// rect path animation). ViewerChildWindow::flush_pending_resize
+    /// checks this to force an immediate ResizeBuffers instead of the
+    /// 150 ms debounce — presenting through a stale buffer during a
+    /// transition applies DXGI_STRETCH's non-uniform scale on top of
+    /// the animated transform, which reads as bounce / skew.
+    pub fn is_transitioning(&self) -> bool {
+        self.animator.is_animating() || self.rect_anim.is_some()
     }
 
     pub fn viewport_size(&self) -> (u32, u32) { (self.viewport_w, self.viewport_h) }
