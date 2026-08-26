@@ -1210,42 +1210,19 @@ impl MainWindow {
             // Merge side panel actions into the main queue.
             actions.extend(side_actions);
 
-            // Phase 12: belt-and-braces seam fill — paint a 1px column
-            // of panel_bg over the panel↔viewer boundaries so no canvas
-            // color can ever show through a rounding gap (the visible
-            // gray line near the bottom bar). No-op in fullscreen
-            // (panels hidden, no seams).
-            if !self.is_fullscreen {
-                let seam = egui_state.ctx.layer_painter(egui::LayerId::new(
-                    egui::Order::Middle,
-                    egui::Id::new(0x5EAF),
-                ));
-                let screen = egui_state.ctx.input(|i| i.screen_rect);
-                let top = TOOLBAR_HEIGHT as f32;
-                let bottom = screen.bottom() - STATUS_BAR_HEIGHT as f32;
-                if self.show_tree && self.tree_rect_phys.2 > 0.0 {
-                    let x = (self.tree_rect_phys.0 + self.tree_rect_phys.2) / ppp;
-                    seam.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x, top),
-                            egui::pos2(x + 1.0, bottom),
-                        ),
-                        0.0,
-                        pal.panel_bg,
-                    );
-                }
-                if self.show_thumbs && self.thumb_rect_phys.2 > 0.0 {
-                    let x = self.thumb_rect_phys.0 / ppp;
-                    seam.rect_filled(
-                        egui::Rect::from_min_max(
-                            egui::pos2(x - 1.0, top),
-                            egui::pos2(x, bottom),
-                        ),
-                        0.0,
-                        pal.panel_bg,
-                    );
-                }
-            }
+            // Phase 15: the Phase 12 "belt-and-braces" seam-fill layer is
+            // REMOVED. It painted a 1px column of panel_bg over the
+            // panel↔viewer boundary in the egui surface layer; the
+            // popover hole punches expose that egui surface, and
+            // panel_bg (egui sRGB) sits against the child's d2d_clear
+            // (a D2D linear float) — the two differ by one color step
+            // on the monitor even though the numeric values look equal,
+            // so the 'seam' read as a faint divider line through every
+            // menu/shortcut popover. The physical-px panel snapping
+            // (round(anim*ppp)/ppp) below already makes the egui panel
+            // and the D2D child share the exact same physical edge, so
+            // no filler column is needed — the panel background and the
+            // child's clear color meet directly with no gap to expose.
 
             // Phase 7 修复: 之前 D2D viewer 只在 ToggleTree/ToggleThumbs
             // action 触发的 relayout_viewer() 里 resize 一次。tree_panel
