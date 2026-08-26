@@ -492,37 +492,50 @@ impl Direct2DViewer {
         self.viewport_origin = (x, y);
         // Fullscreen (or panel-layout) transitions: animate the image from
         // where it was to the new fit — a path animation, not a zoom.
-        // Phase 8: both `from` (captured by mark_viewport_transition)
-        // and `target` are in VIEWER-RELATIVE coords, so the
-        // interpolation stays in one coord system even when the
-        // viewport origin changes (e.g. windowed → fullscreen moves
-        // origin from ~(240, 44) to (0, 0)). Previously `target` was
-        // in screen coords (`x + offset`) while `from` was
-        // viewer-relative — a unit mismatch that made the image
-        // teleport sideways when it was right of center.
+        // Both `from` (captured by mark_viewport_transition) and
+        // `target` are in VIEWER-RELATIVE coords, so the interpolation
+        // stays in one coord system even when the viewport origin
+        // changes.
         //
-        // Phase 9: skip compute_fit while a rect anim is in flight —
-        // its completion commit writes the authoritative final
-        // zoom/offset, and recomputing mid-flight against an evolving
-        // viewport made the landing position drift frame to frame.
-        if !self.rect_anim.is_some() {
+        // Phase 10: three branches instead of the old
+        // "skip-compute_fit-mid-flight" rule.
+        //   1. Transition just triggered (pending captured) → fit +
+        //      start the anim (unchanged).
+        //   2. Anim ALREADY in flight and the viewport changed AGAIN →
+        //      re-target: compute_fit for the new viewport and rewrite
+        //      anim.to in place, keeping the original start time so
+        //      the motion stays continuous. winit can deliver several
+        //      Resized events per toggle (restore → deferred
+        //      re-maximize), and the old code let the anim land on a
+        //      target computed for the FIRST size — the completion
+        //      commit then wrote a stale fit and the next resize
+        //      snapped it, which read as a drift/jump at the end of
+        //      every exit-from-fullscreen. Re-targeting makes "the
+        //      animation always ends where the image belongs".
+        //   3. No anim → plain compute_fit.
+        let new_fit = |viewer: &Self| -> (f32, f32, f32, f32) {
+            let (ew, eh) = viewer.effective_size();
+            (viewer.offset_x, viewer.offset_y, ew * viewer.zoom, eh * viewer.zoom)
+        };
+        if let Some(mut anim) = self.rect_anim.take() {
+            // Branch 2: anim in flight and the viewport changed again
+            // → re-target in place (continuous motion, correct landing).
+            if size_changed || origin_changed {
+                self.compute_fit();
+                anim.to = new_fit(self);
+            }
+            self.rect_anim = Some(anim);
+        } else {
             self.compute_fit();
-        }
-        if (size_changed || origin_changed) && !self.animator.is_sliding() {
-            if let Some(from) = self.pending_viewport_anim_from.take() {
-                let (ew, eh) = self.effective_size();
-                let target = (
-                    self.offset_x,
-                    self.offset_y,
-                    ew * self.zoom,
-                    eh * self.zoom,
-                );
-                self.rect_anim = Some(RectAnim {
-                    from,
-                    to: target,
-                    start: std::time::Instant::now(),
-                    dur: 0.30,
-                });
+            if (size_changed || origin_changed) && !self.animator.is_sliding() {
+                if let Some(from) = self.pending_viewport_anim_from.take() {
+                    self.rect_anim = Some(RectAnim {
+                        from,
+                        to: new_fit(self),
+                        start: std::time::Instant::now(),
+                        dur: 0.35,
+                    });
+                }
             }
         }
     }
