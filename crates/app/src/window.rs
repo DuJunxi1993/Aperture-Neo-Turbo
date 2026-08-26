@@ -1282,12 +1282,38 @@ impl MainWindow {
                 });
                 // Phase 9: record the popover rect for the unified hole
                 // punch after the popup block, and close on any click
-                // outside the window (the ? button itself toggles via
-                // its own action — both paths converge on "closed").
+                // outside the window.
+                //
+                // Phase 10 fix: clicks on the `?` button itself are
+                // EXCLUDED from clicked_elsewhere. The ? handler queues
+                // UiAction::ToggleShortcutHelp this same frame; if the
+                // popover also closed itself here, apply_action's toggle
+                // flipped it straight back open — the panel could never
+                // be dismissed via the button. With the exclusion, the
+                // button path closes via the toggle action, and any
+                // other outside click closes via clicked_elsewhere.
                 if let Some(resp) = help_resp {
-                    if resp.response.clicked_elsewhere() {
+                    // Click position this frame (None = no click).
+                    let pointer = egui_state.ctx.input(|i| i.pointer.latest_pos());
+                    let anchor = HELP_ANCHOR.with(|c| c.get());
+                    let anchor_valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
+                    let clicked_on_help_btn = match pointer {
+                        Some(p) => {
+                            anchor_valid
+                                && egui::Rect::from_min_max(
+                                    anchor.min - egui::Vec2::splat(2.0),
+                                    anchor.max + egui::Vec2::splat(2.0),
+                                )
+                                .contains(p)
+                        }
+                        None => false,
+                    };
+                    if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
                         self.show_shortcut_help = false;
                     } else {
+                        // Still open (or closing via the ? toggle this
+                        // frame — either way punch the hole so it stays
+                        // visible until the state actually flips).
                         popover_rects.push(resp.response.rect);
                     }
                 }
@@ -1484,21 +1510,6 @@ impl MainWindow {
             };
             self.actions.extend(popup_actions);
 
-            // ----- Phase 9: unified hole punch -----
-            // Rebuild the D2D child's window region as
-            // (child rect − Σ popover rects) in one SetWindowRgn call.
-            // Punching per-popover would let each successive call
-            // overwrite the previous region, losing earlier holes.
-            {
-                let ppp = egui_state.ctx.pixels_per_point();
-                Self::apply_child_holes(
-                    self.viewer_child.as_ref(),
-                    &mut self.help_child_hidden,
-                    &popover_rects,
-                    ppp,
-                );
-            }
-
             // ----- STATUS BAR -----
             // Same three-zone layout as the fullscreen bar (filename left /
             // controls center / info + help right) for a consistent UI.
@@ -1614,6 +1625,26 @@ impl MainWindow {
                         child.apply_position(px, py, pw, ph);
                     }
                 }
+            }
+
+            // ----- Phase 10: unified hole punch (AFTER child positioning) -----
+            // Rebuild the D2D child's window region as
+            // (child rect − Σ popover rects) in one SetWindowRgn call.
+            // Phase 10 fix: this MUST run after the CentralPanel
+            // resize/apply_position above — the hole conversion
+            // subtracts child.hit_rect's origin, and mid-frame the
+            // hit_rect still held the PRE-layout position (e.g. before
+            // a tree-panel width change landed). Punching with a stale
+            // origin offset the hole relative to the menu, clipping the
+            // menu's left column. Here hit_rect is authoritative.
+            {
+                let ppp = egui_state.ctx.pixels_per_point();
+                Self::apply_child_holes(
+                    self.viewer_child.as_ref(),
+                    &mut self.help_child_hidden,
+                    &popover_rects,
+                    ppp,
+                );
             }
 
             // Render D2D viewer AFTER positioning so the swapchain is at the
@@ -3187,6 +3218,17 @@ impl ApplicationHandler for MainWindow {
         // ---- Mouse input: pan, panel-edge drag start/end, dbl-click ----
         if let WindowEvent::MouseInput { state, button, .. } = &event {
             let cursor = self.router.cursor_pos;
+
+            // Phase 10: while the image context menu is open, ALL mouse
+            // input over the viewer must reach egui — the menu floats
+            // over the image, and the pan/right-click handlers below
+            // consume (and `return`) every click before egui ever sees
+            // it, which made the menu's items unclickable and outside
+            // clicks unable to dismiss it. Forward and bail.
+            if self.image_ctx_menu.is_some() {
+                event_router::forward_to_egui(&mut self.router, &event);
+                return;
+            }
 
             // Panel edge drag: press on an edge → start; release → end.
             if matches!(button, MouseButton::Left) {
