@@ -1145,9 +1145,19 @@ impl MainWindow {
                             .inner_margin(egui::Margin::same(0.0)),
                     )
                     .show(&egui_state.ctx, |ui| {
+                        // Phase 14: pass the nav's CURRENT FOLDER, not
+                        // its current image's path. ImageItem.path is
+                        // a file; tree nodes are folders, so the old
+                        // `current_path` made is_current() never match.
+                        // Also pass the user-pinned active root so the
+                        // highlight follows the row the user last
+                        // picked from (a folder may live in Favorites +
+                        // Recent; we only highlight the active row).
+                        let current_folder = self.nav.lock().folder().cloned();
                         let min_w = Self::draw_tree_panel_static(
                             ui,
                             &self.file_tree,
+                            current_folder,
                             &folder,
                             nav_count,
                             &mut side_actions,
@@ -1502,7 +1512,7 @@ impl MainWindow {
                         // light halo shows around the menu over images.
                         .frame(egui::Frame::default()
                             .fill(bg)
-                            .stroke(egui::Stroke::new(1.0, stroke))
+                            .stroke(egui::Stroke::NONE)
                             .rounding(8.0)
                             .outer_margin(egui::Margin::same(2.0))
                             .inner_margin(egui::Margin::same(4.0))
@@ -1573,7 +1583,7 @@ impl MainWindow {
                         // light halo shows around the menu over images.
                         .frame(egui::Frame::default()
                             .fill(bg)
-                            .stroke(egui::Stroke::new(1.0, stroke))
+                            .stroke(egui::Stroke::NONE)
                             .rounding(8.0)
                             .outer_margin(egui::Margin::same(2.0))
                             .inner_margin(egui::Margin::same(4.0))
@@ -2233,6 +2243,11 @@ impl MainWindow {
     fn draw_tree_panel_static(
         ui: &mut egui::Ui,
         tree: &crate::file_tree::FileTree,
+        // Phase 14: the nav's CURRENT FOLDER, used by the tree for
+        // highlighting the active row. (Was previously `current_path`
+        // = `ImageItem.path`, i.e. a file — which never matches the
+        // folder path of a tree node, so is_current() never fired.)
+        current_folder: Option<PathBuf>,
         folder: &Option<PathBuf>,
         nav_count: usize,
         actions: &mut Vec<UiAction>,
@@ -2364,7 +2379,7 @@ impl MainWindow {
                     let mut max_w: f32 = 0.0;
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
-                            ui, root, 0, folder, &mut expanded, actions, root_idx,
+                            ui, root, 0, &current_folder, &mut expanded, actions, root_idx,
                             &reveal, &mut revealed, pending_ctx,
                             &mut recent_scroll, &pal,
                         ));
@@ -2391,7 +2406,11 @@ impl MainWindow {
         ui: &mut egui::Ui,
         node: &mut crate::file_tree::TreeNode,
         depth: usize,
-        current: &Option<PathBuf>,
+        // Phase 14: the nav's current FOLDER (used for the active
+        // row's indigo card). Was previously a file path
+        // (`ImageItem.path` via `nav.current()`) which never matched
+        // a tree node's folder path — is_current() never fired.
+        current_folder: &Option<PathBuf>,
         expanded: &mut [std::collections::HashSet<std::path::PathBuf>; 3],
         actions: &mut Vec<UiAction>,
         root_idx: usize,
@@ -2425,7 +2444,7 @@ impl MainWindow {
         // Highlight only in the root the user last picked a folder from —
         // the same path may be registered in both Recent and Favorites.
         let active_root = ACTIVE_ROOT.load(std::sync::atomic::Ordering::Relaxed);
-        let is_current = current
+        let is_current = current_folder
             .as_ref()
             .map(|c| c == &node.path && root_idx == active_root)
             .unwrap_or(false);
@@ -2523,7 +2542,7 @@ impl MainWindow {
                     }
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
-                            ui, child, depth + 1, current, expanded, actions, root_idx,
+                            ui, child, depth + 1, current_folder, expanded, actions, root_idx,
                             reveal, revealed, pending, recent_scroll, pal,
                         );
                         max_w = max_w.max(w);
@@ -2545,7 +2564,7 @@ impl MainWindow {
                 // This PC) hides the current node — scroll the matching
                 // Recent entry into view so the selection keeps a home.
                 if is_open && root_idx == 2 {
-                    if let Some(cur) = current {
+                    if let Some(cur) = current_folder {
                         if cur != &path_clone && cur.starts_with(&path_clone) {
                             *recent_scroll = Some(cur.clone());
                         }
