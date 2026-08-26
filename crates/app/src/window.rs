@@ -1339,14 +1339,55 @@ impl MainWindow {
                 let stroke = pal.card_stroke;
                 let text = pal.text_primary;
                 let text_dim = pal.text_tertiary;
-                let btn_fill = pal.button_fill;
+                let hover_fill = pal.hover_fill;
+                // Destructive (wallpaper) accent — readable on both
+                // themes; hover wash tints the row without hiding text.
+                let red = egui::Color32::from_rgb(0xef, 0x44, 0x44);
+                let red_hover =
+                    egui::Color32::from_rgba_unmultiplied(0xdc, 0x26, 0x26, 40);
                 let current_path = self.nav.lock().current().map(|i| i.path.clone());
                 let mut out: Vec<UiAction> = Vec::new();
 
+                // Phase 10: menu row styled after the Aperture Neo main
+                // project's context menu (reference screenshot): full-width
+                // 30px rows, 13px left-aligned label, 6px-rounded hover
+                // wash, red destructive item, no separators — grouping
+                // reads through spacing alone. Auto height (min_width
+                // only) so the window hugs its content.
+                let mut row = |ui: &mut egui::Ui,
+                               label: &str,
+                               enabled: bool,
+                               destructive: bool|
+                    -> bool {
+                    let (rect, resp) = ui.allocate_exact_size(
+                        egui::vec2(ui.available_width(), 30.0),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() && enabled {
+                        let wash = if destructive { red_hover } else { hover_fill };
+                        ui.painter().rect_filled(rect, 6.0, wash);
+                    }
+                    let color = if !enabled {
+                        text_dim
+                    } else if destructive {
+                        red
+                    } else {
+                        text
+                    };
+                    ui.painter().text(
+                        egui::pos2(rect.left() + 10.0, rect.center().y),
+                        egui::Align2::LEFT_CENTER,
+                        label,
+                        egui::FontId::proportional(13.0),
+                        color,
+                    );
+                    resp.clicked() && enabled
+                };
+
                 // --- Image right-click popup ---
                 if let Some(initial_pos) = self.image_ctx_menu {
-                    const EST_W: f32 = 200.0;
-                    const EST_H: f32 = 200.0;
+                    const EST_W: f32 = 190.0;
+                    const EST_H: f32 = 190.0;
                     let pos = edge_clamp(initial_pos, screen, EST_W, EST_H);
                     let mut close = false;
 
@@ -1355,59 +1396,44 @@ impl MainWindow {
                         .resizable(false)
                         .collapsible(false)
                         .fixed_pos(pos)
-                        .fixed_size(egui::vec2(EST_W, EST_H))
+                        .min_width(EST_W)
                         .frame(egui::Frame::default()
                             .fill(bg)
                             .stroke(egui::Stroke::new(1.0, stroke))
                             .rounding(8.0)
-                            .inner_margin(egui::Margin::same(6.0))
+                            .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(EST_W - 16.0);
-                                let path_enabled = current_path.is_some();
-                                let draw_btn = |ui: &mut egui::Ui, label: &str, enabled: bool| -> bool {
-                                    let color = if enabled { text } else { text_dim };
-                                    ui.add_enabled(enabled, egui::Button::new(
-                                        egui::RichText::new(label).size(13.0).color(color))
-                                        .fill(btn_fill).frame(false))
-                                        .clicked()
-                                };
-                                if draw_btn(ui, "复制图片路径", path_enabled) && path_enabled {
-                                    out.push(UiAction::CopyPath);
-                                    close = true;
+                            ui.set_min_width(EST_W - 8.0);
+                            let path_enabled = current_path.is_some();
+                            if row(ui, "复制图片路径", path_enabled, false) {
+                                out.push(UiAction::CopyPath);
+                                close = true;
+                            }
+                            if row(ui, "在资源管理器中打开", path_enabled, false) {
+                                if let Some(p) = current_path.clone() {
+                                    out.push(UiAction::OpenInExplorer);
+                                    out.push(UiAction::RevealInExplorer(p));
                                 }
-                                if draw_btn(ui, "在资源管理器中打开", path_enabled) && path_enabled {
-                                    if let Some(p) = current_path.clone() {
-                                        out.push(UiAction::OpenInExplorer);
-                                        out.push(UiAction::RevealInExplorer(p));
-                                    }
-                                    close = true;
+                                close = true;
+                            }
+                            if row(ui, "打印", path_enabled, false) {
+                                out.push(UiAction::Print);
+                                close = true;
+                            }
+                            if row(ui, "设为桌面壁纸", path_enabled, true) {
+                                out.push(UiAction::SetWallpaper);
+                                close = true;
+                            }
+                            if row(ui, "在目录树中定位", path_enabled, false) {
+                                if let Some(p) = current_path
+                                    .clone()
+                                    .and_then(|p| p.parent().map(|q| q.to_path_buf()))
+                                {
+                                    out.push(UiAction::RevealInTree(p));
                                 }
-                                ui.add_space(2.0);
-                                ui.separator();
-                                ui.add_space(2.0);
-                                if draw_btn(ui, "打印", path_enabled) && path_enabled {
-                                    out.push(UiAction::Print);
-                                    close = true;
-                                }
-                                if draw_btn(ui, "设为桌面壁纸", path_enabled) && path_enabled {
-                                    out.push(UiAction::SetWallpaper);
-                                    close = true;
-                                }
-                                ui.add_space(2.0);
-                                ui.separator();
-                                ui.add_space(2.0);
-                                if draw_btn(ui, "在目录树中定位", path_enabled) && path_enabled {
-                                    if let Some(p) = current_path
-                                        .clone()
-                                        .and_then(|p| p.parent().map(|q| q.to_path_buf()))
-                                    {
-                                        out.push(UiAction::RevealInTree(p));
-                                    }
-                                    close = true;
-                                }
-                            });
+                                close = true;
+                            }
                         });
                     // Phase 9: close on click outside the menu window
                     // too (item clicks set `close` above; this covers
@@ -1428,8 +1454,8 @@ impl MainWindow {
                 }
                 // --- Tree right-click popup ---
                 if let Some(menu) = self.tree_ctx_menu.clone() {
-                    const EST_W: f32 = 200.0;
-                    const EST_H: f32 = 180.0;
+                    const EST_W: f32 = 190.0;
+                    const EST_H: f32 = 210.0;
                     let pos = edge_clamp(menu.pos, screen, EST_W, EST_H);
 
                     let mut close = false;
@@ -1439,63 +1465,51 @@ impl MainWindow {
                         .resizable(false)
                         .collapsible(false)
                         .fixed_pos(pos)
-                        .fixed_size(egui::vec2(EST_W, EST_H))
+                        .min_width(EST_W)
                         .frame(egui::Frame::default()
                             .fill(bg)
                             .stroke(egui::Stroke::new(1.0, stroke))
                             .rounding(8.0)
-                            .inner_margin(egui::Margin::same(6.0))
+                            .inner_margin(egui::Margin::same(4.0))
                             .shadow(egui::Shadow::NONE))
                         .show(&ctx, |ui| {
-                            ui.vertical(|ui| {
-                                ui.set_width(EST_W - 16.0);
-                                let draw_btn = |ui: &mut egui::Ui, label: &str| -> bool {
-                                    ui.add(egui::Button::new(
-                                        egui::RichText::new(label).size(13.0).color(text))
-                                        .fill(btn_fill).frame(false))
-                                        .clicked()
-                                };
-                                if menu.depth > 0 {
-                                    if draw_btn(ui, "在资源管理器中打开") {
-                                        out.push(UiAction::RevealInExplorer(menu.path.clone()));
-                                        close = true;
-                                    }
-                                    if draw_btn(ui, "浏览图片") {
-                                        out.push(UiAction::FolderChosen(menu.path.clone(), menu.root_idx));
-                                        close = true;
-                                    }
-                                    ui.add_space(2.0);
-                                    ui.separator();
-                                    ui.add_space(2.0);
+                            ui.set_min_width(EST_W - 8.0);
+                            if menu.depth > 0 {
+                                if row(ui, "在资源管理器中打开", true, false) {
+                                    out.push(UiAction::RevealInExplorer(menu.path.clone()));
+                                    close = true;
                                 }
-                                if menu.root_idx == 1 && menu.depth > 0 {
-                                    if draw_btn(ui, "添加到收藏") {
-                                        out.push(UiAction::AddFavorite(menu.path.clone()));
-                                        close = true;
-                                    }
+                                if row(ui, "浏览图片", true, false) {
+                                    out.push(UiAction::FolderChosen(menu.path.clone(), menu.root_idx));
+                                    close = true;
                                 }
-                                if menu.root_idx == 0 && menu.depth > 0 {
-                                    if draw_btn(ui, "取消收藏") {
-                                        out.push(UiAction::RemoveFavorite(menu.path.clone()));
-                                        close = true;
-                                    }
+                                ui.add_space(4.0);
+                            }
+                            if menu.root_idx == 1 && menu.depth > 0 {
+                                if row(ui, "添加到收藏", true, false) {
+                                    out.push(UiAction::AddFavorite(menu.path.clone()));
+                                    close = true;
                                 }
-                                if menu.root_idx == 1 && menu.depth > 0 {
-                                    if draw_btn(ui, "从 Recent 移除") {
-                                        out.push(UiAction::RemoveRecent(menu.path.clone()));
-                                        close = true;
-                                    }
+                            }
+                            if menu.root_idx == 0 && menu.depth > 0 {
+                                if row(ui, "取消收藏", true, false) {
+                                    out.push(UiAction::RemoveFavorite(menu.path.clone()));
+                                    close = true;
                                 }
-                                if menu.depth > 0 {
-                                    ui.add_space(2.0);
-                                    ui.separator();
-                                    ui.add_space(2.0);
-                                    if draw_btn(ui, "在目录树中定位") {
-                                        out.push(UiAction::RevealInTree(menu.path.clone()));
-                                        close = true;
-                                    }
+                            }
+                            if menu.root_idx == 1 && menu.depth > 0 {
+                                if row(ui, "从 Recent 移除", true, false) {
+                                    out.push(UiAction::RemoveRecent(menu.path.clone()));
+                                    close = true;
                                 }
-                             });
+                            }
+                            if menu.depth > 0 {
+                                ui.add_space(4.0);
+                                if row(ui, "在目录树中定位", true, false) {
+                                    out.push(UiAction::RevealInTree(menu.path.clone()));
+                                    close = true;
+                                }
+                            }
                         });
                     if let Some(resp) = win_resp {
                         if resp.response.clicked_elsewhere() {
