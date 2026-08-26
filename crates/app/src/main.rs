@@ -49,19 +49,7 @@ fn main() -> Result<()> {
     };
 
     let event_loop = winit::event_loop::EventLoop::new()?;
-    // Phase 5: switch from Poll to Wait. The previous Poll
-    // caused the event loop to re-enter ~60 times per second even
-    // when nothing was happening, which is wasteful — each tick
-    // pulled a frame, ran the egui frame, and presented a
-    // swapchain image. With Wait, the loop only re-enters when
-    // we explicitly request a redraw (every input, every
-    // animation tick, every decoded bitmap, every panel
-    // width tween). Idle CPU drops to near zero. The same
-    // `request_redraw()` call sites already enumerated in
-    // MainWindow drive the new behaviour; we just stop
-    // unconditionally re-arming the redraw at the bottom of
-    // every frame in the WindowEvent::RedrawRequested handler.
-    event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+    event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
     let mut app = window::MainWindow::new(target);
     event_loop.run_app(&mut app)?;

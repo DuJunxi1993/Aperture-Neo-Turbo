@@ -277,10 +277,10 @@ pub struct MainWindow {
     /// site that knows the next frame will differ from the
     /// current one (input, animation tick, decoded bitmap,
     /// panel-width tween, HELP_ANCHOR change, slide-show
-    /// auto-advance). The RedrawRequested handler consults it:
-    /// if true, it re-arms request_redraw; if false, the loop
-    /// stays in Wait and CPU drops to zero.
-    needs_redraw: bool,
+    /// auto-advance). Removed in Phase 7 — see RedrawRequested
+    /// handler for the rationale (ControlFlow::Poll + every-frame
+    /// request_redraw keeps the UI responsive; the 14+ call-site
+    /// audit model was fragile).
 
     viewport_w: u32,
     viewport_h: u32,
@@ -344,18 +344,6 @@ pub struct EguiState {
 }
 
 impl MainWindow {
-    /// Phase 5: single point of redraw-request. Sets the
-    /// `needs_redraw` flag AND calls the winit window's
-    /// `request_redraw`. With ControlFlow::Wait, this is the
-    /// only thing that re-arms the event loop's redraw queue.
-    /// Callers use this everywhere; direct `window.request_redraw()`
-    /// calls are forbidden by convention.
-    fn request_redraw(&mut self) {
-        self.needs_redraw = true;
-        if let Some(window) = &self.window {
-            window.request_redraw();
-        }
-    }
 
     pub fn new(target: LaunchTarget) -> Self {
         let nav = Arc::new(parking_lot::Mutex::new(NavigationService::new()));
@@ -432,7 +420,6 @@ impl MainWindow {
             pending_tree_menu: None,
             slide_show_running: false,
             slide_show_last: None,
-            needs_redraw: true, // initial paint
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
             viewport_h: last.1.saturating_sub(TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT),
             show_tree,
@@ -674,7 +661,7 @@ impl MainWindow {
         if self.slide_show_running {
             self.slide_show_last = Some(std::time::Instant::now());
         }
-        self.request_redraw();
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn navigate_to_folder(&mut self, path: PathBuf) {
@@ -701,7 +688,7 @@ impl MainWindow {
         if let Some(coordinator) = &self.coordinator {
             coordinator.request_current(SlideDir::None);
         }
-        self.request_redraw();
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     /// Page navigation: jump by the number of thumbnails visible per page
@@ -765,7 +752,7 @@ impl MainWindow {
                 let mut v = v_arc.lock();
                 v.on_wheel(wheel, local_x, local_y);
             }
-            self.request_redraw();
+            if let Some(window) = &self.window { window.request_redraw(); }
         }
     }
 
@@ -776,7 +763,7 @@ impl MainWindow {
                 let mut v = v_arc.lock();
                 v.fit_to_screen();
             }
-            self.request_redraw();
+            if let Some(window) = &self.window { window.request_redraw(); }
         }
     }
 
@@ -787,33 +774,11 @@ impl MainWindow {
             // coordinator.poll() applies any in-flight decoded
             // bitmap to the viewer (calls set_image on the
             // Direct2DViewer). The image upload happens on the
-            // NEXT render, so re-arm a redraw unconditionally
-            // — without this, the first image after startup or
-            // after a navigation stays blank until the user
-            // moves the mouse (which Phase 5's input
-            // catch-all also re-arms, but only as a side
-            // effect; making it explicit here removes the
-            // 'image takes a while to appear' symptom).
-            let was_idle = !coordinator.has_queued();
+            // NEXT render. With ControlFlow::Poll (Phase 7 回滚
+            // Phase 5 的 Wait), the next render fires
+            // automatically; we don't need an explicit
+            // request_redraw() here.
             coordinator.poll();
-            if was_idle {
-                // Apply happened — schedule a frame so the
-                // viewer picks up the new bitmap this turn.
-                self.needs_redraw = true;
-            }
-        }
-
-        // Phase 5: re-arm a redraw if anything is still animating
-        // or the slide-show timer is in its 3-second wait. Without
-        // this the next render_frame would never run and the
-        // animation would freeze on the last frame.
-        let viewer_animating = self
-            .viewer
-            .as_ref()
-            .map(|v| v.lock().animator.is_animating())
-            .unwrap_or(false);
-        if viewer_animating || self.slide_show_running {
-            self.needs_redraw = true;
         }
 
 
@@ -829,7 +794,7 @@ impl MainWindow {
             if elapsed >= SLIDE_TICK {
                 self.slide_show_last = Some(now);
                 self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
         }
 
@@ -1461,18 +1426,11 @@ impl MainWindow {
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         right.add_space(10.0);
-        let q = right.add(
-            egui::Button::new(egui::RichText::new("?").size(13.0))
-                .fill(pal.button_fill)
-                .stroke(egui::Stroke::new(1.0, pal.card_stroke))
-                .min_size(egui::vec2(32.0, 30.0))
-                .rounding(6.0),
-        ).on_hover_text("Show shortcuts (Ctrl+/)");
-        HELP_ANCHOR.with(|c| c.set(q.rect));
-        if q.clicked() {
-            actions.push(UiAction::ToggleShortcutHelp);
-        }
-        right.add_space(10.0);
+        // Phase 7 修复: 底栏的 `?` 按钮已迁移到顶栏（Phase 4），
+        // 这里只保留缩放% · 分辨率 + 全屏图标。删除底栏的 `?` 块
+        // 及其 HELP_ANCHOR 写入（之前会指向底栏 `?` 位置，导致
+        // 快捷键面板在底栏弹出，跟我们想要的"在顶栏 `?` 上方"
+        // 的位置不一致）。
         if let Some((w, h)) = current_size {
             right.label(
                 egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
@@ -2224,13 +2182,13 @@ impl MainWindow {
             UiAction::Next => self.handle_navigation(NavigationDirection::Next, SlideDir::Next),
             UiAction::Fit => {
                 if let Some(v) = &self.viewer { v.lock().fit_to_screen(); }
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
             UiAction::OneToOne => {
                 if let Some(v) = &self.viewer {
                     v.lock().zoom_1_to_1();
                 }
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
             // Phase 3: fit↔1:1 cycle. Read is_fit_scale out of the
             // viewer to decide which way to go. The bottom bar
@@ -2246,7 +2204,7 @@ impl MainWindow {
                         g.fit_to_screen();
                     }
                 }
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
             // Phase 3: rotate by `delta` quarter-turns clockwise.
             // The bottom bar always sends +1; the keyboard Ctrl+R
@@ -2260,7 +2218,7 @@ impl MainWindow {
                     let next = ((cur as i32 + delta).rem_euclid(4)) as u8;
                     g.set_rotation(next);
                 }
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
             // Phase 3: flip the slide-show timer. The state is
             // stored on MainWindow (slide_show_running / _last);
@@ -2288,7 +2246,7 @@ impl MainWindow {
                     if let Some(coordinator) = &self.coordinator {
                         coordinator.request_current(SlideDir::None);
                     }
-                    self.request_redraw();
+                    if let Some(window) = &self.window { window.request_redraw(); }
                 }
             }
             UiAction::FolderChosen(p, root) => {
@@ -2386,7 +2344,7 @@ impl MainWindow {
         if let Some(coordinator) = &self.coordinator {
             coordinator.request_current(SlideDir::None);
         }
-        self.request_redraw();
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     /// Close the shortcuts popover (and restore the child window region).
@@ -2756,7 +2714,7 @@ impl MainWindow {
         if let Some(coordinator) = &self.coordinator {
             coordinator.request_current(SlideDir::None);
         }
-        self.request_redraw();
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn relayout_viewer(&mut self) {
@@ -2840,26 +2798,26 @@ impl ApplicationHandler for MainWindow {
                             if let Some(v) = &self.viewer {
                                 v.lock().fit_to_screen();
                             }
-                            self.request_redraw();
+                            if let Some(window) = &self.window { window.request_redraw(); }
                         }
                         KeyCode::Digit0 if ctrl_pressed => {
                             // Ctrl+0 → fit to window.
                             if let Some(v) = &self.viewer {
                                 v.lock().fit_to_screen();
                             }
-                            self.request_redraw();
+                            if let Some(window) = &self.window { window.request_redraw(); }
                         }
                         KeyCode::Equal | KeyCode::NumpadAdd if ctrl_pressed => {
                             if let Some(v) = &self.viewer {
                                 v.lock().zoom_step(1.25);
                             }
-                            self.request_redraw();
+                            if let Some(window) = &self.window { window.request_redraw(); }
                         }
                         KeyCode::Minus | KeyCode::NumpadSubtract if ctrl_pressed => {
                             if let Some(v) = &self.viewer {
                                 v.lock().zoom_step(1.0 / 1.25);
                             }
-                            self.request_redraw();
+                            if let Some(window) = &self.window { window.request_redraw(); }
                         }
                         KeyCode::Escape => {
                             if self.is_fullscreen {
@@ -3086,21 +3044,15 @@ impl ApplicationHandler for MainWindow {
                 if let Err(e) = self.render_frame() {
                     tracing::error!("Render error: {:#}", e);
                 }
-                // Phase 5: only re-arm a redraw if render_frame
-                // marked itself as still-animating / still-needs-
-                // redraw. Combined with ControlFlow::Wait in
-                // main.rs, this means the loop stays idle (zero
-                // CPU) when nothing's changing — only a single
-                // frame is presented per input, decode, or
-                // animation tick. The render_frame method is
-                // responsible for setting self.needs_redraw
-                // whenever it knows the next frame will differ
-                // from the current one.
-                if self.needs_redraw {
-                    self.needs_redraw = false;
-                    if let Some(window) = &self.window {
-                        window.request_redraw();
-                    }
+                // Phase 5 → 7 修复: 回滚到 ControlFlow::Poll
+                // 行为。Phase 5 用 needs_redraw 标志 + Wait 来
+                // 减少空闲 CPU，但实际效果不稳定 —— 14+ 个
+                // request_redraw 调用点只要漏掉一个就会让 UI
+                // 看起来"卡死"（输入事件被丢弃，hover/click
+                // 反馈不显示）。回滚为简单的 Poll + 每帧无条件
+                // request_redraw：现代硬件上空闲帧 CPU < 1%。
+                if let Some(window) = &self.window {
+                    window.request_redraw();
                 }
             }
 
@@ -3112,7 +3064,7 @@ impl ApplicationHandler for MainWindow {
                 // (the user explicitly chose to background the app).
                 self.slide_show_running = false;
                 self.slide_show_last = None;
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
 
             ref ev @ (WindowEvent::CursorMoved { .. }
@@ -3133,7 +3085,7 @@ impl ApplicationHandler for MainWindow {
                 // This was the root cause of the 'all content
                 // is unclickable' symptom reported after
                 // shipping the Phase 5 commit.
-                self.request_redraw();
+                if let Some(window) = &self.window { window.request_redraw(); }
             }
 
             _ => {}
