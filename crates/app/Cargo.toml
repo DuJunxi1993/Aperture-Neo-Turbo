@@ -17,7 +17,6 @@ winresource = "0.1"
 [dependencies]
 aperture-core = { path = "../core" }
 aperture-gpu = { path = "../gpu" }
-aperture-ui = { path = "../ui" }
 
 winit = { workspace = true }
 egui = { workspace = true }

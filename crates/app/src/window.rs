@@ -279,44 +279,63 @@ impl PanelWidth {
     }
 }
 
+/// Pre-extracted UI state for the current frame. Returned by
+/// `capture_frame_state` so the egui closures can read nav counts,
+/// path, size, zoom, and folder without fighting the borrow checker
+/// on `&mut self`.
+struct FrameState {
+    nav_count: usize,
+    nav_idx: usize,
+    nav_count2: usize,
+    current_path: Option<PathBuf>,
+    current_size: Option<(u32, u32)>,
+    zoom_pct: f32,
+    folder: Option<PathBuf>,
+    pal_bg: [f32; 3],
+    actions: Vec<UiAction>,
+    dt: f32,
+    ppp: f32,
+}
+
+/// Egui output data produced by `build_egui_ui` and consumed by
+/// `submit_wgpu_frame`. Separates the egui frame build from the
+/// wgpu surface/encoder/renderpass work so the two methods don't
+/// fight over the surface texture.
+struct PendingEguiOutput {
+    textures_delta: egui::TexturesDelta,
+    paint_jobs: Vec<egui::ClippedPrimitive>,
+    screen_descriptor: egui_wgpu::ScreenDescriptor,
+}
+
 pub struct MainWindow {
+    // ── Window / GPU / egui state ────────────────────────────────
     window: Option<Window>,
     wgpu_state: Option<WgpuState>,
     egui_state: Option<EguiState>,
+    _pending_egui_output: Option<PendingEguiOutput>,
 
+    // ── GPU / decode / viewer state ──────────────────────────────
     gpu: Option<Arc<GpuContext>>,
     viewer: Option<Arc<Mutex<Direct2DViewer>>>,
     loader: Option<Arc<WicLoader>>,
     coordinator: Option<Arc<DecodeCoordinator>>,
 
+    // ── Navigation / data state ──────────────────────────────────
     nav: Arc<parking_lot::Mutex<NavigationService>>,
     settings: SettingsStore,
     file_tree: crate::file_tree::FileTree,
     texture_cache: Arc<crate::texture_cache::TextureCache>,
+
+    // ── Input / action state ─────────────────────────────────────
     actions: Vec<UiAction>,
-    /// Phase 16: proxy to post a custom AppMessage (pop a native
-    /// right-click TrackPopupMenu) into the winit event loop. Held here
-    /// so any event handler can send without owning the loop.
     event_loop_proxy: EventLoopProxy<AppMessage>,
-    /// Phase 8: tree right-click intent recorded during the egui
-    /// frame (the tree closure can't post the AppMessage itself);
-    /// drained post-frame and sent via event_loop_proxy.
     pending_tree_intent: Option<TreeCtxIntent>,
-    /// Phase 3: slide-show state. `running` is bound by the
-    /// bottom-bar play/pause button; `last` is the timestamp of
-    /// the last auto-advance, used by render_frame to fire the
-    /// 3-second tick. Reset to None on stop.
+
+    // ── Slide-show state ─────────────────────────────────────────
     slide_show_running: bool,
     slide_show_last: Option<std::time::Instant>,
-    /// Phase 5: on-demand redraw flag. Set to true from every
-    /// site that knows the next frame will differ from the
-    /// current one (input, animation tick, decoded bitmap,
-    /// panel-width tween, HELP_ANCHOR change, slide-show
-    /// auto-advance). Removed in Phase 7 — see RedrawRequested
-    /// handler for the rationale (ControlFlow::Poll + every-frame
-    /// request_redraw keeps the UI responsive; the 14+ call-site
-    /// audit model was fragile).
 
+    // ── Layout / viewport state ──────────────────────────────────
     viewport_w: u32,
     viewport_h: u32,
     show_tree: bool,
@@ -326,55 +345,39 @@ pub struct MainWindow {
     last_thumb_idx: usize,
     is_fullscreen: bool,
     initial_folder: Option<PathBuf>,
+    single_image_size: Option<(u32, u32)>,
+
+    // ── UI chrome / animation state ──────────────────────────────
     show_shortcut_help: bool,
-    /// Fullscreen overlay chrome state: shown on significant mouse movement,
-    /// auto-hidden after 2.5s idle (hover pauses the countdown).
     chrome_visible: bool,
     chrome_hide_at: Option<std::time::Instant>,
     chrome_move_accum: f32,
     last_cursor: Option<(f32, f32)>,
-    /// Eased 0..1 alpha/height of the fullscreen bottom control bar.
     chrome_anim: f32,
-    /// Theme whose egui visuals were last applied (re-apply on change).
     applied_visuals: Option<Theme>,
-    /// Image size for single-image launches (physical px) — drives the
-    /// initial window size.
-    single_image_size: Option<(u32, u32)>,
-    /// Previous frame timestamp — drives panel animation easing.
     last_frame: Option<std::time::Instant>,
-    /// Manual panel-drag state (native events, not egui interact):
-    /// Some(0) = dragging tree edge, Some(1) = dragging thumbs edge.
+
+    // ── Panel drag state ─────────────────────────────────────────
     drag_panel: Option<u8>,
-    /// Edge currently under the cursor (for highlight + cursor icon).
     panel_edge_hover: Option<u8>,
-    /// Last-frame panel rects in PHYSICAL px (x, y, w, h) for edge
-    /// hit-testing from winit events.
     tree_rect_phys: (f32, f32, f32, f32),
     thumb_rect_phys: (f32, f32, f32, f32),
-    /// Image drag-pan state (left button held over the viewer).
+
+    // ── Pan / zoom state ─────────────────────────────────────────
     pan_active: bool,
     pan_last: (f32, f32),
-    /// UI theme (Dark default; persisted in settings).
+
+    // ── Theme ────────────────────────────────────────────────────
     theme: Theme,
 
+    // ── Event router ─────────────────────────────────────────────
     router: RouterState,
     last_double_click: Option<std::time::Instant>,
 
-    // ---- Arrow-key "brake" state (no rate-limit on KEYDOWN) ----
-    /// Direction the user is currently holding (None = no arrow key held).
-    /// KEYUP clears this so the per-frame pending_nav dispatch stops.
+    // ── Arrow-key brake state ────────────────────────────────────
     arrow_held: Option<NavigationDirection>,
-    /// Latest direction queued by an arrow KEYDOWN. Stays Some until
-    /// KEYUP clears it, so the per-frame dispatcher keeps trying to
-    /// advance while the user keeps holding the key.
     pending_nav: Option<NavigationDirection>,
-    /// SlideDir matching the latest KEYDOWN (so repeated advance uses
-    /// a consistent slide animation direction).
     pending_slide_dir: SlideDir,
-    /// Last time `handle_navigation` fired for an arrow key. Used to
-    /// throttle the per-frame dispatcher to one nav per ~200 ms (= one
-    /// slide-animation duration) so held-key scrolls feel continuous
-    /// without firing faster than the image can transition.
     last_arrow_nav_at: Option<std::time::Instant>,
 }
 
@@ -513,6 +516,7 @@ impl MainWindow {
             panel_edge_hover: None,
             tree_rect_phys: (0.0, 0.0, 0.0, 0.0),
             thumb_rect_phys: (0.0, 0.0, 0.0, 0.0),
+            _pending_egui_output: None,
             pan_active: false,
             pan_last: (0.0, 0.0),
             theme: theme_setting,
@@ -1055,6 +1059,16 @@ let window = event_loop.create_window(
     }
 
     fn render_frame(&mut self) -> Result<()> {
+        self.tick_pre_frame();
+        let mut state = self.capture_frame_state();
+        let central_rect_phys = self.build_egui_ui(&mut state);
+        self.submit_wgpu_frame(central_rect_phys, &state)?;
+        self.drain_frame_actions(state.actions);
+        Ok(())
+    }
+
+    /// Blocks A+B: coordinator poll, arrow-nav tick, slideshow tick, viewer bg sync.
+    fn tick_pre_frame(&mut self) {
         let pal = self.pal();
         // 1. Poll decode coordinator
         if let Some(coordinator) = &self.coordinator {
@@ -1073,7 +1087,6 @@ let window = event_loop.create_window(
         // immediately on KEYUP (the KEYUP handler clears
         // `pending_nav`/`arrow_held` before this runs next frame).
         self.tick_arrow_nav();
-
 
         // Phase 3: slide-show 3-second tick. The user toggles via
         // UiAction::ToggleSlideShow; render_frame here is where the
@@ -1095,9 +1108,10 @@ let window = event_loop.create_window(
         if let Some(v) = &self.viewer {
             v.lock().bg = pal.d2d_clear;
         }
+    }
 
-        // Pre-extract everything the UI needs (so closures don't fight the
-        // &mut self borrow during button handling).
+    /// Block C: pre-extract UI state so closures don't fight &mut self.
+    fn capture_frame_state(&mut self) -> FrameState {
         let nav_count = self.nav.lock().count();
         let (nav_idx, nav_count2) = {
             let n = self.nav.lock();
@@ -1113,556 +1127,667 @@ let window = event_loop.create_window(
         let folder = self.settings.last_folder()
             .or_else(|| self.initial_folder.clone());
 
-        let mut actions: Vec<UiAction> = Vec::new();
-
         // Capture image-quad background colour BEFORE the egui_state
         // mutable borrow opens (egui_state holds &mut self through to
         // flush_inbox, so self.pal() inside the render scope would
         // conflict with it).
         let pal_bg = self.pal().d2d_clear;
 
-        // 3. egui / wgpu
+        let ppp = self.wgpu_state
+            .as_ref()
+            .map(|w| w.pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.1);
+        let now = std::time::Instant::now();
+        let dt = self.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
+
+        FrameState {
+            nav_count,
+            nav_idx,
+            nav_count2,
+            current_path,
+            current_size,
+            zoom_pct,
+            folder,
+            pal_bg,
+            actions: Vec::new(),
+            dt,
+            ppp,
+        }
+    }
+
+    /// Block D (egui UI): build all egui panels and capture the central rect.
+    /// Returns the central rect in physical pixels for `submit_wgpu_frame`.
+    fn build_egui_ui(&mut self, state: &mut FrameState) -> Option<(i32, i32, u32, u32)> {
+        let pal = self.pal();
+        let dt = state.dt;
+        let ppp = state.ppp;
+
+        let Some(egui_state) = self.egui_state.as_mut() else { return None; };
+        let Some(_wgpu_state) = self.wgpu_state.as_ref() else { return None; };
+
+        // Sync surface size to the ACTUAL client area. The wgpu surface
+        // covers the client rect only — using outer_size (which includes
+        // the title bar and borders) makes DWM squash the surface and
+        // desyncs egui hit-testing from the drawn UI.
         {
-            let Some(egui_state) = self.egui_state.as_mut() else { return Ok(()); };
-            let Some(_wgpu_state) = self.wgpu_state.as_ref() else { return Ok(()); };
-
-            // Sync surface size to the ACTUAL client area. The wgpu surface
-            // covers the client rect only — using outer_size (which includes
-            // the title bar and borders) makes DWM squash the surface and
-            // desyncs egui hit-testing from the drawn UI.
+            let wgpu_state_mut = self.wgpu_state.as_mut().expect("checked above");
+            let phys = self.window.as_ref().unwrap().inner_size();
+            let cw = phys.width.max(1);
+            let ch = phys.height.max(1);
+            if cw != wgpu_state_mut.config.width || ch != wgpu_state_mut.config.height
             {
-                let wgpu_state_mut = self.wgpu_state.as_mut().expect("checked above");
-                let phys = self.window.as_ref().unwrap().inner_size();
-                let cw = phys.width.max(1);
-                let ch = phys.height.max(1);
-                if cw != wgpu_state_mut.config.width || ch != wgpu_state_mut.config.height
-                {
-                    wgpu_state_mut.config.width = cw;
-                    wgpu_state_mut.config.height = ch;
-                    wgpu_state_mut.surface.configure(
-                        &wgpu_state_mut.device,
-                        &wgpu_state_mut.config,
-                    );
-                }
-            }
-            // Re-borrow immutably for the rest of the frame.
-            let wgpu_state = self.wgpu_state.as_ref().unwrap();
-
-
-            // Take the input events accumulated from winit since last frame
-            // and fill in the screen rect + time. egui works in LOGICAL
-            // points, so the physical surface size must be divided by
-            // pixels_per_point.
-            let ppp = wgpu_state.pixels_per_point.max(0.1);
-            self.router.pixels_per_point = ppp;
-            let mut raw_input = self.router.take_pending();
-            raw_input.screen_rect = Some(egui::Rect::from_min_size(
-                egui::Pos2::ZERO,
-                egui::Vec2::new(
-                    wgpu_state.config.width as f32 / ppp,
-                    wgpu_state.config.height as f32 / ppp,
-                ),
-            ));
-            // Keep egui's own scale factor in sync with the window's so
-            // logical→physical conversions (CentralPanel rect capture,
-            // tessellation) use the same factor we do.
-            if (egui_state.ctx.pixels_per_point() - ppp).abs() > 0.001 {
-                egui_state.ctx.set_pixels_per_point(ppp);
-            }
-            raw_input.time = Some(
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs_f64())
-                    .unwrap_or(0.0),
-            );
-            egui_state.ctx.begin_pass(raw_input);
-
-            // Apply egui visuals when the theme changes (toggle or startup).
-            if self.applied_visuals != Some(self.theme) {
-                self.applied_visuals = Some(self.theme);
-                let mut visuals = match self.theme {
-                    Theme::Light => {
-                        let mut v = egui::Visuals::light();
-                        v.panel_fill = egui::Color32::from_rgb(243, 244, 245);
-                        v.window_fill = v.panel_fill;
-                        v.override_text_color = Some(egui::Color32::from_rgb(26, 27, 30));
-                        v
-                    }
-                    Theme::Dark => {
-                        let mut v = egui::Visuals::dark();
-                        v.panel_fill = egui::Color32::from_rgb(15, 16, 17);
-                        v.window_fill = v.panel_fill;
-                        v.override_text_color = Some(egui::Color32::from_rgb(247, 248, 248));
-                        v
-                    }
-                };
-                // Kill egui's default light-gray chrome:
-                //  * panel separators (1px line between Side/Central/TopBottom
-                //    panels) come from `noninteractive.bg_stroke` — transparent
-                //    makes panels blend seamlessly.
-                //  * `window_shadow`/`popup_shadow` give the shortcuts Window
-                //    a light halo below it.
-                visuals.window_stroke = egui::Stroke::NONE;
-                visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT);
-                visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
-                visuals.window_shadow = egui::epaint::Shadow::NONE;
-                visuals.popup_shadow = egui::epaint::Shadow::NONE;
-                egui_state.ctx.set_visuals(visuals);
-            }
-
-            // Frame delta for UI animations (panel widths, chrome fade).
-            let now = std::time::Instant::now();
-            let dt = self.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
-            self.last_frame = Some(now);
-
-            // ----- TITLEBAR (custom-drawn, replaces the OS frame) -----
-            let mut toolbar_rect: Option<egui::Rect> = None;
-            if !self.is_fullscreen {
-                let resp = egui::TopBottomPanel::top("titlebar")
-                    .exact_height(TOOLBAR_HEIGHT as f32)
-                    .frame(
-                        egui::Frame::default()
-                            .fill(pal.panel_bg)
-                            .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
-                    )
-                    .show(&egui_state.ctx, |ui| {
-                        if let Some(window) = self.window.as_ref() {
-                            Self::draw_titlebar(
-                                ui, &mut actions, window,
-                                self.show_tree, self.show_thumbs,
-                                &pal,
-                            );
-                        }
-                    });
-                toolbar_rect = Some(resp.response.rect);
-            }
-            // Ease the fullscreen bottom-bar alpha/height toward its target.
-            {
-                let target = if self.is_fullscreen && self.chrome_visible { 1.0 } else { 0.0 };
-                let k = (dt / 0.15).clamp(0.0, 1.0);
-                self.chrome_anim += (target - self.chrome_anim) * k;
-                if (self.chrome_anim - target).abs() < 0.01 {
-                    self.chrome_anim = target;
-                }
-            }
-            if self.is_fullscreen && self.chrome_anim > 0.02 {
-                // ----- OVERLAY CONTROL BAR (slides up from bottom) -----
-                let a = self.chrome_anim;
-                let bar_h = 48.0 * a;
-                let resp = egui::TopBottomPanel::bottom("overlay_toolbar")
-                    .frame(
-                        egui::Frame::default()
-                            .fill(egui::Color32::from_rgba_unmultiplied(
-                                pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
-                                (235.0 * a) as u8,
-                            ))
-                            // Phase 9: zero margin — the bar draws its own
-                            // full-height centered rows; a vertical margin
-                            // here squeezed the interior to 32px for 30px
-                            // buttons (top-edge clipping).
-                            .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
-                    )
-                    .exact_height(bar_h)
-                    .show(&egui_state.ctx, |ui| {
-                        ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
-                        Self::draw_fullscreen_bar(
-                            ui, &mut actions, &current_path,
-                            nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal, true, self.slide_show_running,
-                        );
-                    });
-                toolbar_rect = Some(resp.response.rect);
-            }
-
-            // ----- SIDE PANELS (custom width controller) -----
-            // Widths ease toward their targets (macOS sidebar animation);
-            // the tree's content minimum is measured while drawing so the
-            // panel widens for deep folders and shrinks back on collapse.
-            // Phase 12: widths are snapped to WHOLE physical pixels
-            // (round(anim*ppp)/ppp) before feeding egui — the D2D child
-            // is positioned at round(anim*ppp), so a fractional logical
-            // width left a 1px column of canvas showing between panel
-            // and viewer (the gray seam near the bottom bar).
-            let ppp_snap = ppp.max(0.1);
-            let tree_anim = self.tree_panel.tick(self.show_tree && !self.is_fullscreen, dt);
-            let thumb_anim = self.thumb_panel.tick(self.show_thumbs && !self.is_fullscreen, dt);
-            let tree_anim = (tree_anim * ppp_snap).round() / ppp_snap;
-            let thumb_anim = (thumb_anim * ppp_snap).round() / ppp_snap;
-
-            // We collect any tree/thumb actions into a fresh Vec that the
-            // outer scope owns. The draw helpers take &mut Vec<UiAction>
-            // directly so they can queue without borrowing self.
-            let mut side_actions: Vec<UiAction> = Vec::new();
-            if tree_anim > 0.5 {
-                let resp = egui::SidePanel::left("tree")
-                    .resizable(false)
-                    .exact_width(tree_anim)
-                    .frame(
-                        egui::Frame::default()
-                            .fill(pal.panel_bg)
-                            .inner_margin(egui::Margin::same(0.0)),
-                    )
-                    .show(&egui_state.ctx, |ui| {
-                        // Phase 14: pass the nav's CURRENT FOLDER, not
-                        // its current image's path. ImageItem.path is
-                        // a file; tree nodes are folders, so the old
-                        // `current_path` made is_current() never match.
-                        // Also pass the user-pinned active root so the
-                        // highlight follows the row the user last
-                        // picked from (a folder may live in Favorites +
-                        // Recent; we only highlight the active row).
-                        let current_folder = self.nav.lock().folder().cloned();
-                        let min_w = Self::draw_tree_panel_static(
-                            ui,
-                            &self.file_tree,
-                            current_folder,
-                            &folder,
-                            nav_count,
-                            &mut side_actions,
-                            &mut self.pending_tree_intent,
-                            &pal,
-                        );
-                        self.tree_panel.content_min = min_w;
-                    });
-                let r = resp.response.rect;
-                self.tree_rect_phys = (
-                    r.left() * ppp, r.top() * ppp,
-                    r.width() * ppp, r.height() * ppp,
+                wgpu_state_mut.config.width = cw;
+                wgpu_state_mut.config.height = ch;
+                wgpu_state_mut.surface.configure(
+                    &wgpu_state_mut.device,
+                    &wgpu_state_mut.config,
                 );
-            } else {
-                self.tree_rect_phys = (0.0, 0.0, 0.0, 0.0);
             }
-            if thumb_anim > 0.5 {
-                let tc = self.texture_cache.clone();
-                let nav_items = self.nav.lock().items().to_vec();
-                let cur_idx = self.nav.lock().current_index();
-                let force_scroll = cur_idx != self.last_thumb_idx;
-                let resp = egui::SidePanel::right("thumbs")
-                    .resizable(false)
-                    .exact_width(thumb_anim)
-                    .frame(
-                        egui::Frame::default()
-                            .fill(pal.panel_bg)
-                            .inner_margin(egui::Margin::same(0.0)),
-                    )
-                    .show(&egui_state.ctx, |ui| {
-                        Self::draw_thumbs_panel_static(
-                            ui,
-                            &tc,
-                            &nav_items,
-                            cur_idx,
-                            force_scroll,
-                            &mut side_actions,
-                            &pal,
-                        );
-                    });
-                let r = resp.response.rect;
-                self.thumb_rect_phys = (
-                    r.left() * ppp, r.top() * ppp,
-                    r.width() * ppp, r.height() * ppp,
-                );
-                self.last_thumb_idx = cur_idx;
-            } else {
-                self.thumb_rect_phys = (0.0, 0.0, 0.0, 0.0);
-            }
-            // Merge side panel actions into the main queue.
-            actions.extend(side_actions);
+        }
+        // Re-borrow immutably for the rest of the frame.
+        let wgpu_state = self.wgpu_state.as_ref().unwrap();
 
-            // ----- SHORTCUT HELP (popover anchored below the "?" button) -----
-            // Phase 9: rects of all popovers that need a hole punched in
-            // the D2D child this frame. Collected while drawing, applied
-            // once after the popup block (combined region — punching
-            // twice would let the second SetWindowRgn overwrite the first).
-            if self.show_shortcut_help {
-                let anchor = HELP_ANCHOR.with(|c| c.get());
-                let screen = egui_state.ctx.input(|i| i.screen_rect);
-                // Phase 9 fix: anchor BELOW the top-bar "?" button,
-                // right-aligned (pivot RIGHT_TOP extends the window
-                // left+down from the anchor). The previous
-                // RIGHT_BOTTOM pivot at (right+8, top-8) expanded the
-                // window UP across the title bar, covering the very
-                // button that opened it.
-                let anchor_pos = if anchor.any_nan() || anchor == egui::Rect::NOTHING {
-                    // Fallback: below the title bar's right side.
-                    egui::pos2(
-                        screen.right() - 60.0,
-                        TOOLBAR_HEIGHT as f32 + 8.0,
-                    )
-                } else {
-                    egui::pos2(anchor.right() + 4.0, anchor.bottom() + 6.0)
-                };
-                let help_resp = egui::Window::new(
-                    egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
-                )
-                // No default shadow/fill — the gray halo around the window
-                // read as a stray background block on both themes.
+        // Take the input events accumulated from winit since last frame
+        // and fill in the screen rect + time. egui works in LOGICAL
+        // points, so the physical surface size must be divided by
+        // pixels_per_point.
+        self.router.pixels_per_point = ppp;
+        let mut raw_input = self.router.take_pending();
+        raw_input.screen_rect = Some(egui::Rect::from_min_size(
+            egui::Pos2::ZERO,
+            egui::Vec2::new(
+                wgpu_state.config.width as f32 / ppp,
+                wgpu_state.config.height as f32 / ppp,
+            ),
+        ));
+        // Keep egui's own scale factor in sync with the window's so
+        // logical→physical conversions (CentralPanel rect capture,
+        // tessellation) use the same factor we do.
+        if (egui_state.ctx.pixels_per_point() - ppp).abs() > 0.001 {
+            egui_state.ctx.set_pixels_per_point(ppp);
+        }
+        raw_input.time = Some(
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs_f64())
+                .unwrap_or(0.0),
+        );
+        egui_state.ctx.begin_pass(raw_input);
+
+        // Apply egui visuals when the theme changes (toggle or startup).
+        if self.applied_visuals != Some(self.theme) {
+            self.applied_visuals = Some(self.theme);
+            let mut visuals = match self.theme {
+                Theme::Light => {
+                    let mut v = egui::Visuals::light();
+                    v.panel_fill = egui::Color32::from_rgb(243, 244, 245);
+                    v.window_fill = v.panel_fill;
+                    v.override_text_color = Some(egui::Color32::from_rgb(26, 27, 30));
+                    v
+                }
+                Theme::Dark => {
+                    let mut v = egui::Visuals::dark();
+                    v.panel_fill = egui::Color32::from_rgb(15, 16, 17);
+                    v.window_fill = v.panel_fill;
+                    v.override_text_color = Some(egui::Color32::from_rgb(247, 248, 248));
+                    v
+                }
+            };
+            // Kill egui's default light-gray chrome:
+            //  * panel separators (1px line between Side/Central/TopBottom
+            //    panels) come from `noninteractive.bg_stroke` — transparent
+            //    makes panels blend seamlessly.
+            //  * `window_shadow`/`popup_shadow` give the shortcuts Window
+            //    a light halo below it.
+            visuals.window_stroke = egui::Stroke::NONE;
+            visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT);
+            visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
+            visuals.window_shadow = egui::epaint::Shadow::NONE;
+            visuals.popup_shadow = egui::epaint::Shadow::NONE;
+            egui_state.ctx.set_visuals(visuals);
+        }
+
+        // Frame delta for UI animations (panel widths, chrome fade).
+        let now = std::time::Instant::now();
+        let _dt = self.last_frame.map(|t| now.duration_since(t).as_secs_f32()).unwrap_or(1.0 / 60.0);
+        self.last_frame = Some(now);
+
+        // ----- TITLEBAR (custom-drawn, replaces the OS frame) -----
+        let mut toolbar_rect: Option<egui::Rect> = None;
+        if !self.is_fullscreen {
+            let resp = egui::TopBottomPanel::top("titlebar")
+                .exact_height(TOOLBAR_HEIGHT as f32)
                 .frame(
                     egui::Frame::default()
                         .fill(pal.panel_bg)
-                        // Phase 14: drop the 1px stroke (same reason as
-                        // the context menus) — it painted 0.5px inside
-                        // the frame rect and leaked past the hole.
-                        .stroke(egui::Stroke::NONE)
-                        .rounding(8.0)
-                        .outer_margin(egui::Margin::same(2.0))
-                        .inner_margin(egui::Margin::same(12.0))
-                        .shadow(egui::Shadow::NONE),
+                        .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
                 )
-                .fixed_pos(anchor_pos)
-                .pivot(egui::Align2::RIGHT_TOP)
-                .resizable(false)
-                .collapsible(false)
-                .fade_in(false)
-                .fade_out(false)
                 .show(&egui_state.ctx, |ui| {
-                    egui::Grid::new("shortcuts_grid")
-                        .num_columns(2)
-                        .spacing([32.0, 7.0])
-                        .show(ui, |ui| {
-                            macro_rules! shortcut {
-                                ($key:expr, $desc:expr) => {
-                                    ui.label(
-                                        egui::RichText::new($key)
-                                            .monospace()
-                                            .size(12.0)
-                                            .color(pal.key_hint),
-                                    );
-                                    ui.label(
-                                        egui::RichText::new($desc)
-                                            .size(12.0)
-                                            .color(pal.help_desc),
-                                    );
-                                    ui.end_row();
-                                };
-                            }
-                            shortcut!("← → ↑ ↓", "Previous / Next image");
-                            shortcut!("PgUp / PgDn", "Page through thumbnails");
-                            shortcut!("Home / End", "First / Last image");
-                            shortcut!("Ctrl + ←→↑↓", "Cycle related folders");
-                            shortcut!("Wheel", "Zoom (50%–500%)");
-                            shortcut!("Drag", "Pan image");
-                            shortcut!("F / Ctrl + 0", "Fit image to window");
-                            shortcut!("Ctrl + + / −", "Zoom in / out");
-                            shortcut!("Ctrl + F", "Fullscreen");
-                            shortcut!("Ctrl + W", "Set as wallpaper");
-                            shortcut!("Ctrl + E", "Open in Explorer");
-                            shortcut!("Ctrl + D", "Toggle favorite");
-                            shortcut!("Ctrl + /", "Toggle this help");
-                            shortcut!("Esc", "Exit fullscreen / Quit");
-                        });
-                });
-                // Phase 9: record the popover rect for the unified hole
-                // punch after the popup block, and close on any click
-                // outside the window.
-                //
-                // Phase 10 fix: clicks on the `?` button itself are
-                // EXCLUDED from clicked_elsewhere. The ? handler queues
-                // UiAction::ToggleShortcutHelp this same frame; if the
-                // popover also closed itself here, apply_action's toggle
-                // flipped it straight back open — the panel could never
-                // be dismissed via the button. With the exclusion, the
-                // button path closes via the toggle action, and any
-                // other outside click closes via clicked_elsewhere.
-                if let Some(resp) = help_resp {
-                    // Click position this frame (None = no click).
-                    let pointer = egui_state.ctx.input(|i| i.pointer.latest_pos());
-                    let anchor = HELP_ANCHOR.with(|c| c.get());
-                    let anchor_valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
-                    let clicked_on_help_btn = match pointer {
-                        Some(p) => {
-                            anchor_valid
-                                && egui::Rect::from_min_max(
-                                    anchor.min - egui::Vec2::splat(2.0),
-                                    anchor.max + egui::Vec2::splat(2.0),
-                                )
-                                .contains(p)
-                        }
-                        None => false,
-                    };
-                    if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
-                        self.show_shortcut_help = false;
-                    }
-                }
-            }
-
-            // ----- STATUS BAR -----
-            // Same three-zone layout as the fullscreen bar (filename left /
-            // controls center / info + help right) for a consistent UI.
-            if !self.is_fullscreen {
-                egui::TopBottomPanel::bottom("statusbar")
-                    // Phase 9: explicit zero-margin frame — the default
-                    // panel frame's inner margin ate into the 48px bar
-                    // height, leaving the button row top-anchored and
-                    // visually clipped by the bar edge.
-                    .frame(
-                        egui::Frame::default()
-                            .fill(pal.panel_bg)
-                            .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
-                    )
-                    .exact_height(STATUS_BAR_HEIGHT as f32)
-                    .show(&egui_state.ctx, |ui| {
-                        Self::draw_fullscreen_bar(
-                            ui, &mut actions, &current_path,
-                            nav_idx, nav_count2, current_size, zoom_pct,
-                            &pal, false, self.slide_show_running,
+                    if let Some(window) = self.window.as_ref() {
+                        Self::draw_titlebar(
+                            ui, &mut state.actions, window,
+                            self.show_tree, self.show_thumbs,
+                            &pal,
                         );
-                    });
-            }
-
-            // ----- Fullscreen chrome countdown -----
-            // Hovering the overlay toolbar pauses the timer; 2.5s of idle
-            // elsewhere hides it again.
-            if self.is_fullscreen && self.chrome_visible {
-                let pointer = egui_state.ctx.input(|i| i.pointer.latest_pos());
-                let hovering = pointer.map_or(false, |p| {
-                    toolbar_rect.map_or(false, |r| r.contains(p))
-                });
-                if hovering {
-                    self.chrome_hide_at = Some(std::time::Instant::now());
-                } else if let Some(t) = self.chrome_hide_at {
-                    if t.elapsed() >= std::time::Duration::from_millis(2500) {
-                        self.chrome_visible = false;
-                        if let Some(w) = &self.window { w.request_redraw(); }
                     }
-                }
+                });
+            toolbar_rect = Some(resp.response.rect);
+        }
+        // Ease the fullscreen bottom-bar alpha/height toward its target.
+        {
+            let target = if self.is_fullscreen && self.chrome_visible { 1.0 } else { 0.0 };
+            let k = (dt / 0.15).clamp(0.0, 1.0);
+            self.chrome_anim += (target - self.chrome_anim) * k;
+            if (self.chrome_anim - target).abs() < 0.01 {
+                self.chrome_anim = target;
             }
-
-            // Reserve the central area; the D2D viewer child HWND lives here.
-            // We do NOT paint a background fill — that would cover the child.
-            // We capture the CentralPanel's rect to position the D2D child
-            // exactly underneath it (single source of truth = egui layout).
-            let mut central_rect_phys: Option<(i32, i32, u32, u32)> = None;
-            let _center = egui::CentralPanel::default()
-                .frame(egui::Frame::none())
+        }
+        if self.is_fullscreen && self.chrome_anim > 0.02 {
+            // ----- OVERLAY CONTROL BAR (slides up from bottom) -----
+            let a = self.chrome_anim;
+            let bar_h = 48.0 * a;
+            let resp = egui::TopBottomPanel::bottom("overlay_toolbar")
+                .frame(
+                    egui::Frame::default()
+                        .fill(egui::Color32::from_rgba_unmultiplied(
+                            pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
+                            (235.0 * a) as u8,
+                        ))
+                        // Phase 9: zero margin — the bar draws its own
+                        // full-height centered rows; a vertical margin
+                        // here squeezed the interior to 32px for 30px
+                        // buttons (top-edge clipping).
+                        .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
+                )
+                .exact_height(bar_h)
                 .show(&egui_state.ctx, |ui| {
-                    let r = ui.max_rect();
-                    let ppp = egui_state.ctx.pixels_per_point();
-                    central_rect_phys = Some((
-                        (r.min.x * ppp).round() as i32,
-                        (r.min.y * ppp).round() as i32,
-                        (r.width() * ppp).round() as u32,
-                        (r.height() * ppp).round() as u32,
-                    ));
-
-                    // ----- Panel edge highlight -----
-                    // A 2px accent line on the draggable edge when hovered
-                    // or actively dragged (confirmation affordance).
-                    let active_edge = self.drag_panel.or(self.panel_edge_hover);
-                    if let Some(edge) = active_edge {
-                        let line_rect = match edge {
-                            0 => {
-                                let (x, y, w, h) = self.tree_rect_phys;
-                                if w > 0.0 {
-                                    Some(egui::Rect::from_min_size(
-                                        egui::pos2((x + w - 1.5) / ppp, y / ppp),
-                                        egui::vec2(3.0 / ppp, h / ppp),
-                                    ))
-                                } else { None }
-                            }
-                            1 => {
-                                let (x, y, w, h) = self.thumb_rect_phys;
-                                if w > 0.0 {
-                                    Some(egui::Rect::from_min_size(
-                                        egui::pos2((x - 1.5) / ppp, y / ppp),
-                                        egui::vec2(3.0 / ppp, h / ppp),
-                                    ))
-                                } else { None }
-                            }
-                            _ => None,
-                        };
-                        if let Some(lr) = line_rect {
-                            ui.painter().rect_filled(
-                                lr,
-                                0.0,
-                                egui::Color32::from_rgb(0x71, 0x70, 0xff),
-                            );
-                        }
-                    }
+                    ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                    Self::draw_fullscreen_bar(
+                        ui, &mut state.actions, &state.current_path,
+                        state.nav_idx, state.nav_count2, state.current_size, state.zoom_pct,
+                        &pal, true, self.slide_show_running,
+                    );
                 });
+            toolbar_rect = Some(resp.response.rect);
+        }
 
-            // ----- egui → wgpu -----
-            let full_output = egui_state.ctx.end_pass();
-            let paint_jobs = egui_state.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+        // ----- SIDE PANELS (custom width controller) -----
+        // Widths ease toward their targets (macOS sidebar animation);
+        // the tree's content minimum is measured while drawing so the
+        // panel widens for deep folders and shrinks back on collapse.
+        // Phase 12: widths are snapped to WHOLE physical pixels
+        // (round(anim*ppp)/ppp) before feeding egui — the D2D child
+        // is positioned at round(anim*ppp), so a fractional logical
+        // width left a 1px column of canvas showing between panel
+        // and viewer (the gray seam near the bottom bar).
+        let ppp_snap = ppp.max(0.1);
+        let tree_anim = self.tree_panel.tick(self.show_tree && !self.is_fullscreen, dt);
+        let thumb_anim = self.thumb_panel.tick(self.show_thumbs && !self.is_fullscreen, dt);
+        let tree_anim = (tree_anim * ppp_snap).round() / ppp_snap;
+        let thumb_anim = (thumb_anim * ppp_snap).round() / ppp_snap;
 
-            // Apply the captured CentralPanel rect to update viewport dimensions.
-            if let Some((px, py, pw, ph)) = central_rect_phys {
-                // Clamp to the surface — the first frame's layout can be
-                // garbage (huge available_rect before fonts settle).
-                let px = px.clamp(0, wgpu_state.config.width as i32);
-                let py = py.clamp(0, wgpu_state.config.height as i32);
-                let pw = pw.min(wgpu_state.config.width.saturating_sub(px as u32));
-                let ph = ph.min(wgpu_state.config.height.saturating_sub(py as u32));
-                if pw >= 1 && ph >= 1 {
-                    self.viewport_w = pw;
-                    self.viewport_h = ph;
-                }
-            }
+        // We collect any tree/thumb actions into a fresh Vec that the
+        // outer scope owns. The draw helpers take &mut Vec<UiAction>
+        // directly so they can queue without borrowing self.
+        let mut side_actions: Vec<UiAction> = Vec::new();
+        if tree_anim > 0.5 {
+            let resp = egui::SidePanel::left("tree")
+                .resizable(false)
+                .exact_width(tree_anim)
+                .frame(
+                    egui::Frame::default()
+                        .fill(pal.panel_bg)
+                        .inner_margin(egui::Margin::same(0.0)),
+                )
+                .show(&egui_state.ctx, |ui| {
+                    // Phase 14: pass the nav's CURRENT FOLDER, not
+                    // its current image's path. ImageItem.path is
+                    // a file; tree nodes are folders, so the old
+                    // `current_path` made is_current() never match.
+                    // Also pass the user-pinned active root so the
+                    // highlight follows the row the user last
+                    // picked from (a folder may live in Favorites +
+                    // Recent; we only highlight the active row).
+                    let current_folder = self.nav.lock().folder().cloned();
+                    let min_w = Self::draw_tree_panel_static(
+                        ui,
+                        &self.file_tree,
+                        current_folder,
+                        &state.folder,
+                        state.nav_count,
+                        &mut side_actions,
+                        &mut self.pending_tree_intent,
+                        &pal,
+                    );
+                    self.tree_panel.content_min = min_w;
+                });
+            let r = resp.response.rect;
+            self.tree_rect_phys = (
+                r.left() * ppp, r.top() * ppp,
+                r.width() * ppp, r.height() * ppp,
+            );
+        } else {
+            self.tree_rect_phys = (0.0, 0.0, 0.0, 0.0);
+        }
+        if thumb_anim > 0.5 {
+            let tc = self.texture_cache.clone();
+            let nav_items = self.nav.lock().items().to_vec();
+            let cur_idx = self.nav.lock().current_index();
+            let force_scroll = cur_idx != self.last_thumb_idx;
+            let resp = egui::SidePanel::right("thumbs")
+                .resizable(false)
+                .exact_width(thumb_anim)
+                .frame(
+                    egui::Frame::default()
+                        .fill(pal.panel_bg)
+                        .inner_margin(egui::Margin::same(0.0)),
+                )
+                .show(&egui_state.ctx, |ui| {
+                    Self::draw_thumbs_panel_static(
+                        ui,
+                        &tc,
+                        &nav_items,
+                        cur_idx,
+                        force_scroll,
+                        &mut side_actions,
+                        &pal,
+                    );
+                });
+            let r = resp.response.rect;
+            self.thumb_rect_phys = (
+                r.left() * ppp, r.top() * ppp,
+                r.width() * ppp, r.height() * ppp,
+            );
+            self.last_thumb_idx = cur_idx;
+        } else {
+            self.thumb_rect_phys = (0.0, 0.0, 0.0, 0.0);
+        }
+        // Merge side panel actions into the main queue.
+        state.actions.extend(side_actions);
 
-            let surface_texture = wgpu_state.surface.get_current_texture()?;
-            let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-            for (id, delta) in &full_output.textures_delta.set {
-                egui_state.renderer.update_texture(&wgpu_state.device, &wgpu_state.queue, *id, delta);
-            }
-            for id in &full_output.textures_delta.free {
-                egui_state.renderer.free_texture(id);
-            }
-
-            let screen_descriptor = egui_wgpu::ScreenDescriptor {
-                size_in_pixels: [wgpu_state.config.width, wgpu_state.config.height],
-                pixels_per_point: wgpu_state.pixels_per_point.max(0.1),
-            };
-
-            let mut encoder = wgpu_state.device.create_command_encoder(
-                &wgpu::CommandEncoderDescriptor { label: Some("egui") });
-
-            {
-                let _cmds = egui_state.renderer.update_buffers(
-                    &wgpu_state.device,
-                    &wgpu_state.queue,
-                    &mut encoder,
-                    &paint_jobs,
-                    &screen_descriptor,
-                );
-                drop(_cmds);
-            }
-
-            // Canvas color matches the panel background (#0f1011) — no
-            // gray seams where egui doesn't paint.
-            //
-            // On an sRGB-encoded surface, wgpu encodes the clear value
-            // through the surface's linear→sRGB encoder on store; passing
-            // an sRGB fraction (0..1) over-brightens the cleared region
-            // relative to the authored palette. Convert to linear first.
-            //
-            // On a *linear* surface the GPU does NOT do that encoding on
-            // store, so the sRGB-encoded palette value must be passed
-            // through raw (no srgb_to_linear). The fix is keyed on
-            // `surface_is_srgb` so a DX12 driver that reports only linear
-            // formats doesn't render the cleared region too dark — the
-            // "black" half of the user's white+black launch flash.
-            let clear_color = if wgpu_state.surface_is_srgb {
-                wgpu::Color {
-                    r: srgb_to_linear(pal.canvas_clear.0),
-                    g: srgb_to_linear(pal.canvas_clear.1),
-                    b: srgb_to_linear(pal.canvas_clear.2),
-                    a: 1.0,
-                }
+        // ----- SHORTCUT HELP (popover anchored below the "?" button) -----
+        // Phase 9: rects of all popovers that need a hole punched in
+        // the D2D child this frame. Collected while drawing, applied
+        // once after the popup block (combined region — punching
+        // twice would let the second SetWindowRgn overwrite the first).
+        if self.show_shortcut_help {
+            let anchor = HELP_ANCHOR.with(|c| c.get());
+            let screen = egui_state.ctx.input(|i| i.screen_rect);
+            // Phase 9 fix: anchor BELOW the top-bar "?" button,
+            // right-aligned (pivot RIGHT_TOP extends the window
+            // left+down from the anchor). The previous
+            // RIGHT_BOTTOM pivot at (right+8, top-8) expanded the
+            // window UP across the title bar, covering the very
+            // button that opened it.
+            let anchor_pos = if anchor.any_nan() || anchor == egui::Rect::NOTHING {
+                // Fallback: below the title bar's right side.
+                egui::pos2(
+                    screen.right() - 60.0,
+                    TOOLBAR_HEIGHT as f32 + 8.0,
+                )
             } else {
-                wgpu::Color {
-                    r: pal.canvas_clear.0,
-                    g: pal.canvas_clear.1,
-                    b: pal.canvas_clear.2,
-                    a: 1.0,
-                }
+                egui::pos2(anchor.right() + 4.0, anchor.bottom() + 6.0)
             };
-            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("egui"),
+            let help_resp = egui::Window::new(
+                egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
+            )
+            // No default shadow/fill — the gray halo around the window
+            // read as a stray background block on both themes.
+            .frame(
+                egui::Frame::default()
+                    .fill(pal.panel_bg)
+                    // Phase 14: drop the 1px stroke (same reason as
+                    // the context menus) — it painted 0.5px inside
+                    // the frame rect and leaked past the hole.
+                    .stroke(egui::Stroke::NONE)
+                    .rounding(8.0)
+                    .outer_margin(egui::Margin::same(2.0))
+                    .inner_margin(egui::Margin::same(12.0))
+                    .shadow(egui::Shadow::NONE),
+            )
+            .fixed_pos(anchor_pos)
+            .pivot(egui::Align2::RIGHT_TOP)
+            .resizable(false)
+            .collapsible(false)
+            .fade_in(false)
+            .fade_out(false)
+            .show(&egui_state.ctx, |ui| {
+                egui::Grid::new("shortcuts_grid")
+                    .num_columns(2)
+                    .spacing([32.0, 7.0])
+                    .show(ui, |ui| {
+                        macro_rules! shortcut {
+                            ($key:expr, $desc:expr) => {
+                                ui.label(
+                                    egui::RichText::new($key)
+                                        .monospace()
+                                        .size(12.0)
+                                        .color(pal.key_hint),
+                                );
+                                ui.label(
+                                    egui::RichText::new($desc)
+                                        .size(12.0)
+                                        .color(pal.help_desc),
+                                );
+                                ui.end_row();
+                            };
+                        }
+                        shortcut!("← → ↑ ↓", "Previous / Next image");
+                        shortcut!("PgUp / PgDn", "Page through thumbnails");
+                        shortcut!("Home / End", "First / Last image");
+                        shortcut!("Ctrl + ←→↑↓", "Cycle related folders");
+                        shortcut!("Wheel", "Zoom (50%–500%)");
+                        shortcut!("Drag", "Pan image");
+                        shortcut!("F / Ctrl + 0", "Fit image to window");
+                        shortcut!("Ctrl + + / −", "Zoom in / out");
+                        shortcut!("Ctrl + F", "Fullscreen");
+                        shortcut!("Ctrl + W", "Set as wallpaper");
+                        shortcut!("Ctrl + E", "Open in Explorer");
+                        shortcut!("Ctrl + D", "Toggle favorite");
+                        shortcut!("Ctrl + /", "Toggle this help");
+                        shortcut!("Esc", "Exit fullscreen / Quit");
+                    });
+            });
+            // Phase 9: record the popover rect for the unified hole
+            // punch after the popup block, and close on any click
+            // outside the window.
+            //
+            // Phase 10 fix: clicks on the `?` button itself are
+            // EXCLUDED from clicked_elsewhere. The ? handler queues
+            // UiAction::ToggleShortcutHelp this same frame; if the
+            // popover also closed itself here, apply_action's toggle
+            // flipped it straight back open — the panel could never
+            // be dismissed via the button. With the exclusion, the
+            // button path closes via the toggle action, and any
+            // other outside click closes via clicked_elsewhere.
+            if let Some(resp) = help_resp {
+                // Click position this frame (None = no click).
+                let pointer = egui_state.ctx.input(|i| i.pointer.latest_pos());
+                let anchor = HELP_ANCHOR.with(|c| c.get());
+                let anchor_valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
+                let clicked_on_help_btn = match pointer {
+                    Some(p) => {
+                        anchor_valid
+                            && egui::Rect::from_min_max(
+                                anchor.min - egui::Vec2::splat(2.0),
+                                anchor.max + egui::Vec2::splat(2.0),
+                            )
+                            .contains(p)
+                    }
+                    None => false,
+                };
+                if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
+                    self.show_shortcut_help = false;
+                }
+            }
+        }
+
+        // ----- STATUS BAR -----
+        // Same three-zone layout as the fullscreen bar (filename left /
+        // controls center / info + help right) for a consistent UI.
+        if !self.is_fullscreen {
+            egui::TopBottomPanel::bottom("statusbar")
+                // Phase 9: explicit zero-margin frame — the default
+                // panel frame's inner margin ate into the 48px bar
+                // height, leaving the button row top-anchored and
+                // visually clipped by the bar edge.
+                .frame(
+                    egui::Frame::default()
+                        .fill(pal.panel_bg)
+                        .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
+                )
+                .exact_height(STATUS_BAR_HEIGHT as f32)
+                .show(&egui_state.ctx, |ui| {
+                    Self::draw_fullscreen_bar(
+                        ui, &mut state.actions, &state.current_path,
+                        state.nav_idx, state.nav_count2, state.current_size, state.zoom_pct,
+                        &pal, false, self.slide_show_running,
+                    );
+                });
+        }
+
+        // ----- Fullscreen chrome countdown -----
+        // Hovering the overlay toolbar pauses the timer; 2.5s of idle
+        // elsewhere hides it again.
+        if self.is_fullscreen && self.chrome_visible {
+            let pointer = egui_state.ctx.input(|i| i.pointer.latest_pos());
+            let hovering = pointer.map_or(false, |p| {
+                toolbar_rect.map_or(false, |r| r.contains(p))
+            });
+            if hovering {
+                self.chrome_hide_at = Some(std::time::Instant::now());
+            } else if let Some(t) = self.chrome_hide_at {
+                if t.elapsed() >= std::time::Duration::from_millis(2500) {
+                    self.chrome_visible = false;
+                    if let Some(w) = &self.window { w.request_redraw(); }
+                }
+            }
+        }
+
+        // Reserve the central area; the D2D viewer child HWND lives here.
+        // We do NOT paint a background fill — that would cover the child.
+        // We capture the CentralPanel's rect to position the D2D child
+        // exactly underneath it (single source of truth = egui layout).
+        let mut central_rect_phys: Option<(i32, i32, u32, u32)> = None;
+        let _center = egui::CentralPanel::default()
+            .frame(egui::Frame::none())
+            .show(&egui_state.ctx, |ui| {
+                let r = ui.max_rect();
+                let ppp = egui_state.ctx.pixels_per_point();
+                central_rect_phys = Some((
+                    (r.min.x * ppp).round() as i32,
+                    (r.min.y * ppp).round() as i32,
+                    (r.width() * ppp).round() as u32,
+                    (r.height() * ppp).round() as u32,
+                ));
+
+                // ----- Panel edge highlight -----
+                // A 2px accent line on the draggable edge when hovered
+                // or actively dragged (confirmation affordance).
+                let active_edge = self.drag_panel.or(self.panel_edge_hover);
+                if let Some(edge) = active_edge {
+                    let line_rect = match edge {
+                        0 => {
+                            let (x, y, w, h) = self.tree_rect_phys;
+                            if w > 0.0 {
+                                Some(egui::Rect::from_min_size(
+                                    egui::pos2((x + w - 1.5) / ppp, y / ppp),
+                                    egui::vec2(3.0 / ppp, h / ppp),
+                                ))
+                            } else { None }
+                        }
+                        1 => {
+                            let (x, y, w, h) = self.thumb_rect_phys;
+                            if w > 0.0 {
+                                Some(egui::Rect::from_min_size(
+                                    egui::pos2((x - 1.5) / ppp, y / ppp),
+                                    egui::vec2(3.0 / ppp, h / ppp),
+                                ))
+                            } else { None }
+                        }
+                        _ => None,
+                    };
+                    if let Some(lr) = line_rect {
+                        ui.painter().rect_filled(
+                            lr,
+                            0.0,
+                            egui::Color32::from_rgb(0x71, 0x70, 0xff),
+                        );
+                    }
+                }
+            });
+
+        // ----- egui → wgpu -----
+        let full_output = egui_state.ctx.end_pass();
+        let textures_delta = full_output.textures_delta;
+        let paint_jobs = egui_state.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
+
+        // Apply the captured CentralPanel rect to update viewport dimensions.
+        if let Some((px, py, pw, ph)) = central_rect_phys {
+            // Clamp to the surface — the first frame's layout can be
+            // garbage (huge available_rect before fonts settle).
+            let px = px.clamp(0, wgpu_state.config.width as i32);
+            let py = py.clamp(0, wgpu_state.config.height as i32);
+            let pw = pw.min(wgpu_state.config.width.saturating_sub(px as u32));
+            let ph = ph.min(wgpu_state.config.height.saturating_sub(py as u32));
+            if pw >= 1 && ph >= 1 {
+                self.viewport_w = pw;
+                self.viewport_h = ph;
+            }
+        }
+
+        let screen_descriptor = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [wgpu_state.config.width, wgpu_state.config.height],
+            pixels_per_point: wgpu_state.pixels_per_point.max(0.1),
+        };
+
+        // All egui frame building is done. Store the output data so
+        // submit_wgpu_frame can perform the actual wgpu rendering.
+        // We intentionally do NOT touch the surface/encoder here.
+        self._pending_egui_output = Some(PendingEguiOutput {
+            textures_delta,
+            paint_jobs,
+            screen_descriptor,
+        });
+
+        central_rect_phys
+    }
+
+    /// Submit the wgpu frame: egui render pass, image-quad pass, submit, present,
+    /// thumbnail flush. All surface/encoder/renderpass work lives here.
+    fn submit_wgpu_frame(
+        &mut self,
+        central_rect_phys: Option<(i32, i32, u32, u32)>,
+        state: &FrameState,
+    ) -> Result<()> {
+        let pal = self.pal();
+        let pal_bg = state.pal_bg;
+
+        let Some(egui_state) = self.egui_state.as_mut() else { return Ok(()); };
+        let Some(wgpu_state) = self.wgpu_state.as_ref() else { return Ok(()); };
+
+        let Some(pending) = self._pending_egui_output.take() else { return Ok(()) };
+        let PendingEguiOutput { textures_delta, paint_jobs, screen_descriptor } = pending;
+
+        let surface_texture = wgpu_state.surface.get_current_texture()?;
+        let view = surface_texture.texture.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // Apply egui texture deltas.
+        for (id, delta) in &textures_delta.set {
+            egui_state.renderer.update_texture(&wgpu_state.device, &wgpu_state.queue, *id, delta);
+        }
+        for id in &textures_delta.free {
+            egui_state.renderer.free_texture(id);
+        }
+
+        let mut encoder = wgpu_state.device.create_command_encoder(
+            &wgpu::CommandEncoderDescriptor { label: Some("egui") });
+
+        {
+            let _cmds = egui_state.renderer.update_buffers(
+                &wgpu_state.device,
+                &wgpu_state.queue,
+                &mut encoder,
+                &paint_jobs,
+                &screen_descriptor,
+            );
+            drop(_cmds);
+        }
+
+        // Canvas color matches the panel background (#0f1011) — no
+        // gray seams where egui doesn't paint.
+        //
+        // On an sRGB-encoded surface, wgpu encodes the clear value
+        // through the surface's linear→sRGB encoder on store; passing
+        // an sRGB fraction (0..1) over-brightens the cleared region
+        // relative to the authored palette. Convert to linear first.
+        //
+        // On a *linear* surface the GPU does NOT do that encoding on
+        // store, so the sRGB-encoded palette value must be passed
+        // through raw (no srgb_to_linear). The fix is keyed on
+        // `surface_is_srgb` so a DX12 driver that reports only linear
+        // formats doesn't render the cleared region too dark — the
+        // "black" half of the user's white+black launch flash.
+        let clear_color = if wgpu_state.surface_is_srgb {
+            wgpu::Color {
+                r: srgb_to_linear(pal.canvas_clear.0),
+                g: srgb_to_linear(pal.canvas_clear.1),
+                b: srgb_to_linear(pal.canvas_clear.2),
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                r: pal.canvas_clear.0,
+                g: pal.canvas_clear.1,
+                b: pal.canvas_clear.2,
+                a: 1.0,
+            }
+        };
+        let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(clear_color),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        egui_state.renderer.render(
+            &mut rpass.forget_lifetime(),
+            &paint_jobs,
+            &screen_descriptor,
+        );
+
+        // Phase 3: wgpu image-quad pass. Drawn after egui's chrome
+        // so the image appears on top of any egui panels that
+        // overlap the viewer rect (which they shouldn't — the
+        // CentralPanel's `Frame::none()` is invisible — but
+        // ordering this way matches the expected Z-order).
+        //
+        // Capture everything we need from self before locking
+        // (Rust's borrow checker is conservative about reentrancy
+        // through self).
+        let image_quad_args: Option<(
+            ImageQuadUniforms,
+            std::sync::Arc<DecodedGpuImage>,
+            i32, i32, u32, u32,
+        )> = match (central_rect_phys, self.viewer.as_ref()) {
+            (Some(rect), Some(viewer)) => {
+                let viewer_locked = viewer.lock();
+                viewer_locked.current_gpu.as_ref().map(|img| {
+                    let uniforms = viewer_locked.gpu_uniforms(
+                        (rect.0 as f32, rect.1 as f32),
+                        (rect.2 as f32, rect.3 as f32),
+                        pal_bg,
+                    );
+                    (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
+                })
+            }
+            _ => None,
+        };
+        if let Some((uniforms, gpu_image, vx, vy, vw, vh)) = image_quad_args {
+            wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, &uniforms);
+            let bind_group = wgpu_state.image_quad.create_bind_group(
+                &wgpu_state.device,
+                &gpu_image.view,
+            );
+            let mut iq_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("image_quad"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
+                    // Load the existing egui output as input —
+                    // the image quad is drawn on top of the
+                    // chrome, not cleared.
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(clear_color),
+                        load: wgpu::LoadOp::Load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1670,87 +1795,35 @@ let window = event_loop.create_window(
                 timestamp_writes: None,
                 occlusion_query_set: None,
             });
-
-            egui_state.renderer.render(
-                &mut rpass.forget_lifetime(),
-                &paint_jobs,
-                &screen_descriptor,
+            iq_rpass.set_scissor_rect(
+                vx.max(0) as u32,
+                vy.max(0) as u32,
+                vw,
+                vh,
             );
-
-            // Phase 3: wgpu image-quad pass. Drawn after egui's chrome
-            // so the image appears on top of any egui panels that
-            // overlap the viewer rect (which they shouldn't — the
-            // CentralPanel's `Frame::none()` is invisible — but
-            // ordering this way matches the expected Z-order).
-            //
-            // Capture everything we need from self before locking
-            // (Rust's borrow checker is conservative about reentrancy
-            // through self).
-            let image_quad_args: Option<(
-                ImageQuadUniforms,
-                std::sync::Arc<DecodedGpuImage>,
-                i32, i32, u32, u32,
-            )> = match (central_rect_phys, self.viewer.as_ref()) {
-                (Some(rect), Some(viewer)) => {
-                    let viewer_locked = viewer.lock();
-                    viewer_locked.current_gpu.as_ref().map(|img| {
-                        let uniforms = viewer_locked.gpu_uniforms(
-                            (rect.0 as f32, rect.1 as f32),
-                            (rect.2 as f32, rect.3 as f32),
-                            pal_bg,
-                        );
-                        (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
-                    })
-                }
-                _ => None,
-            };
-            if let Some((uniforms, gpu_image, vx, vy, vw, vh)) = image_quad_args {
-                wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, &uniforms);
-                let bind_group = wgpu_state.image_quad.create_bind_group(
-                    &wgpu_state.device,
-                    &gpu_image.view,
-                );
-                let mut iq_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("image_quad"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        // Load the existing egui output as input —
-                        // the image quad is drawn on top of the
-                        // chrome, not cleared.
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                iq_rpass.set_scissor_rect(
-                    vx.max(0) as u32,
-                    vy.max(0) as u32,
-                    vw,
-                    vh,
-                );
-                iq_rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
-                iq_rpass.set_bind_group(0, &bind_group, &[]);
-                iq_rpass.draw(0..3, 0..1);
-                drop(iq_rpass);
-            }
-
-            wgpu_state.queue.submit(std::iter::once(encoder.finish()));
-            surface_texture.present();
-
-            // Drain any completed thumbnail decodes from background
-            // threads and upload them as egui textures.
-            let _ = self.texture_cache.flush_inbox(&egui_state.ctx);
+            iq_rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
+            iq_rpass.set_bind_group(0, &bind_group, &[]);
+            iq_rpass.draw(0..3, 0..1);
+            drop(iq_rpass);
         }
 
-                // Apply deferred UI actions (after egui borrows are released).
+        wgpu_state.queue.submit(std::iter::once(encoder.finish()));
+        surface_texture.present();
+
+        // Drain any completed thumbnail decodes from background
+        // threads and upload them as egui textures.
+        let _ = self.texture_cache.flush_inbox(&egui_state.ctx);
+
+        Ok(())
+    }
+
+    /// Block E: apply deferred UI actions + drain tree right-click intent.
+    fn drain_frame_actions(&mut self, actions: Vec<UiAction>) {
+        // Apply deferred UI actions (after egui borrows are released).
         // Include any actions queued directly from the keyboard handler.
-        actions.extend(std::mem::take(&mut self.actions));
-        for action in actions {
+        let mut all_actions = actions;
+        all_actions.extend(std::mem::take(&mut self.actions));
+        for action in all_actions {
             self.apply_action(action);
         }
 
@@ -1776,8 +1849,6 @@ let window = event_loop.create_window(
                 is_favorite: is_fav,
             });
         }
-
-        Ok(())
     }
 
     /// Fullscreen overlay control bar (auto-hides; slides up from the
