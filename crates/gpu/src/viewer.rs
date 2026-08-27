@@ -97,10 +97,10 @@ impl Direct2DViewer {
                     viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
                     viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
                     texture_size: [0.0, 0.0],
+                    _pad_texture: [0; 2],
                     bg: [bg[0], bg[1], bg[2], 1.0],
                     has_image: 0,
                     _pad: [0; 3],
-                    _tail: [0; 2],
                 };
             }
         };
@@ -119,10 +119,10 @@ impl Direct2DViewer {
             viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
             viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
             texture_size: [img_w, img_h],
+            _pad_texture: [0; 2],
             bg: [bg[0], bg[1], bg[2], 1.0],
             has_image: 1,
             _pad: [0; 3],
-            _tail: [0; 2],
         }
     }
 

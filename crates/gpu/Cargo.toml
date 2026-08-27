@@ -23,3 +23,6 @@ parking_lot = { workspace = true }
 bytemuck = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+
+[dev-dependencies]
+naga = "22"

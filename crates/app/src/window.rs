@@ -264,7 +264,17 @@ impl PanelWidth {
 
     /// Advance the animation and return the width to draw with this frame.
     fn tick(&mut self, expanded: bool, dt: f32) -> f32 {
-        let target = if expanded { self.user_width.max(self.content_min) } else { 0.0 };
+        // Collapsing to 0 is instant — only the expansion direction
+        // animates. This avoids a flash of the panel for several frames
+        // when show_tree/show_thumbs are toggled false (e.g. by
+        // SingleImage launch, which starts at the default full width
+        // and would otherwise leave a visible tree column for ~30
+        // frames until the exponential easing settles).
+        if !expanded {
+            self.anim = 0.0;
+            return 0.0;
+        }
+        let target = self.user_width.max(self.content_min);
         // Exponential smoothing ≈ 120ms settle time.
         let k = (dt / 0.12).clamp(0.0, 1.0);
         self.anim += (target - self.anim) * k;

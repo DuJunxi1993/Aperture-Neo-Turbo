@@ -161,16 +161,19 @@ pub struct ImageQuadUniforms {
     pub viewer_rect_size: [f32; 2],
     /// Source texture size in pixels.
     pub texture_size: [f32; 2],
+    /// WGSL aligns the following `bg` vec4 to 16 bytes. texture_size
+    /// ends at offset 72, but vec4 requires 16-byte alignment, so the
+    /// WGSL bg lands at 80 — 8 bytes of padding after texture_size.
+    pub _pad_texture: [u32; 2],
     /// Straight (non-premul) RGBA background colour; returned by the
     /// fragment shader when `has_image` is 0 or the fragment lies
     /// outside the image rect.
     pub bg: [f32; 4],
     /// 1 when a decoded image texture is bound, 0 otherwise.
     pub has_image: u32,
-    /// Three trailing scalars (mirror the WGSL `_pad0/1/2`).
+    /// Three trailing scalars (mirror the WGSL `_pad0/1/2`). Struct
+    /// ends at 112 bytes, matching the WGSL round-up to 16.
     pub _pad: [u32; 3],
-    /// Final tail padding to round the struct up to 112 bytes.
-    pub _tail: [u32; 2],
 }
 
 impl Default for ImageQuadUniforms {
@@ -185,10 +188,10 @@ impl Default for ImageQuadUniforms {
             viewer_rect_min: [0.0, 0.0],
             viewer_rect_size: [0.0, 0.0],
             texture_size: [0.0, 0.0],
+            _pad_texture: [0; 2],
             bg: [0.0, 0.0, 0.0, 1.0],
             has_image: 0,
             _pad: [0; 3],
-            _tail: [0; 2],
         }
     }
 }
@@ -389,11 +392,53 @@ mod tests {
 
     #[test]
     fn uniforms_size_matches_wgsl_layout() {
-        // 3 vec3 (12 each = 36) + 3 pad u32 (12) + 3 vec2 (24) +
-        // 1 vec4 (16) + 4 scalar (16) = 104 bytes. Round up to the
-        // next 16-byte boundary → 112. naga reports 112 in the
-        // shader's binding; we MUST match it or wgpu validation fails.
         assert_eq!(std::mem::size_of::<ImageQuadUniforms>(), 112);
+    }
+
+    #[test]
+    fn rust_layout_matches_wgsl_layout() {
+        use std::mem::offset_of;
+        let module = naga::front::wgsl::parse_str(SHADER_SRC).expect("parse shader");
+        let u_var = module.global_variables.iter()
+            .find(|(_, v)| v.name.as_deref() == Some("u"))
+            .expect("uniform var 'u'");
+        let ty = &module.types[u_var.1.ty];
+        let naga::TypeInner::Struct { members, .. } = &ty.inner else {
+            panic!("u is not a struct");
+        };
+        let member_offsets: Vec<(String, u32)> = members.iter()
+            .map(|m| (m.name.clone().unwrap_or_default(), m.offset))
+            .collect();
+
+        let rust_offsets: Vec<(String, u32)> = vec![
+            ("col0".into(), offset_of!(ImageQuadUniforms, col0) as u32),
+            ("col1".into(), offset_of!(ImageQuadUniforms, col1) as u32),
+            ("col2".into(), offset_of!(ImageQuadUniforms, col2) as u32),
+            ("viewer_rect_min".into(), offset_of!(ImageQuadUniforms, viewer_rect_min) as u32),
+            ("viewer_rect_size".into(), offset_of!(ImageQuadUniforms, viewer_rect_size) as u32),
+            ("texture_size".into(), offset_of!(ImageQuadUniforms, texture_size) as u32),
+            ("bg".into(), offset_of!(ImageQuadUniforms, bg) as u32),
+            ("has_image".into(), offset_of!(ImageQuadUniforms, has_image) as u32),
+        ];
+
+        println!("{:#?}", member_offsets);
+        println!("{:#?}", rust_offsets);
+        for (name, wgsl_off) in &member_offsets {
+            if name == "_pad0" || name == "_pad1" || name == "_pad2" { continue; }
+            let rust_off = rust_offsets.iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, o)| *o)
+                .unwrap_or_else(|| panic!("no rust field {}", name));
+            // Rust fields were padded to align with WGSL's 16-byte vec3
+            // and 16-byte vec4; account for those by matching each WGSL
+            // offset to the nearest Rust offset that is <= it for scalar
+            // fields, or exactly equal for the padded struct members.
+            assert_eq!(
+                rust_off, *wgsl_off,
+                "field {} offset mismatch: rust={} wgsl={}",
+                name, rust_off, wgsl_off,
+            );
+        }
     }
 
     #[test]
