@@ -340,6 +340,19 @@ impl Direct2DViewer {
         }
     }
 
+    /// Update only the physical-pixel viewport fields. Does NOT recompute
+    /// fit / offset — those are owned by user actions (pan/zoom) and
+    /// `set_image_gpu`. Called every frame from `render_frame` so the
+    /// viewer's internal viewport stays in sync with the egui
+    /// CentralPanel as panel animations change its width — without
+    /// disturbing the user's current pan/zoom state.
+    #[inline]
+    pub fn set_viewport_physical(&mut self, w: u32, h: u32, x: f32, y: f32) {
+        self.viewport_w = w;
+        self.viewport_h = h;
+        self.viewport_origin = (x, y);
+    }
+
     /// Returns the current rect-anim interpolated transform, or None if
     /// no rect-anim is active. Called by `render_frame` to build the
     /// image-quad uniform each frame.

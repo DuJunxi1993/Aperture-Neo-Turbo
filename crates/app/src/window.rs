@@ -793,10 +793,14 @@ let window = event_loop.create_window(
             wgpu_state.config.width, wgpu_state.config.height);
         tracing::info!("init_renderer: viewer rect ({},{},{},{})", cx, cy, cw, ch);
 
-        // Hand the physical-pixel viewport to the viewer immediately
-        // — the first decode (coordinator.request_current below) calls
-        // set_image_gpu → compute_fit, which needs the real viewport.
-        viewer.lock().resize(cw, ch, cx as f32, cy as f32);
+        // Hand the physical-pixel viewport to the viewer immediately so
+        // the first decode (coordinator.request_current below) →
+        // set_image_gpu → compute_fit sees a correct viewport. We use
+        // set_viewport_physical (no compute_fit) because there is no
+        // image yet — compute_fit is a no-op anyway, and reserving
+        // resize() (which triggers rect-anim machinery) for the OS
+        // Resized path keeps semantics clean.
+        viewer.lock().set_viewport_physical(cw, ch, cx as f32, cy as f32);
 
         self.wgpu_state = Some(wgpu_state);
         self.egui_state = Some(egui_state);
@@ -1646,6 +1650,17 @@ let window = event_loop.create_window(
             paint_jobs,
             screen_descriptor,
         });
+
+        // Sync the viewer's viewport to the EGUI-COMPUTED central rect
+        // (single source of truth = the egui layout this frame). Only
+        // mutates viewport fields — does NOT call compute_fit, so the
+        // user's current pan/zoom/fit is preserved across panel
+        // animation changes (tree/thumb width easing).
+        if let Some((cx, cy, cw, ch)) = central_rect_phys {
+            if let Some(viewer) = &self.viewer {
+                viewer.lock().set_viewport_physical(cw, ch, cx as f32, cy as f32);
+            }
+        }
 
         central_rect_phys
     }
@@ -3272,7 +3287,7 @@ let window = event_loop.create_window(
         self.viewport_w = cw;
         self.viewport_h = ch;
         if let Some(viewer) = &self.viewer {
-            viewer.lock().resize(cw, ch, cx as f32, 0.0);
+            viewer.lock().set_viewport_physical(cw, ch, cx as f32, 0.0);
         }
     }
 
@@ -3715,7 +3730,7 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                 self.viewport_w = vw;
                 self.viewport_h = vh;
                 if let Some(viewer) = &self.viewer {
-                    viewer.lock().resize(vw, vh, vx as f32, vy as f32);
+                    viewer.lock().set_viewport_physical(vw, vh, vx as f32, vy as f32);
                 }
             }
 
