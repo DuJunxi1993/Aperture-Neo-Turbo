@@ -367,6 +367,23 @@ pub struct MainWindow {
 
     router: RouterState,
     last_double_click: Option<std::time::Instant>,
+
+    // ---- Arrow-key "brake" state (no rate-limit on KEYDOWN) ----
+    /// Direction the user is currently holding (None = no arrow key held).
+    /// KEYUP clears this so the per-frame pending_nav dispatch stops.
+    arrow_held: Option<NavigationDirection>,
+    /// Latest direction queued by an arrow KEYDOWN. Stays Some until
+    /// KEYUP clears it, so the per-frame dispatcher keeps trying to
+    /// advance while the user keeps holding the key.
+    pending_nav: Option<NavigationDirection>,
+    /// SlideDir matching the latest KEYDOWN (so repeated advance uses
+    /// a consistent slide animation direction).
+    pending_slide_dir: SlideDir,
+    /// Last time `handle_navigation` fired for an arrow key. Used to
+    /// throttle the per-frame dispatcher to one nav per ~200 ms (= one
+    /// slide-animation duration) so held-key scrolls feel continuous
+    /// without firing faster than the image can transition.
+    last_arrow_nav_at: Option<std::time::Instant>,
 }
 
 pub struct WgpuState {
@@ -472,6 +489,10 @@ impl MainWindow {
             is_fullscreen: false,
             router: RouterState::new(),
             last_double_click: None,
+            arrow_held: None,
+            pending_nav: None,
+            pending_slide_dir: SlideDir::None,
+            last_arrow_nav_at: None,
             initial_folder: folder,
             show_shortcut_help: false,
             chrome_visible: true,
@@ -541,12 +562,50 @@ impl MainWindow {
             .unwrap_or((1920.0, 1080.0, 1.0, (0.0, 0.0), (1920.0, 1080.0)));
 
         let (init_w, init_h, min_w, min_h) = if let Some((iw, ih)) = self.single_image_size {
-            // Immersive single-image launch: the client area matches the
-            // image (converted to logical units) plus the custom titlebar,
-            // clamped to the monitor.
-            let lw = ((iw as f64 / scale) + TOOLBAR_HEIGHT as f64).min(max_w).max(280.0);
-            let lh = ((ih as f64 / scale) + TOOLBAR_HEIGHT as f64).min(max_h).max(200.0);
-            (lw, lh, 240.0, 160.0)
+            // Immersive single-image launch. Goal: image occupies the
+            // viewer rect with NO letterbox (win_w / (win_h - chrome_h)
+            // == iw / ih). Chrome is fixed (titlebar + status bar) and
+            // sits outside the image area, so the window is image
+            // dimensions plus chrome while keeping image aspect.
+            //
+            // Previous bug: only TOOLBAR_HEIGHT (40) was added; the
+            // 48px status bar was forgotten, which compressed the
+            // status bar zone AND kept win aspect independent of image
+            // aspect — produced wide letterbox bands (D2D viewer
+            // letterboxing the image).
+            //
+            // Also: min_inner_size is unified to MIN_W/MIN_H (same as
+            // the multi-image modes) so the user can resize the window
+            // smaller than the image, and so `set_fullscreen`
+            // (Borderless(None)) does not collide with the OS min-size
+            // constraint (which made single-image fullscreen overflow
+            // the monitor on certain configs).
+            let chrome_w = 0.0_f64;
+            let chrome_h = (TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT) as f64;
+            let img_w = iw as f64 / scale;
+            let img_h = ih as f64 / scale;
+            let img_aspect = img_w / img_h;
+
+            // Width target: if image is wider than 90% of monitor width,
+            // shrink so it fits; otherwise show at native size.
+            let target_w = img_w.min(max_w).max(MIN_W as f64);
+            // Derive height from aspect; chrome_h lives outside the
+            // image area so win_h - chrome_h matches image aspect.
+            let mut lh = (target_w - chrome_w) / img_aspect + chrome_h;
+            lh = lh.min(max_h).max(MIN_H as f64);
+            let lw = ((lh - chrome_h) * img_aspect + chrome_w)
+                .max(MIN_W as f64).min(max_w);
+
+            tracing::debug!(
+                "single_image window: image={}x{} scale={:.2} -> init_w={:.0} init_h={:.0} (image aspect={:.3}, viewer aspect={:.3})",
+                iw, ih, scale, lw, lh,
+                img_aspect, (lw - chrome_w) / (lh - chrome_h)
+            );
+
+            // Min window size: unified with the multi-image modes so
+            // winit's min_inner_size constraint does not conflict with
+            // Borderless fullscreen on monitors smaller than the image.
+            (lw, lh, MIN_W as f64, MIN_H as f64)
         } else if self.settings.window_size().is_some() {
             // Restored session size.
             (
@@ -779,6 +838,55 @@ impl MainWindow {
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
+    /// Arrow-key KEYDOWN handler. Fires navigation IMMEDIATELY on the
+    /// first press (so a single tap still jumps on the down-stroke),
+    /// then queues the direction so the per-frame dispatcher keeps
+    /// firing while the key is held. The KEYUP path clears
+    /// `arrow_held` + `pending_nav` to stop further advances — that's
+    /// the "brake".
+    fn on_arrow_keydown(&mut self, direction: NavigationDirection, slide_dir: SlideDir) {
+        if self.arrow_held.is_none() {
+            // First press in a fresh hold — jump immediately.
+            self.handle_navigation(direction, slide_dir);
+            self.last_arrow_nav_at = Some(std::time::Instant::now());
+        }
+        // Always mark the key as held + queue the direction so the
+        // per-frame dispatcher can keep advancing while the user
+        // keeps holding. Repeat KEYDOWNs (OS auto-repeat) just
+        // re-assert the same direction — they do NOT fire
+        // handle_navigation directly.
+        self.arrow_held = Some(direction);
+        self.pending_nav = Some(direction);
+        self.pending_slide_dir = slide_dir;
+    }
+
+    /// Per-frame dispatcher for held arrow keys. Called from
+    /// `render_frame` BEFORE the egui frame. If `pending_nav` is
+    /// set AND `arrow_held` matches the queued direction AND
+    /// at least ~200 ms has passed since the last nav, fire one
+    /// navigation. KEYUP already cleared both, so a frame after
+    /// release sees no pending nav and this is a no-op — that's
+    /// the immediate-stop behavior the user wants.
+    ///
+    /// We never POP `pending_nav` from here — KEYUP is the only
+    /// thing that clears it. The 200 ms gate is what caps the
+    /// continuous-hold rate (≈ one nav per slide-animation
+    /// duration).
+    fn tick_arrow_nav(&mut self) {
+        let Some(dir) = self.pending_nav else { return; };
+        if self.arrow_held != Some(dir) { return; }
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(200);
+        let now = std::time::Instant::now();
+        let ready = match self.last_arrow_nav_at {
+            Some(prev) => now.duration_since(prev) >= MIN_GAP,
+            None => true,
+        };
+        if !ready { return; }
+        let slide_dir = self.pending_slide_dir;
+        self.handle_navigation(dir, slide_dir);
+        self.last_arrow_nav_at = Some(now);
+    }
+
     fn navigate_to_folder(&mut self, path: PathBuf) {
         // Keep the current image + thumbnails when the target folder has
         // no images — the viewer always reflects the displayed image's
@@ -895,6 +1003,12 @@ impl MainWindow {
             // request_redraw() here.
             coordinator.poll();
         }
+
+        // Held-arrow-key dispatcher. Fires one navigation per
+        // ~200 ms while the user holds an arrow key, and stops
+        // immediately on KEYUP (the KEYUP handler clears
+        // `pending_nav`/`arrow_held` before this runs next frame).
+        self.tick_arrow_nav();
 
 
         // Phase 3: slide-show 3-second tick. The user toggles via
@@ -3143,12 +3257,64 @@ impl ApplicationHandler<AppMessage> for MainWindow {
     ) {
         // ---- App-level keyboard shortcuts (handled directly) ----
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
+            // ---- Arrow-key "brake" via KEYUP ----
+            //
+            // Previously each KEYDOWN fired handle_navigation
+            // synchronously. OS auto-repeat floods the queue with
+            // ~30Hz KEYDOWNs, and the events queued BEFORE WM_KEYUP
+            // kept firing navigation after the user released — so
+            // holding an arrow key advanced several images past the
+            // release point ("inertia").
+            //
+            // New approach:
+            //   * KEYDOWN for an arrow: if it is the FIRST press
+            //     (arrow_held was None), fire handle_navigation
+            //     immediately so a single tap still jumps on the
+            //     down-stroke. Always record the direction into
+            //     pending_nav so the per-frame dispatcher keeps firing
+            //     while the key is held.
+            //   * KEYUP for an arrow: clear arrow_held AND
+            //     pending_nav. The next frame's dispatcher sees no
+            //     pending nav and stops advancing — the "brake".
+            //   * Per-frame dispatcher (in render_frame): if
+            //     pending_nav is Some AND arrow_held matches the
+            //     queued direction AND >= 200 ms has passed since
+            //     the last nav, fire one more handle_navigation.
+            //     This caps continuous hold at ~5 images/sec (= one
+            //     per slide-animation duration) without rate-limiting
+            //     KEYDOWN — only the EFFECTIVE navigation is paced.
+            if matches!(key_event.state, ElementState::Released) {
+                if let PhysicalKey::Code(code) = key_event.physical_key {
+                    let dir = match code {
+                        KeyCode::ArrowLeft | KeyCode::ArrowUp => Some(NavigationDirection::Previous),
+                        KeyCode::ArrowRight | KeyCode::ArrowDown => Some(NavigationDirection::Next),
+                        _ => None,
+                    };
+                    if let Some(dir) = dir {
+                        if self.arrow_held == Some(dir) {
+                            self.arrow_held = None;
+                            self.pending_nav = None;
+                            self.pending_slide_dir = SlideDir::None;
+                            // Note: we do NOT call handle_navigation
+                            // here. The dispatcher in render_frame
+                            // will see no pending nav next frame and
+                            // skip. Already-fired navs are not
+                            // undone — that's the cost of the
+                            // immediate "tap-on-down" behavior, but
+                            // it's bounded by the 200 ms per-frame
+                            // rate.
+                            return;
+                        }
+                    }
+                }
+            }
+
             if matches!(key_event.state, ElementState::Pressed) {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
                     // Persistent modifier state — survives frame drains
                     // (the batch copy is cleared by take_pending).
                     let ctrl_pressed = self.router.modifiers.ctrl;
-                    tracing::debug!("key {:?} ctrl={}", code, ctrl_pressed);
+                    tracing::debug!("key {:?} repeat={} ctrl={}", code, key_event.repeat, ctrl_pressed);
                     let mut consumed = true;
                     match code {
                         KeyCode::ArrowLeft if ctrl_pressed => self.handle_cycle_folder(-1),
@@ -3156,16 +3322,16 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                         KeyCode::ArrowUp if ctrl_pressed => self.handle_cycle_folder(-1),
                         KeyCode::ArrowDown if ctrl_pressed => self.handle_cycle_folder(1),
                         KeyCode::ArrowLeft => {
-                            self.handle_navigation(NavigationDirection::Previous, SlideDir::Previous);
+                            self.on_arrow_keydown(NavigationDirection::Previous, SlideDir::Previous);
                         }
                         KeyCode::ArrowRight => {
-                            self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
+                            self.on_arrow_keydown(NavigationDirection::Next, SlideDir::Next);
                         }
                         KeyCode::ArrowUp => {
-                            self.handle_navigation(NavigationDirection::Previous, SlideDir::Previous);
+                            self.on_arrow_keydown(NavigationDirection::Previous, SlideDir::Previous);
                         }
                         KeyCode::ArrowDown => {
-                            self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
+                            self.on_arrow_keydown(NavigationDirection::Next, SlideDir::Next);
                         }
                         KeyCode::PageUp => self.handle_navigation_jump(-1),
                         KeyCode::PageDown => self.handle_navigation_jump(1),
