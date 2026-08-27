@@ -110,9 +110,25 @@ impl ViewerChildWindow {
     /// Make the child window visible. Idempotent. Called by
     /// `render_frame` once the first decoded bitmap is available,
     /// so the OS doesn't show a placeholder background during the
-    /// decode gap between CreateWindowExW and the first D2D paint.
+    /// decode gap.
+    ///
+    /// `ShowWindow(SW_SHOW)` itself triggers the child's first
+    /// `WM_PAINT`, which — even though our wnd_proc swallows it —
+    /// causes `DefWindowProcW` to validate the dirty region and
+    /// let DWM composite the swapchain. To make sure that
+    /// composition shows *our* D2D content (not the WNDCLASS
+    /// default `hbrBackground` brush, which renders as the black/
+    /// white "placeholder" the user saw), we paint D2D into the
+    /// swapchain and Present BEFORE ShowWindow. The child's
+    /// wnd_class background brush is `HBRUSH(NULL)` and we never
+    /// fall back to GDI drawing in render(), so this single Present
+    /// is what the OS sees the first time the child is composited.
     pub fn show(&self) {
         if self.shown.get() { return; }
+        // Paint the current viewer state into the swapchain so the
+        // first composition after ShowWindow sees our D2D pixels,
+        // not the OS default brush.
+        let _ = self.render();
         unsafe {
             let _ = ShowWindow(self.hwnd, SW_SHOW);
         }
