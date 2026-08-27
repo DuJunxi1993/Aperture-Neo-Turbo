@@ -367,6 +367,11 @@ pub struct MainWindow {
 
     router: RouterState,
     last_double_click: Option<std::time::Instant>,
+
+    /// Last time an arrow-key navigation fired (None on first press).
+    /// Used by `try_arrow_nav` to drop OS auto-repeat KEYDOWNs that
+    /// would otherwise keep advancing images after key release.
+    last_arrow_nav_at: Option<std::time::Instant>,
 }
 
 pub struct WgpuState {
@@ -472,6 +477,7 @@ impl MainWindow {
             is_fullscreen: false,
             router: RouterState::new(),
             last_double_click: None,
+            last_arrow_nav_at: None,
             initial_folder: folder,
             show_shortcut_help: false,
             chrome_visible: true,
@@ -541,12 +547,51 @@ impl MainWindow {
             .unwrap_or((1920.0, 1080.0, 1.0, (0.0, 0.0), (1920.0, 1080.0)));
 
         let (init_w, init_h, min_w, min_h) = if let Some((iw, ih)) = self.single_image_size {
-            // Immersive single-image launch: the client area matches the
-            // image (converted to logical units) plus the custom titlebar,
-            // clamped to the monitor.
-            let lw = ((iw as f64 / scale) + TOOLBAR_HEIGHT as f64).min(max_w).max(280.0);
-            let lh = ((ih as f64 / scale) + TOOLBAR_HEIGHT as f64).min(max_h).max(200.0);
-            (lw, lh, 240.0, 160.0)
+            // Immersive single-image launch. Goal: image occupies the
+            // viewer rect with NO letterbox (win_w / (win_h - chrome_h)
+            // == iw / ih). Chrome is fixed (titlebar + status bar) and
+            // sits outside the image area, so the window is image
+            // dimensions plus chrome while keeping image aspect.
+            //
+            // Algorithm: pick a target image-fit width in the range
+            //   [max(MIN_W, image_w), max_w * 0.9], then derive the
+            // matching window height so win_w / (win_h - chrome_h)
+            // preserves iw / ih. Clamp to monitor; never smaller than
+            // image+chrome so the toolbar/status bar always fits.
+            //
+            // Previous bug: only TOOLBAR_HEIGHT (40) was added; the
+            // 48px status bar was forgotten, which compressed the
+            // status bar zone AND kept win aspect independent of image
+            // aspect — produced wide letterbox bands (D2D viewer
+            // letterboxing the image).
+            let chrome_w = 0.0_f64;
+            let chrome_h = (TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT) as f64;
+            let img_w = iw as f64 / scale;
+            let img_h = ih as f64 / scale;
+            let img_aspect = img_w / img_h;
+
+            // Width target: if image is wider than 90% of monitor width,
+            // shrink so it fits; otherwise show at native size.
+            let target_w = (img_w).min(max_w).max(280.0_f64);
+            // Derive height from aspect; chrome_h lives outside the
+            // image area so win_h - chrome_h matches image aspect.
+            let mut lh = (target_w - chrome_w) / img_aspect + chrome_h;
+            lh = lh.min(max_h).max(160.0);
+            let lw = ((lh - chrome_h) * img_aspect + chrome_w).max(280.0).min(max_w);
+
+            tracing::debug!(
+                "single_image window: image={}x{} scale={:.2} -> init_w={:.0} init_h={:.0} (image aspect={:.3}, window aspect={:.3}, chrome_h={})",
+                iw, ih, scale, lw, lh,
+                img_aspect, lw / (lh - chrome_h), chrome_h
+            );
+
+            // Minimum window: never smaller than image+chrome so the
+            // chrome always has room.
+            (
+                lw, lh,
+                (img_w + chrome_w).max(280.0),
+                (img_h + chrome_h).max(160.0),
+            )
         } else if self.settings.window_size().is_some() {
             // Restored session size.
             (
@@ -777,6 +822,32 @@ impl MainWindow {
             self.slide_show_last = Some(std::time::Instant::now());
         }
         if let Some(window) = &self.window { window.request_redraw(); }
+    }
+
+    /// Rate-limited arrow-key navigation: drops repeat events arriving
+    /// faster than one slide-animation duration (~250ms) so the viewer
+    /// "brakes" immediately on key release instead of advancing through
+    /// queued OS key-repeat KEYDOWNs.
+    ///
+    /// Without this throttle, holding the arrow key floods the event loop
+    /// with KEYDOWNs (~30Hz from OS auto-repeat); those queued before
+    /// WM_KEYUP continues firing navigation after the user releases.
+    fn try_arrow_nav(&mut self, direction: NavigationDirection, slide_dir: SlideDir) {
+        // ~250ms matches the slide-transition duration so each hold
+        // advances one image per slide instead of bunching up multiple
+        // nav events behind the in-flight animation.
+        const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(250);
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_arrow_nav_at {
+            if now.duration_since(prev) < MIN_GAP {
+                // Drop rapid auto-repeat. KEYUP doesn't need a special
+                // path — once KEYDOWN stops arriving the throttle no
+                // longer matters.
+                return;
+            }
+        }
+        self.last_arrow_nav_at = Some(now);
+        self.handle_navigation(direction, slide_dir);
     }
 
     fn navigate_to_folder(&mut self, path: PathBuf) {
@@ -3148,7 +3219,7 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                     // Persistent modifier state — survives frame drains
                     // (the batch copy is cleared by take_pending).
                     let ctrl_pressed = self.router.modifiers.ctrl;
-                    tracing::debug!("key {:?} ctrl={}", code, ctrl_pressed);
+                    tracing::debug!("key {:?} repeat={} ctrl={}", code, key_event.repeat, ctrl_pressed);
                     let mut consumed = true;
                     match code {
                         KeyCode::ArrowLeft if ctrl_pressed => self.handle_cycle_folder(-1),
@@ -3156,16 +3227,16 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                         KeyCode::ArrowUp if ctrl_pressed => self.handle_cycle_folder(-1),
                         KeyCode::ArrowDown if ctrl_pressed => self.handle_cycle_folder(1),
                         KeyCode::ArrowLeft => {
-                            self.handle_navigation(NavigationDirection::Previous, SlideDir::Previous);
+                            self.try_arrow_nav(NavigationDirection::Previous, SlideDir::Previous);
                         }
                         KeyCode::ArrowRight => {
-                            self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
+                            self.try_arrow_nav(NavigationDirection::Next, SlideDir::Next);
                         }
                         KeyCode::ArrowUp => {
-                            self.handle_navigation(NavigationDirection::Previous, SlideDir::Previous);
+                            self.try_arrow_nav(NavigationDirection::Previous, SlideDir::Previous);
                         }
                         KeyCode::ArrowDown => {
-                            self.handle_navigation(NavigationDirection::Next, SlideDir::Next);
+                            self.try_arrow_nav(NavigationDirection::Next, SlideDir::Next);
                         }
                         KeyCode::PageUp => self.handle_navigation_jump(-1),
                         KeyCode::PageDown => self.handle_navigation_jump(1),
