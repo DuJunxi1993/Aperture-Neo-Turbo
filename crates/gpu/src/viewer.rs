@@ -43,7 +43,7 @@ struct RectAnim {
 }
 
 impl Direct2DViewer {
-    pub fn new(_gpu: Arc<crate::device::GpuContext>, viewport_w: u32, viewport_h: u32) -> Self {
+    pub fn new(viewport_w: u32, viewport_h: u32) -> Self {
         Self {
             current_gpu: None,
             previous_gpu: None,
@@ -89,14 +89,18 @@ impl Direct2DViewer {
             None => {
                 return crate::ImageQuadUniforms {
                     col0: [1.0, 0.0, 0.0],
+                    _pad_col0: 0,
                     col1: [0.0, 1.0, 0.0],
+                    _pad_col1: 0,
                     col2: [0.0, 0.0, 1.0],
+                    _pad_col2: 0,
                     viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
                     viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
                     texture_size: [0.0, 0.0],
                     bg: [bg[0], bg[1], bg[2], 1.0],
                     has_image: 0,
                     _pad: [0; 3],
+                    _tail: [0; 2],
                 };
             }
         };
@@ -107,14 +111,18 @@ impl Direct2DViewer {
         let inv_s = if s > 0.0 { 1.0 / s } else { 1.0 };
         crate::ImageQuadUniforms {
             col0: [inv_s, 0.0, 0.0],
+            _pad_col0: 0,
             col1: [0.0, inv_s, 0.0],
+            _pad_col1: 0,
             col2: [-ox * inv_s, -oy * inv_s, 1.0],
+            _pad_col2: 0,
             viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
             viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
             texture_size: [img_w, img_h],
             bg: [bg[0], bg[1], bg[2], 1.0],
             has_image: 1,
             _pad: [0; 3],
+            _tail: [0; 2],
         }
     }
 

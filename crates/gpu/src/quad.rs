@@ -134,17 +134,27 @@ fn cubic_weight(t: f32) -> vec4<f32> {
 
 /// Per-frame uniform for the image quad.
 ///
-/// Sized to match the WGSL `U struct` (84 bytes — three vec3 columns +
-/// three vec2 + one vec4 + four scalars). The bind group layout has a
-/// single uniform-binding that reads this buffer.
+/// Sized to match the WGSL `Uniforms` struct layout (112 bytes).
+/// WGSL's uniform-buffer layout (std140-like) pads `vec3<f32>` to
+/// 16 bytes, so each of the three `col*` columns takes 16 bytes
+/// (12 data + 4 padding). The three vec2s, one vec4, four scalars
+/// add 8+8+8+16+16 = 56 bytes, plus the three explicit `u32` pads
+/// at the end bring us to 104. The struct size is then
+/// `roundUp(16, 104) = 112` bytes — matching what naga reports.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ImageQuadUniforms {
-    /// Column-major 3x3 transform, screen-pixel-local → image-pixel.
-    /// Three vec3 fields, each 16-byte aligned by WGSL rules.
+    /// Column 0 of the screen-pixel-local → image-pixel affine.
     pub col0: [f32; 3],
+    /// WGSL pads vec3 to 16 bytes in uniform buffers; explicit pad
+    /// keeps the Rust struct byte-aligned to the WGSL layout.
+    pub _pad_col0: u32,
+    /// Column 1.
     pub col1: [f32; 3],
+    pub _pad_col1: u32,
+    /// Column 2.
     pub col2: [f32; 3],
+    pub _pad_col2: u32,
     /// Viewer rect's top-left in framebuffer pixels.
     pub viewer_rect_min: [f32; 2],
     /// Viewer rect size in framebuffer pixels.
@@ -157,23 +167,28 @@ pub struct ImageQuadUniforms {
     pub bg: [f32; 4],
     /// 1 when a decoded image texture is bound, 0 otherwise.
     pub has_image: u32,
-    /// Trailing padding to a multiple of 16 bytes. The shader does
-    /// not read these; they exist only to satisfy WGSL struct layout.
+    /// Three trailing scalars (mirror the WGSL `_pad0/1/2`).
     pub _pad: [u32; 3],
+    /// Final tail padding to round the struct up to 112 bytes.
+    pub _tail: [u32; 2],
 }
 
 impl Default for ImageQuadUniforms {
     fn default() -> Self {
         Self {
             col0: [1.0, 0.0, 0.0],
+            _pad_col0: 0,
             col1: [0.0, 1.0, 0.0],
+            _pad_col1: 0,
             col2: [0.0, 0.0, 1.0],
+            _pad_col2: 0,
             viewer_rect_min: [0.0, 0.0],
             viewer_rect_size: [0.0, 0.0],
             texture_size: [0.0, 0.0],
             bg: [0.0, 0.0, 0.0, 1.0],
             has_image: 0,
             _pad: [0; 3],
+            _tail: [0; 2],
         }
     }
 }
@@ -359,49 +374,6 @@ let bind_group_layout =
     }
 }
 
-/// 1×1 placeholder texture used by Phase 1 to bind a valid texture
-/// before any decoded image is available.
-///
-/// Drop this once Phase 3 wires up the real decoded image texture.
-pub fn create_placeholder_texture(
-    device: &wgpu::Device,
-    queue: &wgpu::Queue,
-) -> (wgpu::Texture, wgpu::TextureView) {
-    use crate::texture_format_premul_bgra;
-    let format = texture_format_premul_bgra();
-    let tex = device.create_texture(&wgpu::TextureDescriptor {
-        label: Some("image_quad_placeholder"),
-        size: wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-        mip_level_count: 1,
-        sample_count: 1,
-        dimension: wgpu::TextureDimension::D2,
-        format,
-        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-        view_formats: &[],
-    });
-    // Clear to (0,0,0,0) — the shader's has_image=0 path will return u.bg
-    // regardless of the texture content, so the placeholder colour does
-    // not matter for visible output. The pixels are initialised here so
-    // GPU validation does not flag uninitialised memory.
-    queue.write_texture(
-        wgpu::ImageCopyTexture {
-            texture: &tex,
-            mip_level: 0,
-            origin: wgpu::Origin3d::ZERO,
-            aspect: wgpu::TextureAspect::All,
-        },
-        &[0u8, 0, 0, 0],
-        wgpu::ImageDataLayout {
-            offset: 0,
-            bytes_per_row: Some(4),
-            rows_per_image: Some(1),
-        },
-        wgpu::Extent3d { width: 1, height: 1, depth_or_array_layers: 1 },
-    );
-    let view = tex.create_view(&wgpu::TextureViewDescriptor::default());
-    (tex, view)
-}
-
 /// The texture format used for decoded image uploads. Must match the
 /// BGRA premultiplied layout WIC produces (`crates/gpu/src/decode.rs`).
 ///
@@ -416,13 +388,12 @@ mod tests {
     use super::*;
 
     #[test]
-    fn uniforms_size_is_push_constant_aligned() {
-        // 9 vec3 + 3 vec2 + 1 vec4 + 2 scalar = 27 + 12 + 16 + 8 = 92
-        // bytes. Well within the 128-byte push-constant budget. 92 % 16
-        // == 12 — fine, push-constant ranges don't require 16-byte
-        // alignment (only uniform buffers do).
-        assert_eq!(std::mem::size_of::<ImageQuadUniforms>(), 92);
-        assert!(std::mem::size_of::<ImageQuadUniforms>() <= 128);
+    fn uniforms_size_matches_wgsl_layout() {
+        // 3 vec3 (12 each = 36) + 3 pad u32 (12) + 3 vec2 (24) +
+        // 1 vec4 (16) + 4 scalar (16) = 104 bytes. Round up to the
+        // next 16-byte boundary → 112. naga reports 112 in the
+        // shader's binding; we MUST match it or wgpu validation fails.
+        assert_eq!(std::mem::size_of::<ImageQuadUniforms>(), 112);
     }
 
     #[test]

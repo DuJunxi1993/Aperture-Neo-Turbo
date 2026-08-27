@@ -31,7 +31,7 @@ use aperture_core::{
     NavigationService, NavigationDirection,
     SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
-use aperture_gpu::{GpuContext, Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir, ImageQuadUniforms, DecodedGpuImage};
+use aperture_gpu::{Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir, ImageQuadUniforms, DecodedGpuImage};
 use crate::event_router::{self, RouterState};
 
 /// Phase 16: custom winit event that pops a native right-click
@@ -315,7 +315,6 @@ pub struct MainWindow {
     _pending_egui_output: Option<PendingEguiOutput>,
 
     // ── GPU / decode / viewer state ──────────────────────────────
-    gpu: Option<Arc<GpuContext>>,
     viewer: Option<Arc<Mutex<Direct2DViewer>>>,
     loader: Option<Arc<WicLoader>>,
     coordinator: Option<Arc<DecodeCoordinator>>,
@@ -402,11 +401,6 @@ pub struct WgpuState {
     /// Image-quad pipeline (Phase 1 scaffolding; replaces the D2D
     /// child HWND in Phase 4). Created once per WgpuState.
     pub image_quad: aperture_gpu::ImageQuadPipeline,
-    /// Placeholder 1×1 texture used by the image quad before any
-    /// decoded image is bound (Phase 1 only). Drop this once Phase 3
-    /// wires the real decoded texture.
-    #[allow(dead_code)]
-    pub placeholder_image: (wgpu::Texture, wgpu::TextureView),
 }
 
 pub struct EguiState {
@@ -475,7 +469,6 @@ impl MainWindow {
             window: None,
             wgpu_state: None,
             egui_state: None,
-            gpu: None,
             viewer: None,
             loader: None,
             coordinator: None,
@@ -730,10 +723,9 @@ let window = event_loop.create_window(
         let egui_state = init_egui(&wgpu_state.device, wgpu_state.surface_format);
         tracing::info!("init_renderer: egui OK");
 
-        let gpu = GpuContext::new()?;
-        let viewer = Arc::new(Mutex::new(Direct2DViewer::new(
-            gpu.clone(), self.viewport_w, self.viewport_h,
-        )));
+        // Viewer is unitless (no pixels yet); the first viewer.resize
+        // call below sets the physical-pixel viewport.
+        let viewer = Arc::new(Mutex::new(Direct2DViewer::new(1, 1)));
 
         let loader = Arc::new(WicLoader::new());
         // Phase 2: pass wgpu device + queue into the coordinator so
@@ -801,9 +793,13 @@ let window = event_loop.create_window(
             wgpu_state.config.width, wgpu_state.config.height);
         tracing::info!("init_renderer: viewer rect ({},{},{},{})", cx, cy, cw, ch);
 
+        // Hand the physical-pixel viewport to the viewer immediately
+        // — the first decode (coordinator.request_current below) calls
+        // set_image_gpu → compute_fit, which needs the real viewport.
+        viewer.lock().resize(cw, ch, cx as f32, cy as f32);
+
         self.wgpu_state = Some(wgpu_state);
         self.egui_state = Some(egui_state);
-        self.gpu = Some(gpu);
         self.viewer = Some(viewer);
         self.loader = Some(loader);
         self.coordinator = Some(coordinator);
@@ -3272,9 +3268,12 @@ let window = event_loop.create_window(
     fn relayout_viewer(&mut self) {
         let Some(window) = &self.window else { return; };
         let size = window.inner_size();
-        let (_cx, _cy, cw, ch) = self.compute_viewer_rect(size.width, size.height);
+        let (cx, _cy, cw, ch) = self.compute_viewer_rect(size.width, size.height);
         self.viewport_w = cw;
         self.viewport_h = ch;
+        if let Some(viewer) = &self.viewer {
+            viewer.lock().resize(cw, ch, cx as f32, 0.0);
+        }
     }
 
     fn save_window_geometry(&mut self) {
@@ -3715,6 +3714,9 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                 let _ = (vx, vy);
                 self.viewport_w = vw;
                 self.viewport_h = vh;
+                if let Some(viewer) = &self.viewer {
+                    viewer.lock().resize(vw, vh, vx as f32, vy as f32);
+                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -3915,7 +3917,6 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
     // image). Phase 3 wires the encoded render pass; Phase 4 deletes
     // the D2D path entirely.
     let image_quad = aperture_gpu::ImageQuadPipeline::new(&device, format);
-    let placeholder_image = aperture_gpu::create_placeholder_texture(&device, &queue);
 
     // Phase 2: Arc-wrap device + queue so the decode coordinator can
     // hold long-lived references for the image-quad texture upload.
@@ -3932,7 +3933,6 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         pixels_per_point: window.scale_factor() as f32,
         _instance: instance,
         image_quad,
-        placeholder_image,
     })
 }
 
