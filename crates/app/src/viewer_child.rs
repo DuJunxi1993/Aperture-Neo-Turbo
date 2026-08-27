@@ -38,6 +38,14 @@ pub struct ViewerChildWindow {
     /// Time the size last changed — ResizeBuffers is deferred until the
     /// size has been stable briefly (avoids per-frame resize during drags).
     pending_resize_since: Option<std::time::Instant>,
+    /// Whether the window has been ShowWindow'd. We deliberately create
+    /// the child HWND WITHOUT WS_VISIBLE and defer ShowWindow until the
+    /// first decoded bitmap has been applied to the viewer — otherwise
+    /// the OS shows a placeholder child-window background (DWM's
+    /// default brush, which differs from both the egui canvas_clear
+    /// and the viewer.bg) during the gap between CreateWindowExW and
+    /// the first set_image, producing a black/white flash on launch.
+    shown: std::cell::Cell<bool>,
 }
 
 impl ViewerChildWindow {
@@ -61,7 +69,11 @@ impl ViewerChildWindow {
                 WS_EX_NOPARENTNOTIFY | WS_EX_TRANSPARENT,
                 VIEWER_CLASS_NAME,
                 PCWSTR::from_raw(EMPTY_W.as_ptr()),
-                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_OVERLAPPED,
+                // Note: WS_VISIBLE deliberately omitted — show() must be
+                // called from render_frame AFTER the first decoded image
+                // lands in the viewer so the OS doesn't paint a placeholder
+                // child-window background during the decode gap.
+                WS_CHILD | WS_CLIPSIBLINGS | WS_OVERLAPPED,
                 x, y, width as i32, height as i32,
                 parent_hwnd,
                 HMENU(std::ptr::null_mut()),
@@ -90,8 +102,21 @@ impl ViewerChildWindow {
                 },
                 last_size: (width, height),
                 pending_resize_since: None,
+                shown: std::cell::Cell::new(false),
             })
         }
+    }
+
+    /// Make the child window visible. Idempotent. Called by
+    /// `render_frame` once the first decoded bitmap is available,
+    /// so the OS doesn't show a placeholder background during the
+    /// decode gap between CreateWindowExW and the first D2D paint.
+    pub fn show(&self) {
+        if self.shown.get() { return; }
+        unsafe {
+            let _ = ShowWindow(self.hwnd, SW_SHOW);
+        }
+        self.shown.set(true);
     }
 
     pub fn render(&self) -> Result<()> {
