@@ -1,6 +1,6 @@
 //! Thumbnail grid panel
 
-use egui::{Ui, Rect, Vec2, Sense, Response, Color32, Stroke, Image, TextureHandle, ImageButton};
+use egui::{Ui, Rect, Vec2, Sense, Response, Color32, Stroke};
 use aperture_core::ImageItem;
 use std::sync::Arc;
 use parking_lot::RwLock;
@@ -37,7 +37,7 @@ impl ThumbPanel {
                 egui::Pos2::new(outer_rect.right(), outer_rect.top()),
                 egui::Pos2::new(outer_rect.right(), outer_rect.bottom()),
             ],
-            Stroke::new(1.0, Color32::from_rgb(230, 230, 230)),
+            Stroke::new(1.0_f32, Color32::from_rgb(230, 230, 230)),
         );
 
         // Scrollable area
@@ -47,7 +47,7 @@ impl ThumbPanel {
             let padding = 8.0;
             let mut y = padding + viewport.min.y - self.scroll_offset;
 
-            for (i, item) in items.iter().enumerate() {
+            for (i, _) in items.iter().enumerate() {
                 if y + self.thumb_size + padding > outer_rect.bottom() {
                     break;
                 }
@@ -69,7 +69,7 @@ impl ThumbPanel {
 
                     ui.painter().rect_filled(thumb_rect, 4.0, bg);
                     if is_selected {
-                        ui.painter().rect_stroke(thumb_rect, 4.0, Stroke::new(2.0, Color32::from_rgb(75, 105, 255)));
+                        ui.painter().rect_stroke(thumb_rect, 4.0, Stroke::new(2.0_f32, Color32::from_rgb(75, 105, 255)));
                     }
 
                     // Placeholder for thumbnail image

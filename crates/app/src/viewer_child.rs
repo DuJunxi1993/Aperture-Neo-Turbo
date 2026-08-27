@@ -11,7 +11,6 @@ use parking_lot::Mutex;
 use aperture_gpu::{GpuContext, Direct2DViewer, create_swapchain_for_hwnd, SwapchainHandle};
 use windows::{
     Win32::Foundation::*,
-    Win32::Graphics::Dxgi::*,
     Win32::Graphics::Gdi::*,
     Win32::UI::WindowsAndMessaging::*,
 };
@@ -267,6 +266,7 @@ impl ViewerChildWindow {
         self.last_applied_rect = (x, y, width, height);
     }
 
+    #[allow(dead_code)]
     pub fn size(&self) -> (u32, u32) {
         self.last_size
     }

@@ -19,7 +19,6 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use std::collections::VecDeque;
-use anyhow::Result;
 use aperture_core::{NavigationService, IImageLoader, ImageLoadResult};
 use crate::{WicLoader, Direct2DViewer, SlideDir, decode_file, DecodedPixels, DecodedBitmap, DecodedGpuImage};
 
@@ -209,20 +208,22 @@ impl DecodeCoordinator {
                     tracing::error!("Failed to upload pixels to D2D for {}: {}", resp.path.display(), e);
                 }
             }
-            // Phase 2 addition: wgpu texture upload (Phase 3+ consumes).
+            // Phase 2: wgpu texture upload. Phase 3 also applies it to the
+            // viewer so the image-quad pipeline can sample it.
             if let (Some(device), Some(queue)) =
                 (self.device.lock().as_ref(), self.queue.lock().as_ref())
             {
                 match DecodedGpuImage::from_pixels(device, queue, &pixels) {
-                    Ok(_gpu_image) => {
+                    Ok(gpu_image) => {
                         tracing::info!(
                             "Uploaded wgpu texture for {} ({}x{})",
                             resp.path.display(), pixels.width, pixels.height,
                         );
-                        // Phase 3 will wire `_gpu_image` into the viewer's
-                        // bind group and onto the queue. For now it goes
-                        // out of scope at the end of this block — Phase 3
-                        // holds it on the viewer / in the bind group.
+                        // Phase 3: hand the texture to the viewer. The
+                        // viewer stores it in `current_gpu` so the image
+                        // quad pipeline's bind group can reference it
+                        // when render_frame builds the per-frame uniform.
+                        self.viewer.lock().set_image_gpu(Arc::new(gpu_image), resp.direction);
                     }
                     Err(e) => {
                         tracing::error!(

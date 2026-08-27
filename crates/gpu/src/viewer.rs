@@ -4,15 +4,14 @@
 //! All transforms are GPU; CPU only computes the matrix array each frame.
 
 use windows::{
-    Win32::Foundation::*,
     Win32::Graphics::Direct2D::*,
     Win32::Graphics::Direct2D::Common::*,
-    Win32::Graphics::Dxgi::Common::*,
     Foundation::Numerics::Matrix3x2,
 };
 use std::sync::Arc;
 use crate::device::GpuContext;
 use crate::bitmap::DecodedBitmap;
+use crate::texture::DecodedGpuImage;
 use crate::animator::{Animator, AffineTransform};
 use crate::swapchain::SwapchainHandle;
 use anyhow::Result;
@@ -27,8 +26,16 @@ pub enum SlideDir {
 pub struct Direct2DViewer {
     pub gpu: Arc<GpuContext>,
     pub current: Option<DecodedBitmap>,
+    /// Phase 3: parallel `current` holding a wgpu texture. The image
+    /// quad shader samples this. Decoded by `DecodeCoordinator` and
+    /// uploaded to a Bgra8UnormSrgb texture. Phase 4 deletes
+    /// `current` and this becomes the sole source-of-truth.
+    pub current_gpu: Option<Arc<DecodedGpuImage>>,
     /// Outgoing image during a directional slide, with its own fit transform.
     pub previous: Option<PreviousImage>,
+    /// Phase 3: parallel `previous` holding the wgpu texture of the
+    /// outgoing image during a directional slide.
+    pub previous_gpu: Option<Arc<DecodedGpuImage>>,
     pub animator: Animator,
     pub slide_dir: SlideDir,
     pub viewport_w: u32,
@@ -90,7 +97,9 @@ impl Direct2DViewer {
         Self {
             gpu,
             current: None,
+            current_gpu: None,
             previous: None,
+            previous_gpu: None,
             animator: Animator::new(),
             slide_dir: SlideDir::None,
             viewport_w,
@@ -124,6 +133,9 @@ impl Direct2DViewer {
             bitmap: bmp,
         });
         self.current = Some(bitmap);
+        // Mirror the outgoing to the wgpu side. Phase 4 collapses
+        // these into a single wgpu field.
+        self.previous_gpu = self.current_gpu.take();
         self.compute_fit();
         if direction != SlideDir::None {
             self.previous = outgoing;
@@ -131,6 +143,120 @@ impl Direct2DViewer {
         } else {
             self.previous = None;
             self.animator.reset();
+        }
+    }
+
+    /// Phase 3: receive the wgpu texture uploaded by the decode
+    /// coordinator. Caller is `MainWindow::render_frame` after
+    /// `coordinator.poll()`. The texture is stored in `current_gpu` so
+    /// the image quad bind group can reference it.
+    pub fn set_image_gpu(&mut self, image: Arc<DecodedGpuImage>, direction: SlideDir) {
+        self.rotation = 0;
+        self.slide_dir = direction;
+        let outgoing = self.current_gpu.take();
+        self.current_gpu = Some(image);
+        self.previous_gpu = outgoing;
+        if direction != SlideDir::None {
+            self.animator.start_slide(direction, self.viewport_w as f32);
+        } else {
+            self.animator.reset();
+        }
+    }
+
+    /// Phase 3: per-frame uniform for the wgpu image-quad pipeline.
+    ///
+    /// Builds the mat3x3 transform that maps a screen-local framebuffer
+    /// pixel position (relative to the viewer's top-left) to the
+    /// corresponding decoded-image pixel coordinate. The transform is
+    /// column-major; the shader's `mat3x3 * vec3(pixel, 1.0)` produces
+    /// the image-pixel position.
+    ///
+    /// **Initial implementation**: handles the static fit (no rotation,
+    /// no slide animation, no rect_anim). This is sufficient for the
+    /// first commit of Phase 3 — the image appears at its fit-to-viewer
+    /// size, no rotation, no slide. Subsequent commits add rotation +
+    /// slide + rect-anim by extending this method.
+    pub fn gpu_uniforms(
+        &self,
+        viewer_rect_min: (f32, f32),
+        viewer_rect_size: (f32, f32),
+        bg: [f32; 3],
+    ) -> crate::ImageQuadUniforms {
+        // Lazy conversion: not in the call-site hot path but keeps the
+        // math readable. We compute image-pixel space from screen-local
+        // pixel space via the displayed-bitmap's per-quadrant transform,
+        // then translate that into the mat3x3 column-major form the
+        // shader expects.
+        let (img_w, img_h) = match &self.current_gpu {
+            Some(img) => (img.width as f32, img.height as f32),
+            None => {
+                // No image bound yet; emit the bg-only uniform and let
+                // the fragment shader paint the whole rect as bg.
+                return crate::ImageQuadUniforms {
+                    col0: [1.0, 0.0, 0.0],
+                    col1: [0.0, 1.0, 0.0],
+                    col2: [0.0, 0.0, 1.0],
+                    viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
+                    viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
+                    texture_size: [0.0, 0.0],
+                    bg: [bg[0], bg[1], bg[2], 1.0],
+                    has_image: 0,
+                    _pad: [0; 3],
+                };
+            }
+        };
+
+        // The image fills the viewer rect via compute_fit (called from
+        // set_image / set_image_gpu). The fit transforms screen-space
+        // (relative to the viewer's top-left, after subtracting
+        // offset_x/offset_y) to image-space. With rotation=0 and no
+        // slide, this is a uniform scale + translation:
+        //   image_x = (screen_x - offset_x) / fit_scale   (zoom = fit_scale;
+        //                                                       offset_x is
+        //                                                       already in
+        //                                                       screen-local)
+        // Wait — the D2D code uses zoom/offset with offset_x being
+        // CENTER-of-image offset. In the existing math:
+        //   x' = s·(x − ox)  where s = zoom, ox = offset_x (already
+        //   in source pixels). So:
+        //   image_x = (screen_x - ox) / s
+        // We use self.zoom and self.offset_x directly.
+        let s = self.zoom;
+        let ox = self.offset_x;
+        let oy = self.offset_y;
+
+        // mat3x3 column-major: col0 = (1/s, 0, 0),
+        //                       col1 = (0, 1/s, 0),
+        //                       col2 = (ox/s, oy/s, 1).
+        // Test: mat * vec3(screen_x, screen_y, 1) = (screen_x/s + ox/s,
+        //                                                screen_y/s + oy/s,
+        //                                                1)
+        //            image_x = screen_x / s + ox / s = (screen_x + ox) / s
+        // But the D2D convention is `x' = s·(x − ox)`, which is the
+        // screen-space (already without offset) perspective. The shader
+        // takes screen-local pixel (relative to viewer rect), so:
+        //   image_x = (screen_local_x - ox) / s
+        // We need mat that maps screen_local → image such that:
+        //   img = (screen_local - offset) / scale
+        //       = screen_local / scale - offset / scale
+        // So mat (col-major) is:
+        //   col0 = (1/s, 0, 0)
+        //   col1 = (0, 1/s, 0)
+        //   col2 = (-ox/s, -oy/s, 1)
+        // Check: mat * vec3(screen_local.x, screen_local.y, 1)
+        //      = (screen_local.x/s - ox/s, screen_local.y/s - oy/s, 1)
+        //      = ((screen_local - offset) / s, 1) ✓
+        let inv_s = if s > 0.0 { 1.0 / s } else { 1.0 };
+        crate::ImageQuadUniforms {
+            col0: [inv_s, 0.0, 0.0],
+            col1: [0.0, inv_s, 0.0],
+            col2: [-ox * inv_s, -oy * inv_s, 1.0],
+            viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
+            viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
+            texture_size: [img_w, img_h],
+            bg: [bg[0], bg[1], bg[2], 1.0],
+            has_image: 1,
+            _pad: [0; 3],
         }
     }
 

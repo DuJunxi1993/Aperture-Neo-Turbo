@@ -1,6 +1,6 @@
 //! ViewerPanel — embeds the Direct2D viewer inside egui via a child window region
 
-use egui::{Ui, Rect, Vec2, Sense, Response};
+use egui::{Ui, Vec2, Sense, Response};
 use aperture_gpu::Direct2DViewer;
 use std::sync::Arc;
 use parking_lot::Mutex;

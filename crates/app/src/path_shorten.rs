@@ -13,7 +13,7 @@ pub fn shorten(p: &Path) -> String {
     // Insert ellipsis in the middle.
     let head_keep = MAX_LEN / 2 - 1;
     let tail_keep = MAX_LEN - head_keep - 1;
-    let mut chars: Vec<char> = s.chars().collect();
+    let chars: Vec<char> = s.chars().collect();
     if chars.len() <= head_keep + tail_keep {
         return s;
     }

@@ -20,8 +20,6 @@ pub enum Action {
 // Virtual key codes (subset of Win32 VK_* constants)
 const VK_RIGHT: u32 = 0x27;
 const VK_LEFT: u32 = 0x25;
-const VK_UP: u32 = 0x26;
-const VK_DOWN: u32 = 0x28;
 const VK_F: u32 = 0x46;
 const VK_F11: u32 = 0x7A;
 const VK_T: u32 = 0x54;

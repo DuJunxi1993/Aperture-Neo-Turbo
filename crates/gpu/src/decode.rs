@@ -4,7 +4,7 @@
 //! Result is BGRA pixel buffer + dimensions; D2D upload happens on main thread.
 
 use windows::{
-    Win32::Foundation::*,
+    Win32::Foundation::GENERIC_READ,
     Win32::Graphics::Imaging::*,
 };
 use windows_core::PCWSTR;
@@ -36,16 +36,6 @@ pub fn decode_file(path: &Path, target_w: u32, target_h: u32) -> Result<DecodedP
         // COM must be initialized per-thread; spawn_blocking does this for us
         CoInitializeEx(None, COINIT_MULTITHREADED).ok()?;
 
-        let path_str: Vec<u16> = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .as_os_str()
-            .as_encoded_bytes()
-            .iter()
-            .map(|&b| b as u16)
-            .chain(std::iter::once(0))
-            .collect();
-        // Actually use encode_wide on the path
         let path_str: Vec<u16> = path
             .as_os_str()
             .to_string_lossy()

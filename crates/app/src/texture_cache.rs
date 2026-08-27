@@ -12,6 +12,7 @@ use parking_lot::Mutex;
 use aperture_core::ThumbCache;
 use aperture_gpu::decode_file;
 
+#[allow(dead_code)]
 /// Loaded main-image texture (full resolution, aspect-ratio known).
 pub struct MainImage {
     pub texture: egui::TextureHandle,
@@ -28,6 +29,7 @@ pub struct ThumbEntry {
 }
 
 #[derive(Default)]
+#[allow(dead_code)]
 struct TextureCacheState {
     main: HashMap<PathBuf, MainImage>,
     thumbs: HashMap<PathBuf, ThumbEntry>,
@@ -46,6 +48,7 @@ pub struct ThumbResult {
 /// Owns the egui texture registry and the on-disk thumbnail DB.
 pub struct TextureCache {
     state: Mutex<TextureCacheState>,
+    #[allow(dead_code)]
     thumb_db: Arc<ThumbCache>,
     /// Channels from background decode threads; the main thread drains
     /// these each frame and uploads the results to egui textures.
@@ -111,6 +114,7 @@ impl TextureCache {
 
     /// Look up the cached main image (full size) for `path`, or `None` if
     /// the image hasn't been decoded this session.
+    #[allow(dead_code)]
     pub fn get_main(&self, path: &Path) -> Option<MainImage> {
         let s = self.state.lock();
         s.main.get(path).map(|m| MainImage {
@@ -123,6 +127,7 @@ impl TextureCache {
 
     /// Register a freshly-decoded main image into the cache. `rgba` is
     /// `width*height*4` bytes in RGBA8 order (NOT premultiplied BGRA).
+    #[allow(dead_code)]
     pub fn put_main(
         &self,
         ctx: &egui::Context,
@@ -182,12 +187,14 @@ impl TextureCache {
 
     /// Read the cached JPEG for a path (mtime-aware) and return raw bytes.
     /// Returns `None` if not cached. Does NOT decode.
+    #[allow(dead_code)]
     pub fn get_thumb_bytes(&self, path: &Path, mtime: u64) -> Option<Vec<u8>> {
         self.thumb_db.get(path, mtime)
     }
 
     /// Store a 200×200 RGBA8 thumb to both memory cache and on-disk JPEG
     /// cache (mtime-aware).
+    #[allow(dead_code)]
     pub fn store_thumb(
         &self,
         path: &Path,
@@ -204,6 +211,7 @@ impl TextureCache {
     }
 
     /// Discard all cached textures (called on folder change / shutdown).
+    #[allow(dead_code)]
     pub fn clear(&self) {
         let mut s = self.state.lock();
         s.main.clear();
@@ -212,6 +220,7 @@ impl TextureCache {
     }
 
     /// Total thumbs cached (for diagnostics).
+    #[allow(dead_code)]
     pub fn thumb_count(&self) -> usize {
         self.state.lock().thumbs.len()
     }
@@ -220,6 +229,7 @@ impl TextureCache {
 /// Helper: decode a 200×200 thumb JPEG from disk (mtime-aware), and
 /// synchronously decode a 200×200 BGRA version for upload. Returns the
 /// BGRA bytes + dimensions.
+#[allow(dead_code)]
 pub fn decode_thumb_to_rgba(path: &Path, mtime: u64, thumb_size: u32) -> Option<(Vec<u8>, u32, u32)> {
     // Fast path: read from ThumbCache, then re-decode JPEG → BGRA.
     // (We don't have a JPEG decoder that doesn't pull in an extra

@@ -46,7 +46,7 @@ impl TitleBar {
         // Bottom border
         ui.painter().line_segment(
             [Pos2::new(rect.left(), rect.bottom()), Pos2::new(rect.right(), rect.bottom())],
-            Stroke::new(1.0, theme.border),
+            Stroke::new(1.0_f32, theme.border),
         );
 
         // Title
@@ -124,7 +124,7 @@ impl FloatingBar {
         ui.painter().rect_filled(rect, 8.0, theme.surface);
 
         // Border
-        ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0, theme.border));
+        ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0_f32, theme.border));
 
         // Zoom display
         ui.painter().text(

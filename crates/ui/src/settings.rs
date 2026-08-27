@@ -51,7 +51,7 @@ impl SettingsPanel {
         let response = ui.allocate_rect(rect, Sense::hover());
 
         ui.painter().rect_filled(rect, 8.0, Color32::from_rgb(255, 255, 255));
-        ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0, Color32::from_rgb(230, 230, 230)));
+        ui.painter().rect_stroke(rect, 8.0, Stroke::new(1.0_f32, Color32::from_rgb(230, 230, 230)));
 
         ui.painter().text(
             rect.left_top() + Vec2::new(16.0, 16.0),

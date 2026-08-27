@@ -19,7 +19,9 @@ pub struct RouterState {
     /// drains the event batch (and its modifiers) every frame. Without
     /// this, Ctrl held across a frame boundary reads as released.
     pub modifiers: egui::Modifiers,
+    #[allow(dead_code)]
     pub last_click_pos: Option<Pos2>,
+    #[allow(dead_code)]
     pub last_click_time: std::time::Instant,
     /// Accumulated egui input, consumed once per frame by begin_frame.
     pub pending: RawInput,

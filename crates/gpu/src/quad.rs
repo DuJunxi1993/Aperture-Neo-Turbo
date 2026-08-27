@@ -13,7 +13,6 @@
 //! `D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC` but expressed as a shader
 //! the GPU can schedule independently.
 
-use anyhow::Result;
 use bytemuck::{Pod, Zeroable};
 
 const SHADER_SRC: &str = r#"

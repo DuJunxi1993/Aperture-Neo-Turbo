@@ -4,11 +4,9 @@
 //! and shared across threads (CoCreateInstance is thread-safe with COINIT_MULTITHREADED).
 
 use std::path::Path;
-use std::sync::Arc;
 use parking_lot::Mutex;
 use aperture_core::{IImageLoader, ImageLoadResult, CodecRoute, CodecProbe};
 use crate::decode::{decode_file, DecodedPixels};
-use anyhow::Result;
 
 pub struct LoadedBitmap {
     pub result: ImageLoadResult,

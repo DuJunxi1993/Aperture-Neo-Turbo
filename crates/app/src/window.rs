@@ -34,7 +34,7 @@ use aperture_core::{
     NavigationService, NavigationDirection,
     SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
-use aperture_gpu::{GpuContext, Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir};
+use aperture_gpu::{GpuContext, Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir, ImageQuadUniforms, DecodedGpuImage};
 use aperture_ui::ViewerPanel;
 
 use crate::viewer_child::ViewerChildWindow;
@@ -77,6 +77,7 @@ const DEFAULT_H: u32 = 800;
 const MIN_W: u32 = 480;
 const MIN_H: u32 = 320;
 
+#[allow(dead_code)]
 enum UiAction {
     OpenFolder,
     Prev,
@@ -144,8 +145,8 @@ enum UiAction {
     Print,
 }
 
-/// Screen-space rect of the "?" status-bar button — the shortcuts popover
-/// anchors directly above it.
+// Screen-space rect of the "?" status-bar button — the shortcuts popover
+// anchors directly above it.
 thread_local! {
     static HELP_ANCHOR: std::cell::Cell<egui::Rect> = const { std::cell::Cell::new(egui::Rect::NOTHING) };
 }
@@ -187,6 +188,7 @@ pub struct Palette {
     pub text_tertiary: egui::Color32,
     pub text_dim: egui::Color32,
     pub accent: egui::Color32,
+    #[allow(dead_code)]
     pub accent_hover: egui::Color32,
     pub selection_text: egui::Color32,
     pub hover_fill: egui::Color32,
@@ -410,6 +412,7 @@ pub struct WgpuState {
     /// Placeholder 1×1 texture used by the image quad before any
     /// decoded image is bound (Phase 1 only). Drop this once Phase 3
     /// wires the real decoded texture.
+    #[allow(dead_code)]
     pub placeholder_image: (wgpu::Texture, wgpu::TextureView),
 }
 
@@ -542,10 +545,15 @@ impl MainWindow {
     /// Phase 8: pull the active palette's panel_bg. Used by the
     /// context-menu egui::Windows (which run inside closures that
     /// don't have `self`).
+    #[allow(dead_code)]
     fn pal_bg(&self) -> egui::Color32 { self.pal().panel_bg }
+    #[allow(dead_code)]
     fn pal_btn(&self) -> egui::Color32 { self.pal().button_fill }
+    #[allow(dead_code)]
     fn pal_text(&self) -> egui::Color32 { self.pal().text_primary }
+    #[allow(dead_code)]
     fn pal_text_dim(&self) -> egui::Color32 { self.pal().text_tertiary }
+    #[allow(dead_code)]
     fn pal_stroke(&self) -> egui::Color32 { self.pal().card_stroke }
 
     fn init_window(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
@@ -1165,10 +1173,16 @@ let window = event_loop.create_window(
 
         let mut actions: Vec<UiAction> = Vec::new();
 
+        // Capture image-quad background colour BEFORE the egui_state
+        // mutable borrow opens (egui_state holds &mut self through to
+        // flush_inbox, so self.pal() inside the render scope would
+        // conflict with it).
+        let pal_bg = self.pal().d2d_clear;
+
         // 3. egui / wgpu
         {
             let Some(egui_state) = self.egui_state.as_mut() else { return Ok(()); };
-            let Some(wgpu_state) = self.wgpu_state.as_ref() else { return Ok(()); };
+            let Some(_wgpu_state) = self.wgpu_state.as_ref() else { return Ok(()); };
 
             // Sync surface size to the ACTUAL client area. The wgpu surface
             // covers the client rect only — using outer_size (which includes
@@ -1219,7 +1233,7 @@ let window = event_loop.create_window(
                     .map(|d| d.as_secs_f64())
                     .unwrap_or(0.0),
             );
-            egui_state.ctx.begin_frame(raw_input);
+            egui_state.ctx.begin_pass(raw_input);
 
             // Apply egui visuals when the theme changes (toggle or startup).
             if self.applied_visuals != Some(self.theme) {
@@ -1247,7 +1261,7 @@ let window = event_loop.create_window(
                 //  * `window_shadow`/`popup_shadow` give the shortcuts Window
                 //    a light halo below it.
                 visuals.window_stroke = egui::Stroke::NONE;
-                visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
+                visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT);
                 visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
                 visuals.window_shadow = egui::epaint::Shadow::NONE;
                 visuals.popup_shadow = egui::epaint::Shadow::NONE;
@@ -1693,7 +1707,7 @@ let window = event_loop.create_window(
                 });
 
             // ----- egui → wgpu -----
-            let full_output = egui_state.ctx.end_frame();
+            let full_output = egui_state.ctx.end_pass();
             let paint_jobs = egui_state.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
 // Apply the captured CentralPanel rect to the D2D child.
@@ -1777,7 +1791,7 @@ let window = event_loop.create_window(
                     a: 1.0,
                 }
             };
-            let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
@@ -1797,6 +1811,73 @@ let window = event_loop.create_window(
                 &paint_jobs,
                 &screen_descriptor,
             );
+
+// Phase 3: wgpu image-quad pass. Drawn after egui's chrome
+            // so the image appears on top of any egui panels that
+            // overlap the viewer rect (which they shouldn't — the
+            // CentralPanel's `Frame::none()` is invisible — but
+            // ordering this way matches the D2D child's Z-order).
+            //
+            // The quad is drawn on the same wgpu surface as egui so
+            // it's composited in one Present instead of two (D2D +
+            // wgpu). With SHOW_WGPU_QUAD_ONLY debug flag the D2D child
+            // is hidden and the quad becomes the only visible image.
+            //
+            // Capture everything we need from self before locking
+            // (Rust's borrow checker is conservative about reentrancy
+            // through self).
+            let image_quad_args: Option<(
+                ImageQuadUniforms,
+                std::sync::Arc<DecodedGpuImage>,
+                i32, i32, u32, u32,
+            )> = match (central_rect_phys, self.viewer.as_ref()) {
+                (Some(rect), Some(viewer)) => {
+                    let viewer_locked = viewer.lock();
+                    viewer_locked.current_gpu.as_ref().map(|img| {
+                        let uniforms = viewer_locked.gpu_uniforms(
+                            (rect.0 as f32, rect.1 as f32),
+                            (rect.2 as f32, rect.3 as f32),
+                            pal_bg,
+                        );
+                        (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
+                    })
+                }
+                _ => None,
+            };
+            if let Some((uniforms, gpu_image, vx, vy, vw, vh)) = image_quad_args {
+                wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, &uniforms);
+                let bind_group = wgpu_state.image_quad.create_bind_group(
+                    &wgpu_state.device,
+                    &gpu_image.view,
+                );
+                let mut iq_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("image_quad"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        // Load the existing egui output as input —
+                        // the image quad is drawn on top of the
+                        // chrome, not cleared.
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                iq_rpass.set_scissor_rect(
+                    vx.max(0) as u32,
+                    vy.max(0) as u32,
+                    vw,
+                    vh,
+                );
+                iq_rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
+                iq_rpass.set_bind_group(0, &bind_group, &[]);
+                iq_rpass.draw(0..3, 0..1);
+                drop(iq_rpass);
+            }
 
             wgpu_state.queue.submit(std::iter::once(encoder.finish()));
             surface_texture.present();
@@ -1865,6 +1946,8 @@ let window = event_loop.create_window(
         slide_show_running: bool,
     ) {
         let _ = nav_count;
+        let _ = nav_idx;
+        let _ = fullscreen;
         let bar = ui.max_rect();
         // Accent-filled buttons always use white text (both themes).
         let nav_btn = |ui: &mut egui::Ui, label: &str| -> bool {
@@ -1885,7 +1968,7 @@ let window = event_loop.create_window(
             ui.add(
                 egui::Button::new(egui::RichText::new(label).size(13.0).strong())
                     .fill(pal.button_fill)
-                    .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                     .min_size(egui::vec2(0.0, 30.0))
                     .rounding(6.0),
             )
@@ -2022,7 +2105,7 @@ let window = event_loop.create_window(
                 ui.add(
                     egui::Button::new(egui::RichText::new(label).size(13.0).strong().color(text))
                         .fill(fill)
-                        .stroke(egui::Stroke::new(1.0, pal.card_stroke))
+                        .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                         .min_size(egui::vec2(56.0, 30.0))
                         .rounding(6.0),
                 ).clicked()
@@ -2128,7 +2211,7 @@ let window = event_loop.create_window(
 
     /// One caption button with a vector-drawn glyph (immune to font
     /// fallback issues). Returns true when clicked.
-    fn window_control(ui: &mut egui::Ui, id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
+    fn window_control(ui: &mut egui::Ui, _id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(42.0, 30.0),
             egui::Sense::click(),
@@ -2143,7 +2226,7 @@ let window = event_loop.create_window(
         }
         let p = ui.painter();
         let c = rect.center();
-        let stroke = egui::Stroke::new(1.3, pal.text_secondary);
+        let stroke = egui::Stroke::new(1.3_f32, pal.text_secondary);
         match glyph {
             WindowGlyph::Minimize => {
                 p.line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], stroke);
@@ -2206,7 +2289,7 @@ let window = event_loop.create_window(
     ) -> f32 {
         let frame = egui::Frame::default()
             .inner_margin(egui::Margin::same(10.0))
-            .stroke(egui::Stroke::new(0.0, egui::Color32::TRANSPARENT));
+            .stroke(egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT));
         let inner = frame.show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(
@@ -2630,9 +2713,9 @@ let window = event_loop.create_window(
                                 egui::Color32::TRANSPARENT
                             })
                             .stroke(if is_selected {
-                                egui::Stroke::new(1.2, pal.selected_card_stroke)
+                                egui::Stroke::new(1.2_f32, pal.selected_card_stroke)
                             } else {
-                                egui::Stroke::new(1.0, pal.card_stroke)
+                                egui::Stroke::new(1.0_f32, pal.card_stroke)
                             })
                             .rounding(egui::Rounding::same(8.0))
                             .inner_margin(egui::Margin::same(4.0));
@@ -3518,6 +3601,35 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                             // Ctrl+F → fullscreen (must precede plain F/fit).
                             self.action_toggle_fullscreen();
                         }
+                        #[cfg(debug_assertions)]
+                        KeyCode::F11 => {
+                            // Phase 3 debug: toggle the wgpu image-quad
+                            // visibility flag. When set, the D2D child is
+                            // hidden so the wgpu quad (the new path) is
+                            // visible alone — used to compare against the
+                            // D2D path pixel-by-pixel. The wgpu quad is
+                            // always drawn; this only hides the D2D child.
+                            use std::sync::atomic::Ordering;
+                            let new = !SHOW_WGPU_QUAD_ONLY.load(Ordering::Relaxed);
+                            SHOW_WGPU_QUAD_ONLY.store(new, Ordering::Relaxed);
+                            tracing::info!("SHOW_WGPU_QUAD_ONLY = {}", new);
+                            // Apply the change immediately to the D2D
+                            // child's visibility so the user sees the
+                            // toggle without waiting for the next decode.
+                            if let Some(child) = &self.viewer_child {
+                                unsafe {
+                                    use windows::Win32::UI::WindowsAndMessaging::ShowWindow;
+                                    let _ = ShowWindow(
+                                        child.hwnd,
+                                        if new {
+                                            windows::Win32::UI::WindowsAndMessaging::SW_HIDE
+                                        } else {
+                                            windows::Win32::UI::WindowsAndMessaging::SW_SHOW
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         KeyCode::KeyF => {
                             if let Some(v) = &self.viewer {
                                 v.lock().fit_to_screen();
@@ -3621,7 +3733,7 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                             Some(1) => winit::window::CursorIcon::EwResize,
                             _ => winit::window::CursorIcon::Default,
                         };
-                        w.set_cursor_icon(icon);
+                        w.set_cursor(icon);
                     }
                 }
             }
@@ -3821,6 +3933,14 @@ static ORIG_WNDPROC: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicI
 static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsize::new(0);
 /// Mirrors MainWindow.is_fullscreen for the resize hook.
 pub static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Phase 3 debug flag. When set, the D2D child HWND is hidden via
+/// `ShowWindow(SW_HIDE)` so the wgpu image-quad is the only visible
+/// image. Used for side-by-side visual verification against the D2D
+/// path during the migration. Toggled by the F11 key in dev builds.
+#[cfg(debug_assertions)]
+static SHOW_WGPU_QUAD_ONLY: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 /// Which tree root the user last selected a folder in (0/1/2) —
 /// controls Ctrl+Arrow cycling and the single-highlight behavior.
 pub static ACTIVE_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
@@ -3895,6 +4015,7 @@ unsafe fn install_resize_hook(hwnd: HWND) {
     ORIG_WNDPROC.store(prev, std::sync::atomic::Ordering::Relaxed);
 }
 
+#[allow(dead_code)]
 fn init_wgpu(window: &Window) -> Result<WgpuState> {
     let size = window.inner_size();
     tracing::info!("init_wgpu: window.inner_size = {}x{}, scale_factor={}",
@@ -3908,7 +4029,7 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         backends: wgpu::Backends::DX12,
         ..Default::default()
     }));
-    let surface = unsafe { instance.create_surface(window.clone()) }?;
+    let surface = instance.create_surface(window)?;
     let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
         power_preference: wgpu::PowerPreference::HighPerformance,
         compatible_surface: Some(&surface),
@@ -4110,14 +4231,14 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     let mut style = (*ctx.style()).clone();
 
     // ---- Colors (Linear palette, dark mode) ----
-    let bg_canvas      = egui::Color32::from_rgb(8, 9, 10);        // #08090a
+    let _bg_canvas      = egui::Color32::from_rgb(8, 9, 10);        // #08090a
     let bg_panel       = egui::Color32::from_rgb(15, 16, 17);      // #0f1011
     let bg_elevated    = egui::Color32::from_rgb(25, 26, 27);      // #191a1b
     let bg_hover       = egui::Color32::from_rgb(34, 37, 42);      // #23252a
     let text_primary   = egui::Color32::from_rgb(247, 248, 248);   // #f7f8f8
     let text_secondary = egui::Color32::from_rgb(208, 214, 224);   // #d0d6e0
-    let text_tertiary  = egui::Color32::from_rgb(138, 143, 152);   // #8a8f98
-    let text_quat      = egui::Color32::from_rgb(98, 102, 109);    // #62666d
+    let _text_tertiary  = egui::Color32::from_rgb(138, 143, 152);   // #8a8f98
+    let _text_quat      = egui::Color32::from_rgb(98, 102, 109);    // #62666d
     let brand          = egui::Color32::from_rgb(94, 106, 210);    // #5e6ad2
     let brand_hover    = egui::Color32::from_rgb(130, 143, 255);   // #828fff
     let border_subtle  = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 13);
@@ -4128,7 +4249,7 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     visuals.override_text_color = Some(text_primary);
 
     visuals.window_fill = bg_panel;
-    visuals.window_stroke = egui::Stroke::new(1.0, border_std);
+    visuals.window_stroke = egui::Stroke::new(1.0_f32, border_std);
 
     visuals.panel_fill = bg_panel;
     visuals.faint_bg_color = bg_elevated;
@@ -4144,8 +4265,8 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     // Buttons
     visuals.widgets.noninteractive.bg_fill = bg_panel;
     // No 1px light separator between panels — panels blend seamlessly.
-    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0, egui::Color32::TRANSPARENT);
-    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, text_secondary);
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(0.0_f32, egui::Color32::TRANSPARENT);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0_f32, text_secondary);
 
     // Phase 6: bump default button rounding 6 → 8 across
     // inactive / hovered / active so every Linear-styled button
@@ -4153,26 +4274,26 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     // previous 6 was visually heavy on the larger 30-px-tall
     // title-bar / bottom-bar buttons.
     visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8);
-    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, border_subtle);
-    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, text_secondary);
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border_subtle);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_secondary);
     visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12);
-    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, border_std);
-    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, text_primary);
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_std);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
     visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.active.bg_fill = brand;
-    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, brand_hover);
-    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, text_primary);
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0_f32, brand_hover);
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
     visuals.widgets.active.rounding = egui::Rounding::same(8.0);
 
     visuals.widgets.open.bg_fill = bg_elevated;
-    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, border_std);
-    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, text_primary);
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0_f32, border_std);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
 
     visuals.selection.bg_fill = brand.linear_multiply(0.25);
-    visuals.selection.stroke = egui::Stroke::new(1.0, brand);
+    visuals.selection.stroke = egui::Stroke::new(1.0_f32, brand);
 
     visuals.hyperlink_color = brand_hover;
     visuals.warn_fg_color = egui::Color32::from_rgb(255, 170, 0);

@@ -3,7 +3,6 @@
 use windows::{
     Win32::Foundation::*,
     Win32::Graphics::Direct2D::*,
-    Win32::Graphics::Direct2D::Common::*,
     Win32::Graphics::Direct3D::*,
     Win32::Graphics::Direct3D11::*,
     Win32::Graphics::Dxgi::*,

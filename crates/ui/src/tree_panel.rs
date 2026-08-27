@@ -2,8 +2,6 @@
 
 use egui::{Ui, Vec2, Sense, Color32, Stroke, Response, FontId};
 use std::path::PathBuf;
-use parking_lot::RwLock;
-use std::sync::Arc;
 
 #[derive(Debug, Clone)]
 pub struct TreeNode {
@@ -65,14 +63,14 @@ impl TreePanel {
                 egui::Pos2::new(rect.right(), rect.top()),
                 egui::Pos2::new(rect.right(), rect.bottom()),
             ],
-            Stroke::new(1.0, Color32::from_rgb(230, 230, 230)),
+            Stroke::new(1.0_f32, Color32::from_rgb(230, 230, 230)),
         );
 
         egui::ScrollArea::vertical()
             .auto_shrink([false; 2])
             .show_viewport(ui, |ui, viewport| {
                 let mut y = 8.0 + viewport.min.y - self.scroll_offset;
-                let mut path_stack: Vec<(TreeNode, usize)> = self.roots.iter().cloned().map(|n| (n, 0)).collect();
+                let path_stack: Vec<(TreeNode, usize)> = self.roots.iter().cloned().map(|n| (n, 0)).collect();
 
                 for (node, _) in path_stack.iter() {
                     let node_rect = egui::Rect::from_min_size(
