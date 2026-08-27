@@ -3,11 +3,8 @@
 //! Pipeline:
 //! 1. User requests current image
 //! 2. Spawn WIC decode on blocking pool (returns DecodedPixels, thread-safe)
-//! 3. On main thread: poll result + upload to BOTH:
-//!    - D2D via DecodedBitmap::from_pixels (legacy path, deleted in Phase 4)
-//!    - wgpu via DecodedGpuImage::from_pixels (new path, used by Phase 3+)
-//! 4. Apply to viewer (D2D side reads `viewer.current`; Phase 3 adds the
-//!    wgpu side reading `viewer.gpu_image`)
+//! 3. On main thread: poll result + upload wgpu texture
+//! 4. Apply to viewer via set_image_gpu
 //!
 //! Rapid navigation: while a decode is in flight, further navigation steps are
 //! queued and replayed one-by-one after the current decode lands, so every
@@ -20,7 +17,7 @@ use parking_lot::Mutex;
 use tokio::sync::oneshot;
 use std::collections::VecDeque;
 use aperture_core::{NavigationService, IImageLoader, ImageLoadResult};
-use crate::{WicLoader, Direct2DViewer, SlideDir, decode_file, DecodedPixels, DecodedBitmap, DecodedGpuImage};
+use crate::{WicLoader, Direct2DViewer, SlideDir, decode_file, DecodedPixels, DecodedGpuImage};
 
 type DecodeId = u64;
 
@@ -31,10 +28,7 @@ pub struct DecodeCoordinator {
     nav: Arc<Mutex<NavigationService>>,
     loader: Arc<WicLoader>,
     viewer: Arc<Mutex<Direct2DViewer>>,
-    /// wgpu device + queue for the image-quad texture upload (Phase 2+).
-    /// Held as `Option` so the coordinator compiles during the brief
-    /// window between adding this field and the call-sites catching up.
-    /// Removed once Phase 4 deletes the D2D `DecodedBitmap` field.
+    /// wgpu device + queue for the image-quad texture upload.
     device: Mutex<Option<Arc<wgpu::Device>>>,
     queue: Mutex<Option<Arc<wgpu::Queue>>>,
     next_id: Mutex<DecodeId>,
@@ -50,8 +44,6 @@ pub struct DecodeResponse {
     pub direction: SlideDir,
     pub pixels: Option<DecodedPixels>,
     /// wgpu texture view populated by `poll()` once the decode lands.
-    /// Phase 2: produced but unused. Phase 3: bound to the image-quad
-    /// bind group. Phase 4: replaces `DecodedBitmap`.
     pub gpu_image: Option<Arc<DecodedGpuImage>>,
 }
 
@@ -189,27 +181,7 @@ impl DecodeCoordinator {
         } else if !resp.result.is_success {
             tracing::warn!("Decode failed for {}: {:?}", resp.path.display(), resp.result.error_message);
         } else if let Some(pixels) = resp.pixels {
-            // Upload to GPU on the main thread. Phase 2 keeps the
-            // existing D2D upload (deleted in Phase 4) and adds the new
-            // wgpu texture upload alongside it. Both paths are pure —
-            // one decode result feeds both. The pixel buffer is reused
-            // rather than re-decoded, so the cost is one BGRA→BGRA
-            // copy to GPU memory (vs. the D2D path which is an
-            // ID2D1Bitmap1 upload via the same bytes).
-            let gpu = self.viewer.lock().gpu.clone();
-            match DecodedBitmap::from_pixels(&gpu, &pixels) {
-                Ok(bitmap) => {
-                    self.viewer.lock().set_image(bitmap, resp.direction);
-                    tracing::info!("Applied decoded image {} ({}x{}, {} KB pixels)",
-                        resp.path.display(), pixels.width, pixels.height,
-                        pixels.pixels.len() / 1024);
-                }
-                Err(e) => {
-                    tracing::error!("Failed to upload pixels to D2D for {}: {}", resp.path.display(), e);
-                }
-            }
-            // Phase 2: wgpu texture upload. Phase 3 also applies it to the
-            // viewer so the image-quad pipeline can sample it.
+            // Upload to wgpu on the main thread.
             if let (Some(device), Some(queue)) =
                 (self.device.lock().as_ref(), self.queue.lock().as_ref())
             {

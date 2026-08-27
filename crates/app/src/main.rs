@@ -7,7 +7,6 @@ use std::path::PathBuf;
 use tracing::info;
 
 mod window;
-mod viewer_child;
 mod event_router;
 mod file_tree;
 mod texture_cache;

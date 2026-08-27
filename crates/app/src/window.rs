@@ -1,10 +1,10 @@
-//! Main window — winit + wgpu + egui (chrome) + embedded Direct2D viewer child window
+//! Main window — winit + wgpu + egui (chrome)
 //!
 //! Layout:
 //! ┌─ Title bar (egui, 28 px) ────────────────────────────┐
 //! ├────────────┬──────────────────────────────────────────┤
 //! │ Tree       │                                          │
-//! │ (egui,    │        Viewer child HWND (Direct2D)       │
+//! │ (egui,    │        Viewer (wgpu image quad)           │
 //! │ 200 px)    │                                          │
 //! │            │                                          │
 //! ├────────────┴──────────────────────────────────────────┤
@@ -26,18 +26,12 @@ use windows::Win32::Foundation::*;
 use windows::Win32::UI::WindowsAndMessaging::{
     SystemParametersInfoW, SPI_SETDESKWALLPAPER, SPIF_UPDATEINIFILE, SPIF_SENDCHANGE,
 };
-use windows::Win32::Graphics::Gdi::{
-    CreateRectRgn, CreateRoundRectRgn, CombineRgn, SetWindowRgn, RGN_DIFF, HRGN,
-};
 
 use aperture_core::{
     NavigationService, NavigationDirection,
     SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
 use aperture_gpu::{GpuContext, Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir, ImageQuadUniforms, DecodedGpuImage};
-use aperture_ui::ViewerPanel;
-
-use crate::viewer_child::ViewerChildWindow;
 use crate::event_router::{self, RouterState};
 
 /// Phase 16: custom winit event that pops a native right-click
@@ -292,10 +286,8 @@ pub struct MainWindow {
 
     gpu: Option<Arc<GpuContext>>,
     viewer: Option<Arc<Mutex<Direct2DViewer>>>,
-    viewer_child: Option<ViewerChildWindow>,
     loader: Option<Arc<WicLoader>>,
     coordinator: Option<Arc<DecodeCoordinator>>,
-    viewer_panel: Option<ViewerPanel>,
 
     nav: Arc<parking_lot::Mutex<NavigationService>>,
     settings: SettingsStore,
@@ -343,8 +335,6 @@ pub struct MainWindow {
     last_cursor: Option<(f32, f32)>,
     /// Eased 0..1 alpha/height of the fullscreen bottom control bar.
     chrome_anim: f32,
-    /// Whether the D2D child is currently hidden for the shortcuts popover.
-    help_child_hidden: bool,
     /// Theme whose egui visuals were last applied (re-apply on change).
     applied_visuals: Option<Theme>,
     /// Image size for single-image launches (physical px) — drives the
@@ -484,10 +474,8 @@ impl MainWindow {
             egui_state: None,
             gpu: None,
             viewer: None,
-            viewer_child: None,
             loader: None,
             coordinator: None,
-            viewer_panel: None,
             nav,
             settings,
             file_tree,
@@ -520,7 +508,6 @@ impl MainWindow {
             chrome_move_accum: 0.0,
             last_cursor: None,
             chrome_anim: 0.0,
-            help_child_hidden: false,
             applied_visuals: None,
             drag_panel: None,
             panel_edge_hover: None,
@@ -810,17 +797,10 @@ let window = event_loop.create_window(
             wgpu_state.config.width, wgpu_state.config.height);
         tracing::info!("init_renderer: viewer rect ({},{},{},{})", cx, cy, cw, ch);
 
-        let viewer_child = ViewerChildWindow::new(hwnd, gpu.clone(), viewer.clone(), cx, cy, cw, ch)?;
-        tracing::info!("init_renderer: ViewerChildWindow created");
-
-        let viewer_panel = ViewerPanel::new(viewer.clone());
-
         self.wgpu_state = Some(wgpu_state);
         self.egui_state = Some(egui_state);
         self.gpu = Some(gpu);
         self.viewer = Some(viewer);
-        self.viewer_child = Some(viewer_child);
-        self.viewer_panel = Some(viewer_panel);
         self.loader = Some(loader);
         self.coordinator = Some(coordinator);
 
@@ -844,15 +824,9 @@ let window = event_loop.create_window(
         // back buffer and falls back to drawing the COLOR_WINDOW
         // brush into the parent's client area — this is the
         // persistent "dark/light launch flash" the user has been
-        // seeing. The D2D child is handled symmetrically via
-        // ViewerChildWindow::new's render_initial() call; this
-        // balances the parent side.
-        //
-        // Must run AFTER ViewerChildWindow::new above so the child
-        // is created (init_renderer reaches this point in source
-        // order). Both surfaces then have content before any
-        // subsequent WindowEvent::RedrawRequested fires
-        // render_frame.
+        // seeing. Force-present the wgpu surface so the main
+        // HWND's back buffer is populated before DWM's first
+        // composition.
         self.present_wgpu_surface_for_init();
 
         // Now that both surfaces have a populated first back buffer,
@@ -1064,26 +1038,20 @@ let window = event_loop.create_window(
     }
 
     fn handle_wheel_in_viewer(&mut self, delta_y: f32, cursor_x: i32, cursor_y: i32) {
-        let Some(viewer_child) = &self.viewer_child else { return; };
-        if let Some((local_x, local_y)) = viewer_child.cursor_to_local(cursor_x, cursor_y) {
-            let wheel = (delta_y * 100.0) as i32;
-            if let Some(v_arc) = self.viewer.as_ref() {
-                let mut v = v_arc.lock();
-                v.on_wheel(wheel, local_x, local_y);
-            }
-            if let Some(window) = &self.window { window.request_redraw(); }
+        let wheel = (delta_y * 100.0) as i32;
+        if let Some(v_arc) = self.viewer.as_ref() {
+            let mut v = v_arc.lock();
+            v.on_wheel(wheel, cursor_x as f32, cursor_y as f32);
         }
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
-    fn handle_double_click(&mut self, cursor_x: i32, cursor_y: i32) {
-        let Some(viewer_child) = &self.viewer_child else { return; };
-        if viewer_child.cursor_to_local(cursor_x, cursor_y).is_some() {
-            if let Some(v_arc) = self.viewer.as_ref() {
-                let mut v = v_arc.lock();
-                v.fit_to_screen();
-            }
-            if let Some(window) = &self.window { window.request_redraw(); }
+    fn handle_double_click(&mut self) {
+        if let Some(v_arc) = self.viewer.as_ref() {
+            let mut v = v_arc.lock();
+            v.fit_to_screen();
         }
+        if let Some(window) = &self.window { window.request_redraw(); }
     }
 
     fn render_frame(&mut self) -> Result<()> {
@@ -1123,35 +1091,9 @@ let window = event_loop.create_window(
             }
         }
 
-        // Flush the deferred swapchain resize once the size settles
-        // (avoids per-frame ResizeBuffers during panel drags).
-        if let Some(child) = &mut self.viewer_child {
-            child.flush_pending_resize();
-        }
         // Keep the viewer background in sync with the theme.
         if let Some(v) = &self.viewer {
             v.lock().bg = pal.d2d_clear;
-        }
-
-        // Popovers must render above the image. The D2D child HWND
-        // always paints over parent content, so instead of hiding it
-        // we punch a hole in it with SetWindowRgn — the image stays
-        // visible and the popover is genuinely topmost. Phase 9:
-        // generalized — BOTH the shortcuts popover AND the image
-        // right-click menu need holes; the region is rebuilt from the
-        // union of visible popover rects each frame (see the punch
-        // step after the egui popup block). This pre-pass only handles
-        // the "everything closed → restore full region" transition.
-        {
-            let any_hole_popover = self.show_shortcut_help;
-            if !any_hole_popover && self.help_child_hidden {
-                self.help_child_hidden = false;
-                if let Some(child) = &self.viewer_child {
-                    unsafe {
-                        let _ = SetWindowRgn(child.hwnd, HRGN::default(), true);
-                    }
-                }
-            }
         }
 
         // Pre-extract everything the UI needs (so closures don't fight the
@@ -1163,7 +1105,7 @@ let window = event_loop.create_window(
         };
         let current_path = self.nav.lock().current().map(|i| i.path.clone());
         let current_size = self.viewer.as_ref()
-            .and_then(|v| v.lock().current.as_ref().map(|b| (b.width, b.height)));
+            .and_then(|v| v.lock().current_gpu.as_ref().map(|img| (img.width, img.height)));
         let zoom_pct = self.viewer.as_ref()
             .map(|v| v.lock().zoom_value() * 100.0).unwrap_or(0.0);
         // Prefer the persisted setting; fall back to the folder the user
@@ -1426,62 +1368,6 @@ let window = event_loop.create_window(
             // Merge side panel actions into the main queue.
             actions.extend(side_actions);
 
-            // Phase 15: the Phase 12 "belt-and-braces" seam-fill layer is
-            // REMOVED. It painted a 1px column of panel_bg over the
-            // panel↔viewer boundary in the egui surface layer; the
-            // popover hole punches expose that egui surface, and
-            // panel_bg (egui sRGB) sits against the child's d2d_clear
-            // (a D2D linear float) — the two differ by one color step
-            // on the monitor even though the numeric values look equal,
-            // so the 'seam' read as a faint divider line through every
-            // menu/shortcut popover. The physical-px panel snapping
-            // (round(anim*ppp)/ppp) below already makes the egui panel
-            // and the D2D child share the exact same physical edge, so
-            // no filler column is needed — the panel background and the
-            // child's clear color meet directly with no gap to expose.
-
-            // Phase 7 修复: 之前 D2D viewer 只在 ToggleTree/ToggleThumbs
-            // action 触发的 relayout_viewer() 里 resize 一次。tree_panel
-            // 和 thumb_panel 的 .anim 字段是每帧在 render_frame 开头
-            // 推进的（tick 方法返回当前动画宽度），但 viewer 的物理
-            // 大小是上一帧 toggle 时的快照。导致 tree 栏展开/收起
-            // 时，图片"等动画结束才适应"或"瞬间跳到目标位置"。
-            // thumbs 看起来好的原因可能是 wgpu/egui 的副作用。
-            //
-            // 修复: 每帧根据 tree_anim / thumb_anim 重新计算 D2D
-            // viewer 大小。relayout_viewer 已经做了相同的事，这里
-            // 直接 inline：调用 child.resize() (它会调 viewer
-            // .lock().resize() 触发 compute_fit()，图片随之
-            // 丝滑重计算 fit)。只在尺寸真正变化时调，避免
-            // 每帧的 ResizeBuffers。
-            if !self.is_fullscreen {
-                if let Some(window) = &self.window {
-                    let size = window.inner_size();
-                    let ppp_now = self
-                        .wgpu_state
-                        .as_ref()
-                        .map(|w| w.pixels_per_point)
-                        .unwrap_or(1.0)
-                        .max(0.1);
-                    let tree_w_phys =
-                        (if self.show_tree { self.tree_panel.anim.round() as u32 } else { 0 }) as f32
-                            * ppp_now;
-                    let thumb_w_phys =
-                        (if self.show_thumbs { self.thumb_panel.anim.round() as u32 } else { 0 }) as f32
-                            * ppp_now;
-                    let toolbar_phys = (TOOLBAR_HEIGHT as f32 * ppp_now).round() as u32;
-                    let status_phys = (STATUS_BAR_HEIGHT as f32 * ppp_now).round() as u32;
-                    let vx = tree_w_phys as i32;
-                    let vy = toolbar_phys as i32;
-                    let vw = size.width.saturating_sub(tree_w_phys as u32 + thumb_w_phys as u32);
-                    let vh = size.height.saturating_sub(toolbar_phys + status_phys);
-                    if let Some(child) = &mut self.viewer_child {
-                        let _ = child.resize(vx, vy, vw, vh);
-                        child.apply_position(vx, vy, vw, vh);
-                    }
-                }
-            }
-
             // ----- SHORTCUT HELP (popover anchored below the "?" button) -----
             // Phase 9: rects of all popovers that need a hole punched in
             // the D2D child this frame. Collected while drawing, applied
@@ -1595,18 +1481,6 @@ let window = event_loop.create_window(
                     };
                     if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
                         self.show_shortcut_help = false;
-                    } else {
-                        // Still open — punch a hole in the D2D child so
-                        // the popover shows over the image area. The
-                        // right-click menus are native now and need no
-                        // hole; only the shortcuts popover does.
-                        let rects = [resp.response.rect];
-                        Self::apply_child_holes(
-                            self.viewer_child.as_ref(),
-                            &mut self.help_child_hidden,
-                            &rects,
-                            egui_state.ctx.pixels_per_point(),
-                        );
                     }
                 }
             }
@@ -1710,7 +1584,7 @@ let window = event_loop.create_window(
             let full_output = egui_state.ctx.end_pass();
             let paint_jobs = egui_state.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
 
-// Apply the captured CentralPanel rect to the D2D child.
+            // Apply the captured CentralPanel rect to update viewport dimensions.
             if let Some((px, py, pw, ph)) = central_rect_phys {
                 // Clamp to the surface — the first frame's layout can be
                 // garbage (huge available_rect before fonts settle).
@@ -1721,16 +1595,7 @@ let window = event_loop.create_window(
                 if pw >= 1 && ph >= 1 {
                     self.viewport_w = pw;
                     self.viewport_h = ph;
-                    if let Some(child) = &mut self.viewer_child {
-                        let _ = child.resize(px, py, pw, ph);
-                        child.apply_position(px, py, pw, ph);
-                    }
                 }
-            }
-
-            // correct size for this frame (not the previous frame's size).
-            if let Some(child) = &self.viewer_child {
-                child.render()?;
             }
 
             let surface_texture = wgpu_state.surface.get_current_texture()?;
@@ -1812,16 +1677,11 @@ let window = event_loop.create_window(
                 &screen_descriptor,
             );
 
-// Phase 3: wgpu image-quad pass. Drawn after egui's chrome
+            // Phase 3: wgpu image-quad pass. Drawn after egui's chrome
             // so the image appears on top of any egui panels that
             // overlap the viewer rect (which they shouldn't — the
             // CentralPanel's `Frame::none()` is invisible — but
-            // ordering this way matches the D2D child's Z-order).
-            //
-            // The quad is drawn on the same wgpu surface as egui so
-            // it's composited in one Present instead of two (D2D +
-            // wgpu). With SHOW_WGPU_QUAD_ONLY debug flag the D2D child
-            // is hidden and the quad becomes the only visible image.
+            // ordering this way matches the expected Z-order).
             //
             // Capture everything we need from self before locking
             // (Rust's borrow checker is conservative about reentrancy
@@ -2773,60 +2633,6 @@ let window = event_loop.create_window(
         });
     }
 
-    /// Phase 9: rebuild the D2D child's window region as
-    /// (child rect − Σ popover rects), converting each logical rect
-    /// to child-local physical pixels. Static method (no `&mut self`)
-    /// so it can be called inside the egui frame where
-    /// `self.egui_state.as_mut()` holds a conflicting borrow — only
-    /// the specific fields are passed in.
-    ///
-    /// `hidden` is `help_child_hidden`: true once a region with holes
-    /// has been applied, false after a restore. When `rects` is empty
-    /// and `hidden` is set, the full (unclipped) region is restored.
-    fn apply_child_holes(
-        child: Option<&ViewerChildWindow>,
-        hidden: &mut bool,
-        rects: &[egui::Rect],
-        ppp: f32,
-    ) {
-        let Some(child) = child else { return };
-        if rects.is_empty() {
-            if !*hidden { return; }
-            *hidden = false;
-            unsafe {
-                let _ = SetWindowRgn(child.hwnd, HRGN::default(), true);
-            }
-            return;
-        }
-        let (cx, cy, cw, ch) = {
-            let (lx, ly, w, h) = child.last_applied_rect;
-            (lx as f32, ly as f32, w as i32, h as i32)
-        };
-        unsafe {
-            let full = CreateRectRgn(0, 0, cw, ch);
-            for r in rects {
-                // Phase 13: ZERO expansion. The previous 1-physical-px
-                // grow-out put a ring of canvas-clear color around the
-                // menu (the ring lies OUTSIDE the frame's painted rect),
-                // and the corner radius wasn't grown to match, widening
-                // the corner gaps. The hole now coincides exactly with
-                // the frame rect at radius 8*ppp — the frame's own fill
-                // (panel_bg) reaches the region edge, so no canvas can
-                // show. The antialiased outer half-pixel of the stroke is
-                // hard-clipped, which reads as a slightly crisper edge.
-                let hl = ((r.min.x * ppp) - cx).round() as i32;
-                let ht = ((r.min.y * ppp) - cy).round() as i32;
-                let hr = ((r.max.x * ppp) - cx).round() as i32;
-                let hb = ((r.max.y * ppp) - cy).round() as i32;
-                let radius = (8.0 * ppp).round() as i32;
-                let hole = CreateRoundRectRgn(hl, ht, hr, hb, radius, radius);
-                CombineRgn(full, full, hole, RGN_DIFF);
-            }
-            let _ = SetWindowRgn(child.hwnd, full, true);
-        }
-        *hidden = true;
-    }
-
     fn apply_action(&mut self, action: UiAction) {
         match action {
             UiAction::OpenFolder => self.action_open_folder(),
@@ -3395,13 +3201,9 @@ let window = event_loop.create_window(
     fn relayout_viewer(&mut self) {
         let Some(window) = &self.window else { return; };
         let size = window.inner_size();
-        let (cx, cy, cw, ch) = self.compute_viewer_rect(size.width, size.height);
+        let (_cx, _cy, cw, ch) = self.compute_viewer_rect(size.width, size.height);
         self.viewport_w = cw;
         self.viewport_h = ch;
-        if let Some(child) = &mut self.viewer_child {
-            let _ = child.resize(cx, cy, cw, ch);
-            child.apply_position(cx, cy, cw, ch);
-        }
     }
 
     fn save_window_geometry(&mut self) {
@@ -3601,35 +3403,6 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                             // Ctrl+F → fullscreen (must precede plain F/fit).
                             self.action_toggle_fullscreen();
                         }
-                        #[cfg(debug_assertions)]
-                        KeyCode::F11 => {
-                            // Phase 3 debug: toggle the wgpu image-quad
-                            // visibility flag. When set, the D2D child is
-                            // hidden so the wgpu quad (the new path) is
-                            // visible alone — used to compare against the
-                            // D2D path pixel-by-pixel. The wgpu quad is
-                            // always drawn; this only hides the D2D child.
-                            use std::sync::atomic::Ordering;
-                            let new = !SHOW_WGPU_QUAD_ONLY.load(Ordering::Relaxed);
-                            SHOW_WGPU_QUAD_ONLY.store(new, Ordering::Relaxed);
-                            tracing::info!("SHOW_WGPU_QUAD_ONLY = {}", new);
-                            // Apply the change immediately to the D2D
-                            // child's visibility so the user sees the
-                            // toggle without waiting for the next decode.
-                            if let Some(child) = &self.viewer_child {
-                                unsafe {
-                                    use windows::Win32::UI::WindowsAndMessaging::ShowWindow;
-                                    let _ = ShowWindow(
-                                        child.hwnd,
-                                        if new {
-                                            windows::Win32::UI::WindowsAndMessaging::SW_HIDE
-                                        } else {
-                                            windows::Win32::UI::WindowsAndMessaging::SW_SHOW
-                                        },
-                                    );
-                                }
-                            }
-                        }
                         KeyCode::KeyF => {
                             if let Some(v) = &self.viewer {
                                 v.lock().fit_to_screen();
@@ -3755,17 +3528,13 @@ impl ApplicationHandler<AppMessage> for MainWindow {
 
         // ---- Wheel over the viewer area → image zoom ----
         if let WindowEvent::MouseWheel { delta, .. } = &event {
-            if let Some(viewer_child) = &self.viewer_child {
-                let cursor = self.router.cursor_pos;
-                if viewer_child.cursor_to_local(cursor.x.round() as i32, cursor.y.round() as i32).is_some() {
-                    let dy = match delta {
-                        MouseScrollDelta::LineDelta(_, y) => *y,
-                        MouseScrollDelta::PixelDelta(p) => p.y as f32 / 100.0,
-                    };
-                    self.handle_wheel_in_viewer(dy, cursor.x as i32, cursor.y as i32);
-                    return;
-                }
-            }
+            let cursor = self.router.cursor_pos;
+            let dy = match delta {
+                MouseScrollDelta::LineDelta(_, y) => *y,
+                MouseScrollDelta::PixelDelta(p) => p.y as f32 / 100.0,
+            };
+            self.handle_wheel_in_viewer(dy, cursor.x as i32, cursor.y as i32);
+            return;
         }
 
         // ---- Mouse input: pan, panel-edge drag start/end, dbl-click ----
@@ -3792,10 +3561,16 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                 }
             }
 
-            let in_viewer = self.viewer_child
-                .as_ref()
-                .and_then(|v| v.cursor_to_local(cursor.x as i32, cursor.y as i32))
-                .is_some();
+            // Check if cursor is within the viewer area (central panel).
+            let in_viewer = if let Some(window) = &self.window {
+                let size = window.inner_size();
+                let (vx, vy, vw, vh) = self.compute_viewer_rect(size.width, size.height);
+                let cx = cursor.x as i32;
+                let cy = cursor.y as i32;
+                cx >= vx && cx < vx + vw as i32 && cy >= vy && cy < vy + vh as i32
+            } else {
+                false
+            };
 
             // Right-click over the image → native context menu.
             if in_viewer
@@ -3818,7 +3593,7 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                     let now = std::time::Instant::now();
                     if let Some(prev) = self.last_double_click {
                         if now.duration_since(prev).as_millis() < 350 {
-                            self.handle_double_click(cursor.x as i32, cursor.y as i32);
+                            self.handle_double_click();
                             self.last_double_click = None;
                         } else {
                             self.last_double_click = Some(now);
@@ -3866,12 +3641,9 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                 }
 
                 let (vx, vy, vw, vh) = self.compute_viewer_rect(w, h);
+                let _ = (vx, vy);
                 self.viewport_w = vw;
                 self.viewport_h = vh;
-                if let Some(child) = &mut self.viewer_child {
-                    let _ = child.resize(vx, vy, vw, vh);
-                    child.apply_position(vx, vy, vw, vh);
-                }
             }
 
             WindowEvent::RedrawRequested => {
@@ -3934,13 +3706,6 @@ static MAIN_HWND: std::sync::atomic::AtomicIsize = std::sync::atomic::AtomicIsiz
 /// Mirrors MainWindow.is_fullscreen for the resize hook.
 pub static IS_FULLSCREEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Phase 3 debug flag. When set, the D2D child HWND is hidden via
-/// `ShowWindow(SW_HIDE)` so the wgpu image-quad is the only visible
-/// image. Used for side-by-side visual verification against the D2D
-/// path during the migration. Toggled by the F11 key in dev builds.
-#[cfg(debug_assertions)]
-static SHOW_WGPU_QUAD_ONLY: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
 /// Which tree root the user last selected a folder in (0/1/2) —
 /// controls Ctrl+Arrow cycling and the single-highlight behavior.
 pub static ACTIVE_ROOT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(2);
