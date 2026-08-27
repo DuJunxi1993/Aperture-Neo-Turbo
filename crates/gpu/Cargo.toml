@@ -19,6 +19,7 @@ windows = { version = "0.58", features = [
     "Foundation_Numerics",
 ] }
 windows-core = "0.58"
+wgpu = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }

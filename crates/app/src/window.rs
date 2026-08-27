@@ -400,6 +400,13 @@ pub struct WgpuState {
     pub surface_is_srgb: bool,
     pub pixels_per_point: f32,
     pub _instance: Box<wgpu::Instance>,
+    /// Image-quad pipeline (Phase 1 scaffolding; replaces the D2D
+    /// child HWND in Phase 4). Created once per WgpuState.
+    pub image_quad: aperture_gpu::ImageQuadPipeline,
+    /// Placeholder 1×1 texture used by the image quad before any
+    /// decoded image is bound (Phase 1 only). Drop this once Phase 3
+    /// wires the real decoded texture.
+    pub placeholder_image: (wgpu::Texture, wgpu::TextureView),
 }
 
 pub struct EguiState {
@@ -3935,6 +3942,14 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
     // SAFETY: the surface holds an Arc<Window> internally via window.clone(),
     // so the lifetime bound on Surface<'window> can be safely extended to 'static.
     let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(surface) };
+
+    // Phase 1: wgpu image-quad pipeline. Created once per WgpuState;
+    // currently rendered nowhere (the D2D child still owns the visible
+    // image). Phase 3 wires the encoded render pass; Phase 4 deletes
+    // the D2D path entirely.
+    let image_quad = aperture_gpu::ImageQuadPipeline::new(&device, format);
+    let placeholder_image = aperture_gpu::create_placeholder_texture(&device, &queue);
+
     Ok(WgpuState {
         surface,
         device,
@@ -3944,6 +3959,8 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         surface_is_srgb: format.is_srgb(),
         pixels_per_point: window.scale_factor() as f32,
         _instance: instance,
+        image_quad,
+        placeholder_image,
     })
 }
 
