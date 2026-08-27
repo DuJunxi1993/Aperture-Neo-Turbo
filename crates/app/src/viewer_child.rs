@@ -38,14 +38,6 @@ pub struct ViewerChildWindow {
     /// Time the size last changed — ResizeBuffers is deferred until the
     /// size has been stable briefly (avoids per-frame resize during drags).
     pending_resize_since: Option<std::time::Instant>,
-    /// Whether the window has been ShowWindow'd. We deliberately create
-    /// the child HWND WITHOUT WS_VISIBLE and defer ShowWindow until the
-    /// first decoded bitmap has been applied to the viewer — otherwise
-    /// the OS shows a placeholder child-window background (DWM's
-    /// default brush, which differs from both the egui canvas_clear
-    /// and the viewer.bg) during the gap between CreateWindowExW and
-    /// the first set_image, producing a black/white flash on launch.
-    shown: std::cell::Cell<bool>,
 }
 
 impl ViewerChildWindow {
@@ -69,11 +61,13 @@ impl ViewerChildWindow {
                 WS_EX_NOPARENTNOTIFY | WS_EX_TRANSPARENT,
                 VIEWER_CLASS_NAME,
                 PCWSTR::from_raw(EMPTY_W.as_ptr()),
-                // Note: WS_VISIBLE deliberately omitted — show() must be
-                // called from render_frame AFTER the first decoded image
-                // lands in the viewer so the OS doesn't paint a placeholder
-                // child-window background during the decode gap.
-                WS_CHILD | WS_CLIPSIBLINGS | WS_OVERLAPPED,
+                // WS_VISIBLE is set so the child is composited from the
+                // start. Combined with HOLLOW_BRUSH (see the WNDCLASS
+                // setup) and an immediate self.render() at the end of
+                // new(), the first composition shows our D2D content
+                // (viewer.bg color = theme dark) instead of a default
+                // system brush placeholder.
+                WS_CHILD | WS_VISIBLE | WS_CLIPSIBLINGS | WS_OVERLAPPED,
                 x, y, width as i32, height as i32,
                 parent_hwnd,
                 HMENU(std::ptr::null_mut()),
@@ -90,7 +84,7 @@ impl ViewerChildWindow {
             // is rendered at the new size on the next frame.
             viewer.lock().resize(width, height, x as f32, y as f32);
 
-            Ok(Self {
+            let me = Self {
                 hwnd,
                 gpu,
                 swapchain,
@@ -102,37 +96,28 @@ impl ViewerChildWindow {
                 },
                 last_size: (width, height),
                 pending_resize_since: None,
-                shown: std::cell::Cell::new(false),
-            })
+            };
+            // Paint once so the DXGI swapchain back buffer is
+            // initialised with viewer.bg (theme dark) before the OS
+            // triggers WM_PAINT for the WS_VISIBLE child. Without
+            // this, the first composition sees an uninit back buffer
+            // and DWM falls back to filling the child rect with the
+            // WNDCLASS hbrBackground brush.
+            let _ = me.render_initial();
+            Ok(me)
         }
     }
 
-    /// Make the child window visible. Idempotent. Called by
-    /// `render_frame` once the first decoded bitmap is available,
-    /// so the OS doesn't show a placeholder background during the
-    /// decode gap.
-    ///
-    /// `ShowWindow(SW_SHOW)` itself triggers the child's first
-    /// `WM_PAINT`, which — even though our wnd_proc swallows it —
-    /// causes `DefWindowProcW` to validate the dirty region and
-    /// let DWM composite the swapchain. To make sure that
-    /// composition shows *our* D2D content (not the WNDCLASS
-    /// default `hbrBackground` brush, which renders as the black/
-    /// white "placeholder" the user saw), we paint D2D into the
-    /// swapchain and Present BEFORE ShowWindow. The child's
-    /// wnd_class background brush is `HBRUSH(NULL)` and we never
-    /// fall back to GDI drawing in render(), so this single Present
-    /// is what the OS sees the first time the child is composited.
-    pub fn show(&self) {
-        if self.shown.get() { return; }
-        // Paint the current viewer state into the swapchain so the
-        // first composition after ShowWindow sees our D2D pixels,
-        // not the OS default brush.
-        let _ = self.render();
-        unsafe {
-            let _ = ShowWindow(self.hwnd, SW_SHOW);
-        }
-        self.shown.set(true);
+    /// Paint D2D content into the swapchain and Present once. Used
+    /// from new() so the first WM_PAINT after ShowWindow finds the
+    /// swapchain back buffer populated with viewer.bg (theme dark)
+    /// rather than the uninitialised state DXGI leaves before the
+    /// first Present.
+    fn render_initial(&self) -> Result<()> {
+        let mut viewer = self.viewer.lock();
+        let (bw, bh) = aperture_gpu::buffer_size(&self.swapchain);
+        viewer.render(&self.swapchain, bw, bh)?;
+        Ok(())
     }
 
     pub fn render(&self) -> Result<()> {
@@ -272,7 +257,17 @@ unsafe fn register_class_once() -> Result<()> {
             lpfnWndProc: Some(wnd_proc),
             hInstance: HINSTANCE(std::ptr::null_mut()),
             hCursor: HCURSOR(std::ptr::null_mut()),
-            hbrBackground: HBRUSH(std::ptr::null_mut()),
+            // HOLLOW_BRUSH (no GDI background paint) instead of the
+            // default NULL/system-COLOR_WINDOW brush. With NULL, the
+            // WM_PAINT that ShowWindow(SW_SHOW) triggers makes
+            // DefWindowProcW FillRect the window with the system
+            // window brush (~#F0EFEC) on top of our DXGI swapchain —
+            // the user sees a light "placeholder" rect until the next
+            // render_frame overpaints it (the black/white launch
+            // flash we kept chasing). HOLLOW_BRUSH tells
+            // DefWindowProcW not to paint any background, so DWM
+            // composites the DXGI swapchain content directly.
+            hbrBackground: HBRUSH(HOLLOW_BRUSH.0 as *mut core::ffi::c_void),
             lpszClassName: VIEWER_CLASS_NAME,
             ..Default::default()
         };

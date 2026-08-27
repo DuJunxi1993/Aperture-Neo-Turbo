@@ -1629,21 +1629,6 @@ impl MainWindow {
             // correct size for this frame (not the previous frame's size).
             if let Some(child) = &self.viewer_child {
                 child.render()?;
-                // Defer ShowWindow until the viewer has at least one
-                // decoded bitmap — otherwise the OS paints a
-                // placeholder child-window background during the decode
-                // gap and the user sees a black/white flash instead of
-                // the image. viewer.current is set by coordinator.poll()
-                // a few frames after request_current(), which fires from
-                // init_renderer. By the time we get here the first
-                // image is in place for typical single-image launches
-                // (decode < one frame); otherwise we'll ShowWindow on
-                // the next frame after decode lands. Either way the
-                // child appears with the image already painted into
-                // its swapchain — no flash.
-                if self.viewer.as_ref().map(|v| v.lock().current.is_some()).unwrap_or(false) {
-                    child.show();
-                }
             }
 
             let surface_texture = wgpu_state.surface.get_current_texture()?;
