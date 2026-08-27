@@ -33,11 +33,21 @@ pub struct ViewerChildWindow {
     pub gpu: Arc<GpuContext>,
     pub swapchain: SwapchainHandle,
     pub viewer: Arc<Mutex<Direct2DViewer>>,
-    pub hit_rect: RECT,
     pub last_size: (u32, u32),
     /// Time the size last changed — ResizeBuffers is deferred until the
     /// size has been stable briefly (avoids per-frame resize during drags).
     pending_resize_since: Option<std::time::Instant>,
+    /// Last `(x, y, w, h)` actually passed to SetWindowPos on the
+    /// child HWND. Distinct from `last_size` (which tracks only the
+    /// requested size and is updated every resize). Comparing the
+    /// guard in `apply_position` against this field is what keeps
+    /// the HWND actually tracking every resize — without this, a
+    /// guard that compared against a field updated by `resize()`
+    /// would always short-circuit and the HWND would never move
+    /// for slow drags (the cause of the resize distortion and the
+    /// thumbs-panel occlusion regressions). Public because
+    // `action_toggle_fullscreen` reads it to compute the path target.
+    pub last_applied_rect: (i32, i32, u32, u32),
 }
 
 impl ViewerChildWindow {
@@ -96,13 +106,15 @@ impl ViewerChildWindow {
                 gpu,
                 swapchain,
                 viewer,
-                hit_rect: RECT {
-                    left: x, top: y,
-                    right: x + width as i32,
-                    bottom: y + height as i32,
-                },
                 last_size: (width, height),
                 pending_resize_since: None,
+                // Pre-seed last_applied_rect to the requested rect
+                // so apply_position's first call (which sets the HWND
+                // via SetWindowPos) actually fires. Without this, the
+                // resize() inside new() — which already updated
+                // last_size and pending_resize_since — would otherwise
+                // pair with apply_position to do nothing.
+                last_applied_rect: (x, y, width, height),
             };
             // Paint once so the DXGI swapchain back buffer is
             // initialised with viewer.bg (theme dark) before the OS
@@ -143,10 +155,12 @@ impl ViewerChildWindow {
     }
 
     pub fn resize(&mut self, x: i32, y: i32, width: u32, height: u32) -> Result<()> {
-        // If the size hasn't changed, nothing to do.
-        if self.last_size == (width, height)
-            && self.hit_rect.left == x && self.hit_rect.top == y
-        {
+        // If the request matches the LAST APPLIED rect (not just the
+        // last requested size), nothing to do. Comparing against
+        // `last_applied_rect` is what keeps the HWND in sync — see
+        // the field doc comment for the resize/apply_position
+        // interaction.
+        if self.last_applied_rect == (x, y, width, height) {
             return Ok(());
         }
 
@@ -156,20 +170,19 @@ impl ViewerChildWindow {
         // so panel drags stay smooth and gap-free.
         self.viewer.lock().resize(width, height, x as f32, y as f32);
 
-        // Big-jump fast path: when the size delta exceeds 200 px (sum of
-        // |Δw| + |Δh|), a fullscreen toggle or window-resize is in
-        // progress. Deferring the ResizeBuffers call for 150 ms leaves
+        // Big-jump fast path: when the size delta exceeds BIG_JUMP_PIXELS
+        // (sum of |Δw| + |Δh|), a fullscreen toggle or window-resize is
+        // in progress. Deferring the ResizeBuffers call for 150 ms leaves
         // the swapchain buffer stale for the entire transition, and
         // STRETCH's non-uniform aspect during that gap visibly distorts
-        // the image (Phase 1's fullscreen aspect bug). Forcing an
-        // immediate ResizeBuffers + SWP_FRAMECHANGED keeps the buffer in
-        // step with the HWND through the whole jump. We still drop the
-        // last_size delta down to 0 first so the deferred path doesn't
-        // immediately re-fire after us.
+        // the image. Forcing an immediate ResizeBuffers + SWP_FRAMECHANGED
+        // keeps the buffer in step with the HWND through the whole jump.
         let (old_w, old_h) = self.last_size;
         let delta = (width as i64 - old_w as i64).unsigned_abs()
             + (height as i64 - old_h as i64).unsigned_abs();
         if delta > BIG_JUMP_PIXELS {
+            // Reset last_size delta to zero *before* resize_swapchain,
+            // so the deferred path doesn't immediately re-fire after us.
             self.last_size = (width, height);
             self.pending_resize_since = None;
             let _ = aperture_gpu::resize_swapchain(&mut self.swapchain, width, height);
@@ -179,14 +192,13 @@ impl ViewerChildWindow {
                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
                 );
             }
-        }
-
-        self.hit_rect = RECT {
-            left: x, top: y,
-            right: x + width as i32,
-            bottom: y + height as i32,
-        };
-        if self.last_size != (width, height) {
+            // We just did the SetWindowPos ourselves; record it.
+            self.last_applied_rect = (x, y, width, height);
+        } else {
+            // Small per-frame delta: defer ResizeBuffers. apply_position
+            // is called right after resize by every callsite, and it
+            // will fire the actual SetWindowPos based on its own guard
+            // against last_applied_rect.
             self.last_size = (width, height);
             self.pending_resize_since = Some(std::time::Instant::now());
         }
@@ -224,20 +236,23 @@ impl ViewerChildWindow {
         }
     }
 
-    pub fn apply_position(&self, x: i32, y: i32, width: u32, height: u32) {
-        // Skip the SetWindowPos if the rect hasn't changed since last
-        // call. SetWindowPos always sends WM_WINDOWPOSCHANGED which
-        // (with the parent's WS_CLIPCHILDREN) triggers a DWM
-        // recompose. We're called from render_frame twice every
-        // frame, so an unguarded path costs 2 unnecessary recompose
-        // cycles per frame regardless of whether anything actually
-        // moved. The compositing impact is small per-frame but
-        // contributes to the launch flash on the first few frames
-        // where DWM is still settling the surfaces.
-        if self.hit_rect.left == x && self.hit_rect.top == y
-            && (self.hit_rect.right - self.hit_rect.left) as u32 == width
-            && (self.hit_rect.bottom - self.hit_rect.top) as u32 == height
-        {
+    pub fn apply_position(&mut self, x: i32, y: i32, width: u32, height: u32) {
+        // Skip the SetWindowPos if the rect matches the LAST APPLIED
+        // rect (not just the last requested size — that's stored in
+        // last_size and is bumped on every resize() call regardless
+        // of whether anything actually moved). Comparing against
+        // `last_applied_rect` means SetWindowPos fires once when the
+        // requested rect actually changes, and is a no-op for the
+        // many redundant apply_position calls per frame when nothing
+        // has changed.
+        //
+        // This MUST be &mut self and MUST update `last_applied_rect`
+        // after a successful SetWindowPos — the resize/apply_position
+        // pair used to compare against `hit_rect`, which resize() also
+        // updated, so the guard always short-circuited and the HWND
+        // never tracked per-frame resizes. That broke resize distortion
+        // and the thumbs-panel reopen occlusion regression.
+        if self.last_applied_rect == (x, y, width, height) {
             return;
         }
         unsafe {
@@ -249,6 +264,7 @@ impl ViewerChildWindow {
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
         }
+        self.last_applied_rect = (x, y, width, height);
     }
 
     pub fn size(&self) -> (u32, u32) {
@@ -258,10 +274,11 @@ impl ViewerChildWindow {
     /// Convert a global cursor position to a viewer-local position
     /// Returns None if cursor is outside the viewer rect
     pub fn cursor_to_local(&self, x: i32, y: i32) -> Option<(f32, f32)> {
-        if x >= self.hit_rect.left && x < self.hit_rect.right
-            && y >= self.hit_rect.top && y < self.hit_rect.bottom
-        {
-            Some(((x - self.hit_rect.left) as f32, (y - self.hit_rect.top) as f32))
+        let (lx, ly, lw, lh) = self.last_applied_rect;
+        let r = lx + lw as i32;
+        let b = ly + lh as i32;
+        if x >= lx && x < r && y >= ly && y < b {
+            Some(((x - lx) as f32, (y - ly) as f32))
         } else {
             None
         }

@@ -134,7 +134,29 @@ pub fn resize_swapchain(handle: &mut SwapchainHandle, width: u32, height: u32) -
 pub fn present(handle: &SwapchainHandle) -> Result<()> {
     unsafe {
         // SyncInterval 1 = wait for vertical blank (tear-free animation).
-        let hr = handle.swapchain.Present(1, DXGI_PRESENT(0));
+        // The very first Present after CreateSwapChainForHwnd can
+        // legitimately fail with DXGI_ERROR_WAS_STILL_DRAWING on
+        // some drivers (the swapchain is still warming up; vblank is
+        // one frame away). That failure leaves the back buffer
+        // uninitialised and DWM samples garbage for the very first
+        // composition — the launch flash. Retry with a short
+        // back-off so the very first paint always lands.
+        let mut hr = handle.swapchain.Present(1, DXGI_PRESENT(0));
+        if hr.is_err() {
+            const WAS_STILL_DRAWING: u32 = 0x887A000A;
+            let mut backoff_ms: u32 = 2;
+            for _ in 0..6 {
+                std::thread::sleep(std::time::Duration::from_millis(backoff_ms.into()));
+                hr = handle.swapchain.Present(1, DXGI_PRESENT(0));
+                if !hr.is_err() {
+                    break;
+                }
+                if hr.0 as u32 != WAS_STILL_DRAWING {
+                    break;
+                }
+                backoff_ms = backoff_ms.saturating_mul(2).min(32);
+            }
+        }
         if hr.is_err() {
             return Err(anyhow::anyhow!("Present failed: {:?}", hr));
         }

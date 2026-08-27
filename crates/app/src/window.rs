@@ -392,6 +392,12 @@ pub struct WgpuState {
     pub queue: wgpu::Queue,
     pub config: wgpu::SurfaceConfiguration,
     pub surface_format: wgpu::TextureFormat,
+    /// Whether `surface_format` is sRGB-encoded. Used to decide if
+    /// `srgb_to_linear` must be applied to the LoadOp clear and the
+    /// egui-wgpu's output — on a linear surface the GPU does NOT do
+    /// linear→sRGB on store, so applying `srgb_to_linear` would
+    /// over-darken the cleared region.
+    pub surface_is_srgb: bool,
     pub pixels_per_point: f32,
     pub _instance: Box<wgpu::Instance>,
 }
@@ -660,18 +666,28 @@ impl MainWindow {
             .max(mon_pos.1)
             .min(mon_pos.1 + mon_size.1 - min_h);
 
-        let window = event_loop.create_window(
+let window = event_loop.create_window(
             WindowAttributes::default()
                 .with_title("Aperture Neo")
                 .with_inner_size(LogicalSize::new(init_w, init_h))
                 .with_min_inner_size(LogicalSize::new(min_w, min_h))
-                // Phase 8: explicit centered placement (see above).
+                // Phase 8: explicit centered placement (see below).
                 .with_position(LogicalPosition::new(pos_x, pos_y))
                 // Custom-drawn titlebar: the OS frame is removed; egui draws
                 // the title row (menu buttons + window controls). Resize
                 // borders are restored in init_renderer by re-adding
                 // WS_THICKFRAME (gives edge resize + Aero Snap back).
-                .with_decorations(false),
+                .with_decorations(false)
+                // Create the window HIDDEN. DWM's first composition of
+                // a newly-created visible window can land before
+                // WindowEvent::Resized fires (and therefore before
+                // init_renderer runs and presents the wgpu/D2D
+                // surfaces), which produces the launch flash. By
+                // starting hidden and revealing from init_renderer
+                // after both surfaces have been presented at least
+                // once, the first composition the user can possibly
+                // see already has both surfaces populated.
+                .with_visible(false),
         )?;
 
         // Phase 16 fix: MAIN_HWND was read everywhere (native menus,
@@ -813,6 +829,14 @@ impl MainWindow {
         // subsequent WindowEvent::RedrawRequested fires
         // render_frame.
         self.present_wgpu_surface_for_init();
+
+        // Now that both surfaces have a populated first back buffer,
+        // make the main HWND visible. It was created with
+        // with_visible(false) in init_window so DWM couldn't
+        // compose an empty placeholder before we got here.
+        if let Some(w) = &self.window {
+            w.set_visible(true);
+        }
 
         Ok(())
     }
@@ -1709,24 +1733,40 @@ impl MainWindow {
 
             // Canvas color matches the panel background (#0f1011) — no
             // gray seams where egui doesn't paint.
+            //
+            // On an sRGB-encoded surface, wgpu encodes the clear value
+            // through the surface's linear→sRGB encoder on store; passing
+            // an sRGB fraction (0..1) over-brightens the cleared region
+            // relative to the authored palette. Convert to linear first.
+            //
+            // On a *linear* surface the GPU does NOT do that encoding on
+            // store, so the sRGB-encoded palette value must be passed
+            // through raw (no srgb_to_linear). The fix is keyed on
+            // `surface_is_srgb` so a DX12 driver that reports only linear
+            // formats doesn't render the cleared region too dark — the
+            // "black" half of the user's white+black launch flash.
+            let clear_color = if wgpu_state.surface_is_srgb {
+                wgpu::Color {
+                    r: srgb_to_linear(pal.canvas_clear.0),
+                    g: srgb_to_linear(pal.canvas_clear.1),
+                    b: srgb_to_linear(pal.canvas_clear.2),
+                    a: 1.0,
+                }
+            } else {
+                wgpu::Color {
+                    r: pal.canvas_clear.0,
+                    g: pal.canvas_clear.1,
+                    b: pal.canvas_clear.2,
+                    a: 1.0,
+                }
+            };
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("egui"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(wgpu::Color {
-                            // wgpu encodes the sRGB clear through the
-                            // surface's linear→sRGB encoder on store, so
-                            // passing an sRGB fraction (0..1) over-brightens
-                            // the cleared region relative to the authored
-                            // palette. Convert to linear first; see
-                            // `srgb_to_linear` for the formula.
-                            r: srgb_to_linear(pal.canvas_clear.0),
-                            g: srgb_to_linear(pal.canvas_clear.1),
-                            b: srgb_to_linear(pal.canvas_clear.2),
-                            a: 1.0,
-                        }),
+                        load: wgpu::LoadOp::Clear(clear_color),
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -2658,12 +2698,10 @@ impl MainWindow {
             }
             return;
         }
-        let (cx, cy, cw, ch) = (
-            child.hit_rect.left as f32,
-            child.hit_rect.top as f32,
-            child.hit_rect.right - child.hit_rect.left,
-            child.hit_rect.bottom - child.hit_rect.top,
-        );
+        let (cx, cy, cw, ch) = {
+            let (lx, ly, w, h) = child.last_applied_rect;
+            (lx as f32, ly as f32, w as i32, h as i32)
+        };
         unsafe {
             let full = CreateRectRgn(0, 0, cw, ch);
             for r in rects {
@@ -3309,18 +3347,29 @@ impl MainWindow {
         let mut encoder = wgpu_state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
             label: Some("init_present_encoder"),
         });
+        // Same sRGB-aware clear logic as in render_frame — see comment there.
+        let clear_color = if wgpu_state.surface_is_srgb {
+            wgpu::Color {
+                r: srgb_to_linear(pal.canvas_clear.0),
+                g: srgb_to_linear(pal.canvas_clear.1),
+                b: srgb_to_linear(pal.canvas_clear.2),
+                a: 1.0,
+            }
+        } else {
+            wgpu::Color {
+                r: pal.canvas_clear.0,
+                g: pal.canvas_clear.1,
+                b: pal.canvas_clear.2,
+                a: 1.0,
+            }
+        };
         let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("init_present"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(wgpu::Color {
-                        r: srgb_to_linear(pal.canvas_clear.0),
-                        g: srgb_to_linear(pal.canvas_clear.1),
-                        b: srgb_to_linear(pal.canvas_clear.2),
-                        a: 1.0,
-                    }),
+                    load: wgpu::LoadOp::Clear(clear_color),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -3892,6 +3941,7 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         queue,
         config,
         surface_format: format,
+        surface_is_srgb: format.is_srgb(),
         pixels_per_point: window.scale_factor() as f32,
         _instance: instance,
     })
