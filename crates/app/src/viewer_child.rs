@@ -54,11 +54,18 @@ impl ViewerChildWindow {
             tracing::debug!("ViewerChildWindow::new: class OK");
 
             let hwnd = CreateWindowExW(
-                // WS_EX_TRANSPARENT: the child is mouse-event transparent so
-                // clicks on the image pass through to the parent winit window
-                // (where the parent routes them to either the viewer logic
-                // or egui). The D2D child is purely a render surface.
-                WS_EX_NOPARENTNOTIFY | WS_EX_TRANSPARENT,
+                // Hit-test transparency is handled by returning HTTRANSPARENT from
+                // the child's WM_NCHITTEST (see wnd_proc below). Do NOT
+                // add WS_EX_TRANSPARENT here — per MSDN that style "the
+                // window itself is not painted", which DWM interprets
+                // as "exclude this window's DXGI surface from the
+                // composition tree" and falls back to drawing the
+                // parent's wgpu surface (or, on the very first
+                // composition, the parent has not presented yet and
+                // DWM shows the COLOR_WINDOW brush — the persistent
+                // light-grey placeholder rect the user has been seeing
+                // on launch).
+                WS_EX_NOPARENTNOTIFY,
                 VIEWER_CLASS_NAME,
                 PCWSTR::from_raw(EMPTY_W.as_ptr()),
                 // WS_VISIBLE is set so the child is composited from the
@@ -103,7 +110,15 @@ impl ViewerChildWindow {
             // this, the first composition sees an uninit back buffer
             // and DWM falls back to filling the child rect with the
             // WNDCLASS hbrBackground brush.
-            let _ = me.render_initial();
+            //
+            // DO NOT silently `let _ =` this — if BeginDraw/Clear/
+            // EndDraw/Present fails, the very first back buffer is
+            // left undefined and DWM samples an uninitialised surface,
+            // which manifests as the COLOR_WINDOW placeholder flash.
+            // Log so a regression is visible in tracing immediately.
+            if let Err(e) = me.render_initial() {
+                tracing::warn!("ViewerChildWindow::new: initial paint failed: {:#}", e);
+            }
             Ok(me)
         }
     }
@@ -210,6 +225,21 @@ impl ViewerChildWindow {
     }
 
     pub fn apply_position(&self, x: i32, y: i32, width: u32, height: u32) {
+        // Skip the SetWindowPos if the rect hasn't changed since last
+        // call. SetWindowPos always sends WM_WINDOWPOSCHANGED which
+        // (with the parent's WS_CLIPCHILDREN) triggers a DWM
+        // recompose. We're called from render_frame twice every
+        // frame, so an unguarded path costs 2 unnecessary recompose
+        // cycles per frame regardless of whether anything actually
+        // moved. The compositing impact is small per-frame but
+        // contributes to the launch flash on the first few frames
+        // where DWM is still settling the surfaces.
+        if self.hit_rect.left == x && self.hit_rect.top == y
+            && (self.hit_rect.right - self.hit_rect.left) as u32 == width
+            && (self.hit_rect.bottom - self.hit_rect.top) as u32 == height
+        {
+            return;
+        }
         unsafe {
             let _ = SetWindowPos(
                 self.hwnd,
@@ -271,7 +301,20 @@ unsafe fn register_class_once() -> Result<()> {
             lpszClassName: VIEWER_CLASS_NAME,
             ..Default::default()
         };
-        let _ = RegisterClassExW(&wc as *const _);
+        let atom = RegisterClassExW(&wc as *const _);
+        if atom == 0 {
+            // Class registration failed. Subsequent CreateWindowExW
+            // would fail too, but logging here gives the failure
+            // visibility without the per-window noise. Most likely
+            // cause: a stale class with the same name from a previous
+            // process whose window still owns the desktop; usually
+            // resolves on the next launch.
+            tracing::warn!(
+                "RegisterClassExW({}) failed: {}",
+                String::from_utf16_lossy(&VIEWER_CLASS_W),
+                std::io::Error::last_os_error(),
+            );
+        }
     });
     Ok(())
 }

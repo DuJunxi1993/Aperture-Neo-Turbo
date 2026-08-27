@@ -607,10 +607,38 @@ impl MainWindow {
             // Borderless fullscreen on monitors smaller than the image.
             (lw, lh, MIN_W as f64, MIN_H as f64)
         } else if self.settings.window_size().is_some() {
-            // Restored session size.
+            // Restored session size. `stored` is *intended* to be in
+            // LOGICAL pixels (save_window_geometry now saves logical
+            // via to_logical) but settings.json from older builds
+            // (commits before today) may contain physical pixels —
+            // those would translate to ever-larger windows on each
+            // launch at >100% DPI. Migration: if `stored` exceeds
+            // the monitor's logical 90% by a wide margin (the
+            // tell-tale sign of a physical value), divide by the
+            // current scale factor to recover the logical size.
+            let (stored_lw, stored_lh) = {
+                let too_big_w = stored.0 as f64 > max_w * 1.5;
+                let too_big_h = stored.1 as f64 > max_h * 1.5;
+                if too_big_w || too_big_h {
+                    tracing::warn!(
+                        "settings.json window_size ({},{}) appears to be physical pixels; \
+                         converting to logical at scale={:.2}",
+                        stored.0, stored.1, scale,
+                    );
+                    (
+                        (stored.0 as f64 / scale).max(MIN_W as f64).min(max_w),
+                        (stored.1 as f64 / scale).max(MIN_H as f64).min(max_h),
+                    )
+                } else {
+                    (
+                        (stored.0 as f64).max(MIN_W as f64).min(max_w),
+                        (stored.1 as f64).max(MIN_H as f64).min(max_h),
+                    )
+                }
+            };
             (
-                (stored.0 as f64).min(max_w).max(MIN_W as f64),
-                (stored.1 as f64).min(max_h).max(MIN_H as f64),
+                stored_lw,
+                stored_lh,
                 MIN_W as f64,
                 MIN_H as f64,
             )
@@ -767,6 +795,25 @@ impl MainWindow {
                 tracing::info!("Initial folder loaded: {}", folder.display());
             }
         }
+
+        // Force-present the wgpu surface once so the main HWND's
+        // DXGI back buffer is populated with canvas_clear before DWM
+        // does its very first composition. Without this, the first
+        // DWM sample of the parent's DXGI surface finds an uninit
+        // back buffer and falls back to drawing the COLOR_WINDOW
+        // brush into the parent's client area — this is the
+        // persistent "dark/light launch flash" the user has been
+        // seeing. The D2D child is handled symmetrically via
+        // ViewerChildWindow::new's render_initial() call; this
+        // balances the parent side.
+        //
+        // Must run AFTER ViewerChildWindow::new above so the child
+        // is created (init_renderer reaches this point in source
+        // order). Both surfaces then have content before any
+        // subsequent WindowEvent::RedrawRequested fires
+        // render_frame.
+        self.present_wgpu_surface_for_init();
+
         Ok(())
     }
 
@@ -3222,8 +3269,68 @@ impl MainWindow {
     fn save_window_geometry(&mut self) {
         if let Some(window) = &self.window {
             let size = window.inner_size();
-            self.settings.set_window_size(size.width, size.height);
+            // Store the size in LOGICAL pixels. winit's
+            // Window::inner_size returns physical pixels; if we save
+            // those as-is, the next launch reads them back through
+            // LogicalSize::new (window.rs:init_window), winit
+            // applies the current scale factor, and the resulting
+            // physical window is `previous_physical * scale / scale`
+            // i.e. `previous_physical * 1` at 100% DPI but
+            // `previous_physical * 1.25` at 125% DPI — the window
+            // GROWS each launch until capped at monitor size. This
+            // was the user's "open → close → open, the window is
+            // bigger every time" symptom.
+            let sf = window.scale_factor();
+            let logical = size.to_logical::<f64>(sf);
+            self.settings.set_window_size(logical.width as u32, logical.height as u32);
         }
+    }
+
+    /// Populate the wgpu surface's back buffer with canvas_clear and
+    /// Present once. Called from `init_renderer` so the main HWND's
+    /// DXGI swapchain has content for the very first DWM
+    /// composition — otherwise the first sample falls back to
+    /// COLOR_WINDOW and the user sees a "placeholder" flash on
+    /// launch. Silent on failure (errors are logged) because the
+    /// next render_frame will repaint anyway.
+    fn present_wgpu_surface_for_init(&self) {
+        let Some(wgpu_state) = self.wgpu_state.as_ref() else {
+            return;
+        };
+        let pal = self.pal();
+        let frame = match wgpu_state.surface.get_current_texture() {
+            Ok(f) => f,
+            Err(e) => {
+                tracing::warn!("init_present: get_current_texture failed: {:#}", e);
+                return;
+            }
+        };
+        let view = frame.texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = wgpu_state.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("init_present_encoder"),
+        });
+        let _rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("init_present"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(wgpu::Color {
+                        r: srgb_to_linear(pal.canvas_clear.0),
+                        g: srgb_to_linear(pal.canvas_clear.1),
+                        b: srgb_to_linear(pal.canvas_clear.2),
+                        a: 1.0,
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+        drop(_rpass);
+        wgpu_state.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
     }
 }
 
@@ -3751,7 +3858,20 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         None,
     ))?;
     let caps = surface.get_capabilities(&adapter);
-    let format = caps.formats[0];
+    // Prefer an sRGB-encoded format. D2D's swapchain is created with
+    // DXGI_FORMAT_B8G8R8A8_UNORM and DXGI_ALPHA_MODE_IGNORE
+    // (crates/gpu/src/swapchain.rs:38-44) — an sRGB surface matches
+    // that encoding and lets the egui_wgpu pipeline's existing
+    // sRGB→linear clear colour (window.rs: srgb_to_linear) produce
+    // the intended panel_bg colour. If `caps.formats[0]` happens to
+    // already be sRGB on a given driver the behaviour is unchanged;
+    // on drivers that report a linear format first (e.g. some
+    // DX12 paths report Bgra8Unorm before Bgra8UnormSrgb), this
+    // prevents the cleared region from being over-darkened by
+    // the srgb_to_linear conversion on a linear surface.
+    let format = caps.formats.iter().copied()
+        .find(|f| f.is_srgb())
+        .unwrap_or(caps.formats[0]);
     let config = wgpu::SurfaceConfiguration {
         usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
         format,
