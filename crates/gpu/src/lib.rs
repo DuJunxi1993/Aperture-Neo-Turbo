@@ -8,6 +8,7 @@ pub mod device;
 pub mod loader;
 pub mod quad;
 pub mod swapchain;
+pub mod texture;
 pub mod viewer;
 
 pub use animator::{Animator, AffineTransform};
@@ -18,4 +19,5 @@ pub use device::GpuContext;
 pub use loader::{WicLoader, LoadedBitmap};
 pub use quad::{ImageQuadPipeline, ImageQuadUniforms, create_placeholder_texture, texture_format_premul_bgra};
 pub use swapchain::{SwapchainHandle, buffer_size, create_swapchain_for_hwnd, resize_swapchain, present};
+pub use texture::DecodedGpuImage;
 pub use viewer::{Direct2DViewer, SlideDir};

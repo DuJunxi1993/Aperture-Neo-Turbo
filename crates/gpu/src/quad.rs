@@ -21,38 +21,26 @@ struct VsOut {
     @builtin(position) pos: vec4<f32>,
 };
 
-// Uniform buffer laid out as 16-byte aligned scalars. Total size = 64
-// bytes — exactly one wgpu::PushConstants range on most platforms.
-struct U {
-    // mat3x3 column-major that maps a screen-space framebuffer-pixel
-    // position (relative to the viewer rect's top-left) to the
-    // corresponding decoded-image pixel coordinate. Multiplying
-    // vec3(px, py, 1) yields (image_x, image_y, _).
-    transform: vec3<f32>,
-    transform2: vec3<f32>,
-    transform3: vec3<f32>,
-    // The viewer's top-left corner in framebuffer pixels (physical px).
+// Uniform buffer. mat3x3 column-major (3 × vec3) + 3 × vec2 + 1 × vec4 +
+// 1 × u32 = 84 bytes — well within the 128-byte push-constant budget.
+struct Uniforms {
+    col0: vec3<f32>,
+    col1: vec3<f32>,
+    col2: vec3<f32>,
     viewer_rect_min: vec2<f32>,
-    // The viewer's size in framebuffer pixels (physical px).
     viewer_rect_size: vec2<f32>,
-    // Decoded image texture size in pixels (after WIC decode, before
-    // any GPU transform).
     texture_size: vec2<f32>,
-    // 0 when no decoded bitmap is bound (frame-zero / decode in flight);
-    // 1 otherwise. Fragments outside the image bounds return `bg` instead
-    // of sampling.
+    bg: vec4<f32>,
     has_image: u32,
-    // Pad to 16-byte boundary for safe push-constant layout.
-    _pad: vec3<u32>,
+    _pad0: u32,
+    _pad1: u32,
+    _pad2: u32,
 }
 
-var<uniform> u: U;
-@group(0) @binding(0) var samp: sampler;
-@group(0) @binding(1) var tex: texture_2d<f32>;
+@group(0) @binding(0) var<uniform> u: Uniforms;
+@group(0) @binding(1) var samp: sampler;
+@group(0) @binding(2) var tex: texture_2d<f32>;
 
-// Emit a single full-screen triangle covering the framebuffer
-// (clip-space). The rasteriser will only fill the pixels inside the
-// scissor rect we set per-frame, so no per-pixel clip is needed.
 @vertex fn vs_main(@builtin(vertex_index) vi: u32) -> VsOut {
     var p = array<vec2<f32>, 3>(
         vec2<f32>(-1.0, -1.0),
@@ -85,12 +73,12 @@ fn cubic_weight(t: f32) -> vec4<f32> {
     );
 }
 
-@fragment fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
+@fragment fn fs_main(@builtin(position) fb: vec4<f32>) -> @location(0) vec4<f32> {
     if (u.has_image == 0u) {
         return u.bg;
     }
     // Framebuffer pixel → screen-local pixel relative to viewer rect.
-    let screen_local = in.pos.xy - u.viewer_rect_min;
+    let screen_local = fb.xy - u.viewer_rect_min;
     // Outside the viewer rect → return bg. The rasteriser should have
     // discarded these already via the scissor rect, but be defensive.
     if (screen_local.x < 0.0 || screen_local.y < 0.0 ||
@@ -99,10 +87,12 @@ fn cubic_weight(t: f32) -> vec4<f32> {
         return u.bg;
     }
     // Map to image-pixel coords via the per-quadrant affine matrix.
-    let h = vec3<f32>(screen_local, 1.0);
-    let img_px = mat3x3<f32>(
-        u.transform, u.transform2, u.transform3,
-    ) * h;
+// Compute manually rather than via mat3x3 * vec3 to sidestep a
+// naga type-inference issue where the mat3x3(column,column,column)
+// constructor is mis-typed against the bound uniform struct fields.
+    let img_x = u.col0.x * screen_local.x + u.col1.x * screen_local.y + u.col2.x;
+    let img_y = u.col0.y * screen_local.x + u.col1.y * screen_local.y + u.col2.y;
+    let img_px = vec2<f32>(img_x, img_y);
     // Outside the source texture → bg (matches D2D behaviour where the
     // display_transform places the bitmap at a sub-rect of the viewport).
     if (img_px.x < 0.0 || img_px.y < 0.0 ||
@@ -141,52 +131,49 @@ fn cubic_weight(t: f32) -> vec4<f32> {
     }
     return sum;
 }
-
-@group(0) @binding(0) @fragment fn fs(@builtin(position) pos: vec4<f32>) -> @location(0) vec4<f32> {
-    var o: VsOut;
-    o.pos = pos;
-    return fs_main(o);
-}
 "#;
 
 /// Per-frame uniform for the image quad.
 ///
-/// Sized to match the WGSL `U struct` (64 bytes). The bind group layout
-/// has a single uniform-binding that reads this buffer.
+/// Sized to match the WGSL `U struct` (84 bytes — three vec3 columns +
+/// three vec2 + one vec4 + four scalars). The bind group layout has a
+/// single uniform-binding that reads this buffer.
 #[repr(C)]
 #[derive(Copy, Clone, Debug, Pod, Zeroable)]
 pub struct ImageQuadUniforms {
-    /// Column-major 3x3 transform. Screen-pixel-local → image-pixel.
-    pub transform: [f32; 3],
-    pub transform2: [f32; 3],
-    pub transform3: [f32; 3],
-    /// Viewer rect's top-left in framebuffer (physical) pixels.
+    /// Column-major 3x3 transform, screen-pixel-local → image-pixel.
+    /// Three vec3 fields, each 16-byte aligned by WGSL rules.
+    pub col0: [f32; 3],
+    pub col1: [f32; 3],
+    pub col2: [f32; 3],
+    /// Viewer rect's top-left in framebuffer pixels.
     pub viewer_rect_min: [f32; 2],
     /// Viewer rect size in framebuffer pixels.
     pub viewer_rect_size: [f32; 2],
     /// Source texture size in pixels.
     pub texture_size: [f32; 2],
-    /// 1 when a decoded image texture is bound, 0 otherwise (the
-    /// fragment shader returns `bg` for any pixel when this is 0).
-    pub has_image: u32,
-    /// Background colour in straight (non-premul) RGBA.
+    /// Straight (non-premul) RGBA background colour; returned by the
+    /// fragment shader when `has_image` is 0 or the fragment lies
+    /// outside the image rect.
     pub bg: [f32; 4],
-    /// Padding to 64 bytes. The shader does not read these, but wgpu
-    /// requires the uniform buffer to be a multiple of 16.
+    /// 1 when a decoded image texture is bound, 0 otherwise.
+    pub has_image: u32,
+    /// Trailing padding to a multiple of 16 bytes. The shader does
+    /// not read these; they exist only to satisfy WGSL struct layout.
     pub _pad: [u32; 3],
 }
 
 impl Default for ImageQuadUniforms {
     fn default() -> Self {
         Self {
-            transform: [1.0, 0.0, 0.0],
-            transform2: [0.0, 1.0, 0.0],
-            transform3: [0.0, 0.0, 1.0],
+            col0: [1.0, 0.0, 0.0],
+            col1: [0.0, 1.0, 0.0],
+            col2: [0.0, 0.0, 1.0],
             viewer_rect_min: [0.0, 0.0],
             viewer_rect_size: [0.0, 0.0],
             texture_size: [0.0, 0.0],
-            has_image: 0,
             bg: [0.0, 0.0, 0.0, 1.0],
+            has_image: 0,
             _pad: [0; 3],
         }
     }
@@ -194,11 +181,14 @@ impl Default for ImageQuadUniforms {
 
 /// Pipeline + bind-group-layout + sampler for the image quad.
 ///
-/// Created once per `WgpuState` at startup; bound per frame.
+/// Created once per `WgpuState` at startup; bound per frame. Holds the
+/// uniform buffer that `set_bind_group` references — Phase 3 writes
+/// `ImageQuadUniforms` into it via `update_uniforms`.
 pub struct ImageQuadPipeline {
     pub pipeline: wgpu::RenderPipeline,
     pub bind_group_layout: wgpu::BindGroupLayout,
     pub sampler: wgpu::Sampler,
+    pub uniform_buffer: wgpu::Buffer,
 }
 
 impl ImageQuadPipeline {
@@ -208,18 +198,31 @@ impl ImageQuadPipeline {
             source: wgpu::ShaderSource::Wgsl(SHADER_SRC.into()),
         });
 
-        let bind_group_layout =
+        // Bind group layout: 1 uniform buffer + 1 sampler + 1 texture.
+// Phase 3 allocates the uniform buffer once per WgpuState and writes
+// to it via queue.write_buffer() each frame from encode_image_pass.
+let bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("image_quad_bind_group_layout"),
                 entries: &[
                     wgpu::BindGroupLayoutEntry {
                         binding: 0,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Texture {
                             sample_type: wgpu::TextureSampleType::Float { filterable: true },
@@ -235,10 +238,7 @@ impl ImageQuadPipeline {
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("image_quad_pipeline_layout"),
                 bind_group_layouts: &[&bind_group_layout],
-                push_constant_ranges: &[wgpu::PushConstantRange {
-                    stages: wgpu::ShaderStages::FRAGMENT,
-                    range: 0..std::mem::size_of::<ImageQuadUniforms>() as u32,
-                }],
+                push_constant_ranges: &[],
             });
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -252,7 +252,7 @@ impl ImageQuadPipeline {
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
-                entry_point: "fs",
+                entry_point: "fs_main",
                 targets: &[Some(wgpu::ColorTargetState {
                     format: surface_format,
                     blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -286,11 +286,26 @@ impl ImageQuadPipeline {
             ..Default::default()
         });
 
-        Self { pipeline, bind_group_layout, sampler }
+        // Uniform buffer that backs the shader's `@group(0) @binding(0)
+        // var<uniform> u: Uniforms`. Phase 3 writes a fresh
+        // `ImageQuadUniforms` every frame via `update_uniforms`.
+        let uniform_buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("image_quad_uniform_buffer"),
+            // naga may insert padding to align the WGSL struct; allocate
+            // 256 bytes (well above the 92-byte Rust struct) so the
+            // GPU sees a buffer big enough regardless of layout.
+            size: 256,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        Self { pipeline, bind_group_layout, sampler, uniform_buffer }
     }
 
     /// Bind a texture to the image quad pipeline. Returns the bind group
-    /// to pass to `RenderPass::set_bind_group`.
+    /// to pass to `RenderPass::set_bind_group`. Binds at @group(0):
+    /// binding(0) = the shared uniform buffer, binding(1) = the
+    /// shared sampler, binding(2) = the per-frame texture view.
     pub fn create_bind_group(
         &self,
         device: &wgpu::Device,
@@ -302,18 +317,39 @@ impl ImageQuadPipeline {
             entries: &[
                 wgpu::BindGroupEntry {
                     binding: 0,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                    resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                        buffer: &self.uniform_buffer,
+                        offset: 0,
+                        size: std::num::NonZeroU64::new(
+                            std::mem::size_of::<ImageQuadUniforms>() as u64,
+                        ),
+                    }),
                 },
                 wgpu::BindGroupEntry {
                     binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&self.sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
                     resource: wgpu::BindingResource::TextureView(texture_view),
                 },
             ],
         })
     }
 
+    /// Write `uniforms` into the shared uniform buffer. Called once
+    /// per frame from `render_frame` before drawing the image quad.
+    pub fn update_uniforms(&self, queue: &wgpu::Queue, uniforms: &ImageQuadUniforms) {
+        queue.write_buffer(
+            &self.uniform_buffer,
+            0,
+            bytemuck::cast_slice(std::slice::from_ref(uniforms)),
+        );
+    }
+
     /// Encode the image quad into an active render pass. Caller must
-    /// have already begun the pass and bound a bind group.
+    /// have already begun the pass and bound a bind group via
+    /// `set_bind_group`.
     pub fn encode(&self, rpass: &mut wgpu::RenderPass<'_>, rect_phys: (u32, u32, u32, u32)) {
         let (vx, vy, vw, vh) = rect_phys;
         // Clamp scissor to the surface so a transient miscomputed rect
@@ -382,13 +418,10 @@ mod tests {
 
     #[test]
     fn uniforms_size_is_push_constant_aligned() {
-        // wgpu push-constant ranges must be a multiple of 16 bytes. The
-        // struct is currently 92 bytes (9+2+2+2+1+4+3 = 23 f32/u32 fields =
-        // 23*4 = 92). 92 % 16 == 12, so we'd need to widen the trailing
-        // _pad if we ever hit a backend that hard-asserts 16-byte
-        // alignment. For now we just confirm the size matches our
-        // hand-count and that it's well within the 128-byte push-constant
-        // budget.
+        // 9 vec3 + 3 vec2 + 1 vec4 + 2 scalar = 27 + 12 + 16 + 8 = 92
+        // bytes. Well within the 128-byte push-constant budget. 92 % 16
+        // == 12 — fine, push-constant ranges don't require 16-byte
+        // alignment (only uniform buffers do).
         assert_eq!(std::mem::size_of::<ImageQuadUniforms>(), 92);
         assert!(std::mem::size_of::<ImageQuadUniforms>() <= 128);
     }
@@ -397,9 +430,9 @@ mod tests {
     fn default_uniforms_are_identity() {
         let u = ImageQuadUniforms::default();
         // Identity transform: col-major [1 0 0; 0 1 0; 0 0 1].
-        assert_eq!(u.transform, [1.0, 0.0, 0.0]);
-        assert_eq!(u.transform2, [0.0, 1.0, 0.0]);
-        assert_eq!(u.transform3, [0.0, 0.0, 1.0]);
+        assert_eq!(u.col0, [1.0, 0.0, 0.0]);
+        assert_eq!(u.col1, [0.0, 1.0, 0.0]);
+        assert_eq!(u.col2, [0.0, 0.0, 1.0]);
         // No image bound yet.
         assert_eq!(u.has_image, 0);
     }

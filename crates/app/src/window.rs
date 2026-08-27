@@ -388,8 +388,12 @@ pub struct MainWindow {
 
 pub struct WgpuState {
     pub surface: wgpu::Surface<'static>,
-    pub device: wgpu::Device,
-    pub queue: wgpu::Queue,
+    /// wgpu device wrapped in `Arc` so the decode coordinator can hold
+    /// a long-lived reference for Phase 2+ texture uploads. Phase 4
+    /// (D2D removal) lets us drop the Arc, but it's cheap and forward-
+    /// compatible.
+    pub device: Arc<wgpu::Device>,
+    pub queue: Arc<wgpu::Queue>,
     pub config: wgpu::SurfaceConfiguration,
     pub surface_format: wgpu::TextureFormat,
     /// Whether `surface_format` is sRGB-encoded. Used to decide if
@@ -733,8 +737,14 @@ let window = event_loop.create_window(
         )));
 
         let loader = Arc::new(WicLoader::new());
+        // Phase 2: pass wgpu device + queue into the coordinator so
+        // it can upload the decoded image to a wgpu texture alongside
+        // the D2D upload. Phase 3 hands this texture to the image
+        // quad; Phase 4 deletes the D2D path entirely.
         let coordinator = Arc::new(DecodeCoordinator::new(
             self.nav.clone(), loader.clone(), viewer.clone(),
+            wgpu_state.device.clone(),
+            wgpu_state.queue.clone(),
         ));
 
         // Extract HWND from the winit window
@@ -3949,6 +3959,11 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
     // the D2D path entirely.
     let image_quad = aperture_gpu::ImageQuadPipeline::new(&device, format);
     let placeholder_image = aperture_gpu::create_placeholder_texture(&device, &queue);
+
+    // Phase 2: Arc-wrap device + queue so the decode coordinator can
+    // hold long-lived references for the image-quad texture upload.
+    let device = Arc::new(device);
+    let queue = Arc::new(queue);
 
     Ok(WgpuState {
         surface,
