@@ -193,10 +193,10 @@ impl Direct2DViewer {
         let (m11, m12, m21, m22, dx, dy) = if let Some(t) = self.current_rect_anim_transform() {
             (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
         } else if self.animator.is_sliding() {
-            let (ew, _eh) = self.effective_size();
+            let vw = self.viewport_w as f32;
             let slide = self.animator.current_transform(
                 self.zoom, self.offset_x, self.offset_y,
-                self.fit_scale, self.slide_dir, ew,
+                self.fit_scale, self.slide_dir, vw,
             );
             if for_previous {
                 // Previous image: reverse the slide direction so the
@@ -206,7 +206,6 @@ impl Direct2DViewer {
                     crate::viewer::SlideDir::Previous => 1.0,
                     crate::viewer::SlideDir::None => 0.0,
                 };
-                let vw = self.viewport_w as f32;
                 let shift = dir * vw * (1.0 - slide.m11.max(0.0).min(1.0));
                 // Place previous at its prior fit (offset,offset_y) and
                 // shift by `shift` in the OPPOSITE direction of the
