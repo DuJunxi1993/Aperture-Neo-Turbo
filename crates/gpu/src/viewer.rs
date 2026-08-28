@@ -57,6 +57,20 @@ pub struct Direct2DViewer {
     pending_viewport_anim_from: Option<(f32, f32, f32, f32)>,
     pending_viewport_target: Option<(f32, f32, f32, f32)>,
     rotation: u8,
+    /// Continuous rotation angle in degrees, animated during a rotation so
+    /// the image spins smoothly to the target quadrant instead of snapping
+    /// to 0/90/180/270. `display_transform` uses this to build the affine.
+    rotation_deg: f32,
+    /// In-flight rotation animation (from_deg → to_deg). None when idle.
+    rot_anim: Option<RotAnim>,
+}
+
+/// A smooth rotation animation (degrees).
+struct RotAnim {
+    from_deg: f32,
+    to_deg: f32,
+    start: std::time::Instant,
+    dur: f32,
 }
 
 struct RectAnim {
@@ -87,11 +101,15 @@ impl Direct2DViewer {
             pending_viewport_anim_from: None,
             pending_viewport_target: None,
             rotation: 0,
+            rotation_deg: 0.0,
+            rot_anim: None,
         }
     }
 
     pub fn set_image_gpu(&mut self, image: Arc<DecodedGpuImage>, direction: SlideDir) {
         self.rotation = 0;
+        self.rotation_deg = 0.0;
+        self.rot_anim = None;
         self.slide_dir = direction;
         let outgoing = self.current_gpu.take();
         self.current_gpu = Some(image);
@@ -243,36 +261,70 @@ impl Direct2DViewer {
         }
     }
 
+    /// Advance any in-flight rotation animation. Called once per frame from
+    /// `render_frame` so `rotation_deg` reflects the interpolated angle when
+    /// `display_transform` reads it.
+    pub fn tick_rotation(&mut self) {
+        if let Some(anim) = self.rot_anim.as_ref() {
+            let raw = (anim.start.elapsed().as_secs_f32() / anim.dur).min(1.0);
+            let t = raw * raw * (3.0 - 2.0 * raw);
+            let deg = anim.from_deg + (anim.to_deg - anim.from_deg) * t;
+            if raw >= 1.0 {
+                self.rotation_deg = anim.to_deg.rem_euclid(360.0);
+                self.rot_anim = None;
+            } else {
+                self.rotation_deg = deg;
+            }
+        }
+    }
+
+    /// Current continuous rotation angle in degrees (advances any in-flight
+    /// rot_anim). Used by `display_transform` to build the affine so the
+    /// image spins smoothly instead of snapping between quadrants.
+    pub fn rotation_angle_deg(&self) -> f32 {
+        self.rotation_deg
+    }
+
+    /// Pure affine-builder: image(w×h) rotated by `rot_deg` about its
+    /// centre, scaled by `s`, with the image centre mapped to `(dx, dy)`.
+    /// Separate from [`Self::display_transform`] so unit tests can verify
+    /// the centre-anchor invariant without a wgpu DecodedGpuImage.
+    ///
+    /// Rotation is CLOCKWISE on screen (the existing quadrant convention:
+    /// rot 1 = 90° CW maps (img_x, img_y) → (s*img_y, -s*img_x)). With a
+    /// top-left-origin display (y grows downward), a clockwise visual
+    /// rotation is the matrix `[[cos, sin],[-sin, cos]]`.
+    fn affine_for_size(
+        bw: f32, bh: f32, rot_deg: f32, dx: f32, dy: f32, s: f32,
+    ) -> AffineTransform {
+        let theta = rot_deg.to_radians();
+        let (cos, sin) = (theta.cos(), theta.sin());
+        // Rotate the image centre (bw/2, bh/2) about the origin with the
+        // clockwise matrix; translate so that point lands at (dx, dy).
+        let cx = dx - s * (cos * bw * 0.5 + sin * bh * 0.5);
+        let cy = dy - s * (-sin * bw * 0.5 + cos * bh * 0.5);
+        AffineTransform {
+            m11: s * cos,
+            m12: s * sin,
+            m21: -s * sin,
+            m22: s * cos,
+            dx: cx,
+            dy: cy,
+        }
+    }
+
     /// Build the image→screen affine with the rotation centred on the
     /// image itself. `dx, dy` is the viewer-space position of the
-    /// IMAGE CENTRE. The forward image→screen maps ORIGINAL image
-    /// coords (pre-rotation) and the per-quadrant translation term
-    /// compensates so the image-centre pixel `(bw/2, bh/2)` lands at
-    /// `(dx, dy)` regardless of rotation. The shader inverts this to
-    /// screen→image.
+    /// IMAGE CENTRE. Uses the continuous `rotation_deg` so the image spins
+    /// smoothly about its geometric centre `(bw/2, bh/2)`, which is mapped
+    /// to `(dx, dy)` regardless of angle — this guarantees the image never
+    /// drifts out of the viewport during a rotation.
     pub fn display_transform(&self, dx: f32, dy: f32, s: f32) -> AffineTransform {
         let (bw, bh) = match &self.current_gpu {
             Some(img) => (img.width as f32, img.height as f32),
             None => return AffineTransform::identity(),
         };
-        let sw = bw * s;
-        let sh = bh * s;
-        // For each rotation k:
-        //   rot 0: (img_x, img_y) → ( s*img_x,  s*img_y )
-        //   rot 1: (img_x, img_y) → ( s*img_y, -s*img_x )
-        //   rot 2: (img_x, img_y) → (-s*img_x, -s*img_y )
-        //   rot 3: (img_x, img_y) → (-s*img_y,  s*img_x )
-        // The translation term is solved so (bw/2, bh/2) → (dx, dy):
-        //   rot 0: dx_affine = dx - s*bw/2, dy_affine = dy - s*bh/2
-        //   rot 1: dx_affine = dx - s*bh/2, dy_affine = dy + s*bw/2
-        //   rot 2: dx_affine = dx + s*bw/2, dy_affine = dy + s*bh/2
-        //   rot 3: dx_affine = dx + s*bh/2, dy_affine = dy - s*bw/2
-        match self.rotation {
-            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: dx - sh * 0.5, dy: dy + sw * 0.5 },
-            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: dx + sw * 0.5, dy: dy + sh * 0.5 },
-            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx: dx + sh * 0.5, dy: dy - sw * 0.5 },
-            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx: dx - sw * 0.5, dy: dy - sh * 0.5 },
-        }
+        Self::affine_for_size(bw, bh, self.rotation_deg, dx, dy, s)
     }
 
     fn compute_fit(&mut self) {
@@ -638,6 +690,21 @@ impl Direct2DViewer {
                 eh2 * self.zoom,
             );
             self.start_rect_anim_with(target, 0.32, from);
+            // Start a continuous angle animation so the image SPINS about
+            // its geometric centre instead of snapping quadrants. We take
+            // the current angle and rotate by the SHORTEST delta (±90° or
+            // ±180°) that reaches the target quadrant, so the spin is a
+            // single smooth motion, never a long around-the-back turn.
+            let target_deg = (q & 3) as f32 * 90.0;
+            let cur = self.rotation_deg;
+            let mut delta = (target_deg - cur).rem_euclid(360.0);
+            if delta > 180.0 { delta -= 360.0; }
+            self.rot_anim = Some(RotAnim {
+                from_deg: cur,
+                to_deg: cur + delta,
+                start: std::time::Instant::now(),
+                dur: 0.32,
+            });
         }
     }
 
@@ -772,5 +839,68 @@ mod tests {
             (bottom_distance - top_distance).abs() < 0.5,
             "bottom_distance={bottom_distance}, top_distance={top_distance}"
         );
+    }
+
+    /// Phase 5: rotation must be centred on the image's GEOMETRIC CENTRE.
+    /// For any rotation angle (including the in-between interpolation
+    /// angles 0/30/60/90/…/360), applying the affine to the image centre
+    /// pixel (bw/2, bh/2) must yield exactly (dx, dy). This guarantees the
+    /// image never drifts out of the viewport while spinning.
+    #[test]
+    fn rotation_is_centred_on_image_geometric_centre() {
+        let (bw, bh) = (1920.0_f32, 1440.0_f32);
+        let (dx, dy) = (600.0_f32, 400.0_f32);
+        let s = 0.6_f32;
+        // Sample every 15° including the four quadrant endpoints.
+        for deg in (0..=360).step_by(15) {
+            let a = Direct2DViewer::affine_for_size(bw, bh, deg as f32, dx, dy, s);
+            // Forward: image → screen. Image centre → (dx, dy).
+            let sx = a.m11 * (bw * 0.5) + a.m12 * (bh * 0.5) + a.dx;
+            let sy = a.m21 * (bw * 0.5) + a.m22 * (bh * 0.5) + a.dy;
+            assert!(
+                (sx - dx).abs() < 0.01 && (sy - dy).abs() < 0.01,
+                "rot={deg}: centre mapped to ({sx},{sy}), expected ({dx},{dy}) — image drifts off its anchor"
+            );
+        }
+    }
+
+    /// Phase 5: at the four cardinals the affine must agree with the old
+    /// hard-coded quadrant matrices (0/90/180/270) so existing perception
+    /// of rotation direction is preserved.
+    #[test]
+    fn rotation_cardinals_match_quadrant_matrices() {
+        let (bw, bh) = (200.0_f32, 100.0_f32);
+        let (dx, dy) = (50.0_f32, 60.0_f32);
+        let s = 1.25_f32;
+        for deg in [0.0_f32, 90.0, 180.0, 270.0] {
+            let a = Direct2DViewer::affine_for_size(bw, bh, deg, dx, dy, s);
+            match deg as i32 {
+                // rot 0: identity scale
+                0 => {
+                    assert!((a.m11 - s).abs() < 0.001 && (a.m22 - s).abs() < 0.001, "rot0");
+                    assert!(a.m12.abs() < 0.001 && a.m21.abs() < 0.001, "rot0 off-diag");
+                }
+                // rot 90: (img_x, img_y) → ( s*img_y, -s*img_x )
+                90 => {
+                    assert!((a.m12 - s).abs() < 0.001 && (a.m21 + s).abs() < 0.001, "rot90");
+                    assert!(a.m11.abs() < 0.001 && a.m22.abs() < 0.001, "rot90 diag");
+                }
+                // rot 180: (img_x, img_y) → (-s*img_x, -s*img_y )
+                180 => {
+                    assert!((a.m11 + s).abs() < 0.001 && (a.m22 + s).abs() < 0.001, "rot180");
+                    assert!(a.m12.abs() < 0.001 && a.m21.abs() < 0.001, "rot180 off-diag");
+                }
+                // rot 270: (img_x, img_y) → (-s*img_y,  s*img_x )
+                270 => {
+                    assert!((a.m12 + s).abs() < 0.001 && (a.m21 - s).abs() < 0.001, "rot270");
+                    assert!(a.m11.abs() < 0.001 && a.m22.abs() < 0.001, "rot270 diag");
+                }
+                _ => unreachable!(),
+            }
+            // And the centre must still land on (dx, dy) at each cardinal.
+            let sx = a.m11 * (bw * 0.5) + a.m12 * (bh * 0.5) + a.dx;
+            let sy = a.m21 * (bw * 0.5) + a.m22 * (bh * 0.5) + a.dy;
+            assert!((sx - dx).abs() < 0.01 && (sy - dy).abs() < 0.01, "rot={deg} centre");
+        }
     }
 }

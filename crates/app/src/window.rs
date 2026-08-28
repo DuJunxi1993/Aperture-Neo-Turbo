@@ -1105,6 +1105,11 @@ let window = event_loop.create_window(
             coordinator.poll();
         }
 
+        // Advance the rotation animation (spin to the target quadrant).
+        if let Some(viewer) = &self.viewer {
+            viewer.lock().tick_rotation();
+        }
+
         // Held-arrow-key dispatcher. Fires one navigation per
         // ~200 ms while the user holds an arrow key, and stops
         // immediately on KEYUP (the KEYUP handler clears
