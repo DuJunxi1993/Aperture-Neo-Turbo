@@ -290,10 +290,10 @@ impl Direct2DViewer {
     /// Separate from [`Self::display_transform`] so unit tests can verify
     /// the centre-anchor invariant without a wgpu DecodedGpuImage.
     ///
-    /// Rotation is CLOCKWISE on screen (the existing quadrant convention:
-    /// rot 1 = 90° CW maps (img_x, img_y) → (s*img_y, -s*img_x)). With a
-    /// top-left-origin display (y grows downward), a clockwise visual
-    /// rotation is the matrix `[[cos, sin],[-sin, cos]]`.
+    /// Rotation is CLOCKWISE on screen (matching the rotate button). With a
+    /// top-left-origin display (y grows downward) a clockwise visual
+    /// rotation is the matrix `[[cos, -sin],[sin, cos]]` — at 90° the top
+    /// edge swings right, the right edge swings down, etc.
     fn affine_for_size(
         bw: f32, bh: f32, rot_deg: f32, dx: f32, dy: f32, s: f32,
     ) -> AffineTransform {
@@ -301,12 +301,12 @@ impl Direct2DViewer {
         let (cos, sin) = (theta.cos(), theta.sin());
         // Rotate the image centre (bw/2, bh/2) about the origin with the
         // clockwise matrix; translate so that point lands at (dx, dy).
-        let cx = dx - s * (cos * bw * 0.5 + sin * bh * 0.5);
-        let cy = dy - s * (-sin * bw * 0.5 + cos * bh * 0.5);
+        let cx = dx - s * (cos * bw * 0.5 - sin * bh * 0.5);
+        let cy = dy - s * (sin * bw * 0.5 + cos * bh * 0.5);
         AffineTransform {
             m11: s * cos,
-            m12: s * sin,
-            m21: -s * sin,
+            m12: -s * sin,
+            m21: s * sin,
             m22: s * cos,
             dx: cx,
             dy: cy,
@@ -864,9 +864,9 @@ mod tests {
         }
     }
 
-    /// Phase 5: at the four cardinals the affine must agree with the old
-    /// hard-coded quadrant matrices (0/90/180/270) so existing perception
-    /// of rotation direction is preserved.
+    /// Phase 5: at the four cardinals the affine matches a clockwise
+    /// rotation (matching the rotate button). rot 90 maps
+    /// (img_x, img_y) → (-s*img_y, s*img_x); rot 270 is the inverse.
     #[test]
     fn rotation_cardinals_match_quadrant_matrices() {
         let (bw, bh) = (200.0_f32, 100.0_f32);
@@ -880,19 +880,19 @@ mod tests {
                     assert!((a.m11 - s).abs() < 0.001 && (a.m22 - s).abs() < 0.001, "rot0");
                     assert!(a.m12.abs() < 0.001 && a.m21.abs() < 0.001, "rot0 off-diag");
                 }
-                // rot 90: (img_x, img_y) → ( s*img_y, -s*img_x )
+                // rot 90 (CW): (img_x, img_y) → (-s*img_y, s*img_x)
                 90 => {
-                    assert!((a.m12 - s).abs() < 0.001 && (a.m21 + s).abs() < 0.001, "rot90");
+                    assert!((a.m21 - s).abs() < 0.001 && (a.m12 + s).abs() < 0.001, "rot90");
                     assert!(a.m11.abs() < 0.001 && a.m22.abs() < 0.001, "rot90 diag");
                 }
-                // rot 180: (img_x, img_y) → (-s*img_x, -s*img_y )
+                // rot 180: (img_x, img_y) → (-s*img_x, -s*img_y)
                 180 => {
                     assert!((a.m11 + s).abs() < 0.001 && (a.m22 + s).abs() < 0.001, "rot180");
                     assert!(a.m12.abs() < 0.001 && a.m21.abs() < 0.001, "rot180 off-diag");
                 }
-                // rot 270: (img_x, img_y) → (-s*img_y,  s*img_x )
+                // rot 270 (CW): (img_x, img_y) → (s*img_y, -s*img_x)
                 270 => {
-                    assert!((a.m12 + s).abs() < 0.001 && (a.m21 - s).abs() < 0.001, "rot270");
+                    assert!((a.m12 - s).abs() < 0.001 && (a.m21 + s).abs() < 0.001, "rot270");
                     assert!(a.m11.abs() < 0.001 && a.m22.abs() < 0.001, "rot270 diag");
                 }
                 _ => unreachable!(),
