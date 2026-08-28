@@ -31,7 +31,7 @@ use aperture_core::{
     NavigationService, NavigationDirection,
     SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
-use aperture_gpu::{Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir, ImageQuadUniforms, DecodedGpuImage};
+use aperture_gpu::{Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir};
 use crate::event_router::{self, RouterState};
 
 /// Phase 16: custom winit event that pops a native right-click
@@ -1753,26 +1753,84 @@ let window = event_loop.create_window(
         // Capture everything we need from self before locking
         // (Rust's borrow checker is conservative about reentrancy
         // through self).
-        let image_quad_args: Option<(
-            ImageQuadUniforms,
-            std::sync::Arc<DecodedGpuImage>,
-            i32, i32, u32, u32,
-        )> = match (central_rect_phys, self.viewer.as_ref()) {
+        // 6-tuple = (uniforms, gpu_image, vx, vy, vw, vh)
+        type QuadArgs = (aperture_gpu::ImageQuadUniforms, std::sync::Arc<aperture_gpu::DecodedGpuImage>, i32, i32, u32, u32);
+        let image_quad_args: Option<(QuadArgs, Option<QuadArgs>)> = match (central_rect_phys, self.viewer.as_ref()) {
             (Some(rect), Some(viewer)) => {
                 let viewer_locked = viewer.lock();
-                viewer_locked.current_gpu.as_ref().map(|img| {
+                let cur = viewer_locked.current_gpu.as_ref().map(|img| {
                     let uniforms = viewer_locked.gpu_uniforms(
                         (rect.0 as f32, rect.1 as f32),
                         (rect.2 as f32, rect.3 as f32),
                         pal_bg,
                     );
                     (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
-                })
+                });
+                let prev = if viewer_locked.animator.is_sliding() {
+                    viewer_locked.previous_gpu.as_ref().map(|img| {
+                        let uniforms = viewer_locked.gpu_uniforms_for(
+                            (rect.0 as f32, rect.1 as f32),
+                            (rect.2 as f32, rect.3 as f32),
+                            pal_bg,
+                            true, // previous_gpu
+                        );
+                        (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
+                    })
+                } else {
+                    None
+                };
+                drop(viewer_locked);
+                cur.map(|c| (c, prev))
             }
             _ => None,
         };
-        if let Some((uniforms, gpu_image, vx, vy, vw, vh)) = image_quad_args {
-            wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, &uniforms);
+        // Draw the previous (outgoing) image first, then the current
+        // (incoming) image. Both use `LoadOp::Load` so they composite
+        // over the egui chrome and each other via `ALPHA_BLENDING`.
+        // Drawing outgoing before incoming means the slide appears
+        // to glide: outgoing slides out, incoming slides in. When
+        // `previous` is None (no active slide) only the current
+        // pass runs and the layout is identical to the pre-Tier-1 path.
+        if let Some(((p_uni, p_img, pvx, pvy, pvw, pvh), cur)) = image_quad_args.as_ref() {
+            if p_uni.has_image == 1 {
+                let pvx = *pvx; let pvy = *pvy; let pvw = *pvw; let pvh = *pvh;
+                wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, p_uni);
+                let bg = wgpu_state.image_quad.create_bind_group(
+                    &wgpu_state.device,
+                    &p_img.view,
+                );
+                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("image_quad_prev"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                });
+                rpass.set_scissor_rect(
+                    pvx.max(0) as u32,
+                    pvy.max(0) as u32,
+                    pvw,
+                    pvh,
+                );
+                rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
+                rpass.set_bind_group(0, &bg, &[]);
+                rpass.draw(0..3, 0..1);
+                drop(rpass);
+            }
+            // (cur is always Some if prev was checked — see match above)
+            let _ = cur;
+        }
+        if let Some((cur, _prev)) = image_quad_args.as_ref() {
+            let (uniforms, gpu_image, vx, vy, vw, vh) = cur;
+            let vx = *vx; let vy = *vy; let vw = *vw; let vh = *vh;
+            wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, uniforms);
             let bind_group = wgpu_state.image_quad.create_bind_group(
                 &wgpu_state.device,
                 &gpu_image.view,

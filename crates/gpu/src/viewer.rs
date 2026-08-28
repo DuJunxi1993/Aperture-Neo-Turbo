@@ -78,13 +78,48 @@ impl Direct2DViewer {
         self.compute_fit();
     }
 
+    /// Build the image-quad uniform for either the current image
+    /// (`for_previous = false`) or the outgoing previous image
+    /// (`for_previous = true`). When `previous_gpu` is None the call
+    /// still succeeds but `has_image = 0`, so the render pass can be
+    /// skipped in `submit_wgpu_frame`.
+    ///
+    /// The affine comes from three sources, in priority order:
+    /// 1. `current_rect_anim_transform` — fullscreen / fit-zoom /
+    ///    rotation target glide. Wins over the slide animation.
+    /// 2. `animator.current_transform` — only meaningful during a
+    ///    slide. For the current image this is the incoming slide
+    ///    (offset+shift); for the previous image we apply the same
+    ///    shift but anchored at the previous image's prior fit
+    ///    position so the two images move in opposite directions
+    ///    across the viewer rect.
+    /// 3. `display_transform(offset, offset_y, zoom)` — the static
+    ///    fit, including rotation.
+    ///
+    /// The shader samples with screen→image, so we invert the
+    /// image→screen affine returned by those helpers.
     pub fn gpu_uniforms(
         &self,
         viewer_rect_min: (f32, f32),
         viewer_rect_size: (f32, f32),
         bg: [f32; 3],
     ) -> crate::ImageQuadUniforms {
-        let (img_w, img_h) = match &self.current_gpu {
+        self.gpu_uniforms_for(viewer_rect_min, viewer_rect_size, bg, false)
+    }
+
+    pub fn gpu_uniforms_for(
+        &self,
+        viewer_rect_min: (f32, f32),
+        viewer_rect_size: (f32, f32),
+        bg: [f32; 3],
+        for_previous: bool,
+    ) -> crate::ImageQuadUniforms {
+        let img_ref = if for_previous {
+            self.previous_gpu.as_ref()
+        } else {
+            self.current_gpu.as_ref()
+        };
+        let (img_w, img_h) = match img_ref {
             Some(img) => (img.width as f32, img.height as f32),
             None => {
                 return crate::ImageQuadUniforms {
@@ -105,16 +140,62 @@ impl Direct2DViewer {
             }
         };
 
-        let s = self.zoom;
-        let ox = self.offset_x;
-        let oy = self.offset_y;
-        let inv_s = if s > 0.0 { 1.0 / s } else { 1.0 };
+        // 1. Rect-anim (fullscreen / fit-glide) wins outright.
+        // 2. Slide animator: current image uses slide-in (offset+shift);
+        //    previous image uses the same shift but anchored at its
+        //    own previous fit position so the two move in opposite
+        //    directions across the viewer rect.
+        // 3. Static fit (with rotation handled by display_transform).
+        let (m11, m12, m21, m22, dx, dy) = if let Some(t) = self.current_rect_anim_transform() {
+            (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
+        } else if self.animator.is_sliding() {
+            let (ew, _eh) = self.effective_size();
+            let slide = self.animator.current_transform(
+                self.zoom, self.offset_x, self.offset_y,
+                self.fit_scale, self.slide_dir, ew,
+            );
+            if for_previous {
+                // Previous image: reverse the slide direction so the
+                // outgoing image moves opposite the incoming one.
+                let dir = match self.slide_dir {
+                    crate::viewer::SlideDir::Next => -1.0,
+                    crate::viewer::SlideDir::Previous => 1.0,
+                    crate::viewer::SlideDir::None => 0.0,
+                };
+                let vw = self.viewport_w as f32;
+                let shift = dir * vw * (1.0 - slide.m11.max(0.0).min(1.0));
+                // Place previous at its prior fit (offset,offset_y) and
+                // shift by `shift` in the OPPOSITE direction of the
+                // incoming slide. `current_transform`'s base is
+                // `offset_x` so the inverse direction is `offset_x
+                // - shift*sign(incoming)`. We just override dx.
+                (slide.m11, slide.m12, slide.m21, slide.m22,
+                 self.offset_x - shift, slide.dy)
+            } else {
+                (slide.m11, slide.m12, slide.m21, slide.m22, slide.dx, slide.dy)
+            }
+        } else {
+            let t = self.display_transform(self.offset_x, self.offset_y, self.zoom);
+            (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
+        };
+
+        // Invert the 2×2 affine in homogeneous coords. For rotation by
+        // multiples of 90° + uniform scale, det(m11*m22 - m12*m21) is
+        // `s*s` — always positive — so the inverse is well-behaved.
+        let det = m11 * m22 - m12 * m21;
+        let inv_det = if det.abs() > 1e-6 { 1.0 / det } else { 0.0 };
+        let im11 =  m22 * inv_det;
+        let im12 = -m12 * inv_det;
+        let im21 = -m21 * inv_det;
+        let im22 =  m11 * inv_det;
+        let idx = -(im11 * dx + im12 * dy);
+        let idy = -(im21 * dx + im22 * dy);
         crate::ImageQuadUniforms {
-            col0: [inv_s, 0.0, 0.0],
+            col0: [im11, im21, 0.0],
             _pad_col0: 0,
-            col1: [0.0, inv_s, 0.0],
+            col1: [im12, im22, 0.0],
             _pad_col1: 0,
-            col2: [-ox * inv_s, -oy * inv_s, 1.0],
+            col2: [idx, idy, 1.0],
             _pad_col2: 0,
             viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
             viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
@@ -417,11 +498,64 @@ impl Direct2DViewer {
     pub fn rotation(&self) -> u8 { self.rotation }
 
     pub fn set_rotation(&mut self, q: u8) {
+        let prev = self.rotation;
         self.rotation = q & 3;
-        self.rect_anim = None;
-        self.pending_viewport_anim_from = None;
-        self.pending_viewport_target = None;
+        if prev == self.rotation {
+            return;
+        }
+        // Capture the current on-screen image rect (in viewer coords)
+        // as the animation FROM. compute_fit will recompute the new
+        // fit for the new rotation; the rect-anim will then glide
+        // from this captured rect to the new one.
+        let (ew, eh) = self.effective_size_for(prev);
+        let from = (
+            self.offset_x,
+            self.offset_y,
+            ew * self.zoom,
+            eh * self.zoom,
+        );
         self.compute_fit();
+        if self.current_gpu.is_some() {
+            let (ew2, eh2) = self.effective_size();
+            let target = (
+                self.offset_x,
+                self.offset_y,
+                ew2 * self.zoom,
+                eh2 * self.zoom,
+            );
+            self.start_rect_anim_with(target, 0.32, from);
+        }
+    }
+
+    /// Same as `start_rect_anim` but with a custom duration.
+    pub fn start_rect_anim_with(
+        &mut self,
+        target: (f32, f32, f32, f32),
+        dur: f32,
+        from: (f32, f32, f32, f32),
+    ) {
+        if self.current_gpu.is_none() {
+            return;
+        }
+        self.rect_anim = Some(RectAnim {
+            from,
+            to: target,
+            start: std::time::Instant::now(),
+            dur,
+            window_space: false,
+        });
+    }
+
+    /// effective_size with an explicit rotation (used to capture the
+    /// pre-rotation image rect before compute_fit overwrites the field).
+    fn effective_size_for(&self, rot: u8) -> (f32, f32) {
+        match &self.current_gpu {
+            Some(img) => {
+                let (w, h) = (img.width as f32, img.height as f32);
+                if rot % 2 == 1 { (h, w) } else { (w, h) }
+            }
+            None => (0.0, 0.0),
+        }
     }
 
     pub fn is_fit_scale(&self) -> bool {
