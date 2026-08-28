@@ -3599,6 +3599,10 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                             // Ctrl+/ → Toggle shortcut help
                             self.actions.push(UiAction::ToggleShortcutHelp);
                         }
+                        KeyCode::KeyR if ctrl_pressed => {
+                            // Ctrl+R → rotate clockwise
+                            self.actions.push(UiAction::RotateImage(1));
+                        }
                         _ => consumed = false,
                     }
                     if consumed {
