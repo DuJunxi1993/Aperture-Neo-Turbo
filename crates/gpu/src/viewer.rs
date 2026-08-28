@@ -8,6 +8,24 @@ use std::sync::Arc;
 use crate::texture::DecodedGpuImage;
 use crate::animator::{Animator, AffineTransform};
 
+/// Minimum zoom factor (as a fraction of original image size). The
+/// previous hard-coded `0.5` caused a counterintuitive bump-up when the
+/// window was small enough that fit-to-screen produced a scale below
+/// 0.5: pressing zoom-out would *increase* the displayed size before
+/// letting the user shrink the image. Lowered to 0.05 (5 %) so the
+/// user can always shrink to thumbnail overview without that bump.
+const MIN_ZOOM: f32 = 0.05;
+/// Maximum zoom factor (as a fraction of original image size).
+const MAX_ZOOM: f32 = 5.0;
+
+/// Pixel slack past the viewport edge when a larger-than-viewport
+/// image is dragged past its natural wall. Both walls of `clamp_pan`
+/// use the same overshoot so left/right (and top/bottom) drag
+/// distances are symmetric — the previous code had `vw - 40` for the
+/// right wall and `vw - w + 40` for the left wall, which let the user
+/// drag much further to the right than to the left.
+const PAN_OVERSHOOT_PX: f32 = 40.0;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlideDir {
     None,
@@ -217,6 +235,16 @@ impl Direct2DViewer {
         }
     }
 
+    /// Build the image→screen affine with the rotation centred on the
+    /// image itself. `dx, dy` is the viewer-space position of the
+    /// IMAGE CENTRE, not the top-left — the previous version used the
+    /// top-left and added `±sh / ±sw` per rotation quadrant, which
+    /// shifts the rotation origin off-image at 90°/270° (the image
+    /// visibly drifted out of the viewer).
+    ///
+    /// The shader inverts this to screen→image; with image centre
+    /// mapped to viewer centre, rotation 0/90/180/270 all keep the
+    /// centre pinned to (0.5, 0.5) → screen centre.
     pub fn display_transform(&self, dx: f32, dy: f32, s: f32) -> AffineTransform {
         let (bw, bh) = match &self.current_gpu {
             Some(img) => (img.width as f32, img.height as f32),
@@ -224,11 +252,17 @@ impl Direct2DViewer {
         };
         let sw = bw * s;
         let sh = bh * s;
+        // Subtract half the displayed size so (dx, dy) is the IMAGE
+        // CENTRE rather than its top-left. Undo with `0.5*(m11+m12)`
+        // and `0.5*(m21+m22)` (the centre of the 1-unit col matrix) at
+        // matrix-build time.
+        let cx = dx - sw * 0.5;
+        let cy = dy - sh * 0.5;
         match self.rotation {
-            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: dx + sh, dy },
-            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: dx + sw, dy: dy + sh },
-            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx, dy: dy + sw },
-            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx, dy },
+            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: cx + sh, dy: cy },
+            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: cx + sw, dy: cy + sh },
+            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx: cx, dy: cy + sw },
+            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx: cx, dy: cy },
         }
     }
 
@@ -254,7 +288,7 @@ impl Direct2DViewer {
 
     pub fn on_wheel(&mut self, delta: i32, cursor_x: f32, cursor_y: f32) {
         let zoom_factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
-        let new_zoom = (self.zoom * zoom_factor).clamp(0.5, 5.0);
+        let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let cursor_rel_x = cursor_x - self.offset_x;
         let cursor_rel_y = cursor_y - self.offset_y;
         self.offset_x = cursor_x - cursor_rel_x * (new_zoom / self.zoom);
@@ -265,7 +299,7 @@ impl Direct2DViewer {
     }
 
     pub fn zoom_step(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(0.5, 5.0);
+        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
         let cx = self.viewport_w as f32 * 0.5;
         let cy = self.viewport_h as f32 * 0.5;
         let rel_x = cx - self.offset_x;
@@ -283,6 +317,23 @@ impl Direct2DViewer {
         self.rect_anim = None;
     }
 
+    /// Clamp pan offsets to keep the image inside the viewport with a
+    /// symmetric `PAN_OVERSHOOT_PX` of slack past each viewport edge.
+    ///
+    /// Symmetry convention (when `w > vw`, image bigger than viewport):
+    ///   - LEFT  wall: image's RIGHT edge is `PAN_OVERSHOOT_PX` past
+    ///     viewport's RIGHT edge. Offset = `vw - w + PAN_OVERSHOOT_PX`.
+    ///   - RIGHT wall: image's LEFT  edge is `PAN_OVERSHOOT_PX` past
+    ///     viewport's LEFT  edge. Offset = `-PAN_OVERSHOOT_PX`.
+    ///
+    /// The previous version used `vw - 40` for the right wall, which
+    /// let the user push the image almost fully off the right side
+    /// (only a 40-px sliver of the image's left edge remained visible),
+    /// while the left wall kept the image mostly inside with just a
+    /// 40-px overflow past the right edge. Equal-and-opposite fix:
+    /// both walls now use the same "40 px past the far edge" rule,
+    /// so drag distance from the centred position is the same in
+    /// every direction.
     fn clamp_pan(&mut self) {
         let Some(img) = &self.current_gpu else { return };
         let (ew, eh) = if self.rotation % 2 == 1 {
@@ -292,17 +343,23 @@ impl Direct2DViewer {
         };
         let w = ew * self.zoom;
         let h = eh * self.zoom;
-        let vw = self.viewport_w as f32;
-        let vh = self.viewport_h as f32;
+        self.clamp_pan_to(w, h, self.viewport_w as f32, self.viewport_h as f32);
+    }
+
+    /// Clamp pan offsets to the given image/viewport sizes without
+    /// needing a real `current_gpu`. Pure logic, used both by the
+    /// public `clamp_pan` and by unit tests.
+    fn clamp_pan_to(&mut self, w: f32, h: f32, vw: f32, vh: f32) {
+        let overshoot = PAN_OVERSHOOT_PX;
         self.offset_x = if w <= vw {
             (vw - w) * 0.5
         } else {
-            self.offset_x.clamp(vw - w + 40.0, vw - 40.0)
+            self.offset_x.clamp(vw - w + overshoot, -overshoot)
         };
         self.offset_y = if h <= vh {
             (vh - h) * 0.5
         } else {
-            self.offset_y.clamp(vh - h + 40.0, vh - 40.0)
+            self.offset_y.clamp(vh - h + overshoot, -overshoot)
         };
     }
 
@@ -560,5 +617,98 @@ impl Direct2DViewer {
 
     pub fn is_fit_scale(&self) -> bool {
         (self.zoom - self.fit_scale).abs() < 0.01
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Bug G regression: clamp_pan_to must give the same drag distance
+    /// from the centred position in both directions when the image is
+    /// bigger than the viewport. Previous code put the right wall at
+    /// `vw - 40` and the left wall at `vw - w + 40`, so right drag
+    /// was much longer than left drag.
+    #[test]
+    fn pan_walls_are_symmetric_when_image_bigger_than_viewport() {
+        // 1000x1000 image, 500x500 viewport, 1x zoom → w > vw.
+        let mut v = Direct2DViewer::new(500, 500);
+        // Centred start.
+        v.offset_x = (500.0_f32 - 1000.0) * 0.5; // = -250
+        v.offset_y = 0.0;
+        let centre = v.offset_x;
+
+        // Drag WAY past the left wall.
+        v.offset_x -= 10_000.0;
+        v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
+        let left_wall = v.offset_x;
+
+        // Reset and drag WAY past the right wall.
+        let mut v = Direct2DViewer::new(500, 500);
+        v.offset_x = centre;
+        v.offset_x += 10_000.0;
+        v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
+        let right_wall = v.offset_x;
+
+        let left_distance = centre - left_wall;
+        let right_distance = right_wall - centre;
+        assert!(
+            (left_distance - right_distance).abs() < 0.5,
+            "left_distance={left_distance}, right_distance={right_distance} — clamp_pan_to is asymmetric"
+        );
+
+        // Both walls leave the image mostly inside the viewport
+        // (PAN_OVERSHOOT_PX past the FAR edge), symmetric in rule.
+        let overshoot = PAN_OVERSHOOT_PX;
+        // LEFT wall (image's right edge is 40 px past viewport's right).
+        let expected_left = 500.0_f32 - 1000.0 + overshoot;
+        assert!(
+            (left_wall - expected_left).abs() < 0.5,
+            "left_wall={left_wall}, expected={expected_left}"
+        );
+        // RIGHT wall (image's left edge is 40 px past viewport's left).
+        assert!(
+            (right_wall - (-overshoot)).abs() < 0.5,
+            "right_wall={right_wall}, expected={}",
+            -overshoot
+        );
+    }
+
+    /// When the image is SMALLER than the viewport, the offset
+    /// should snap to centred (not follow whatever stale value was in
+    /// `offset_x`).
+    #[test]
+    fn pan_centre_when_image_smaller_than_viewport() {
+        let mut v = Direct2DViewer::new(800, 800);
+        v.offset_x = 999.0;
+        v.offset_y = 999.0;
+        v.clamp_pan_to(200.0, 200.0, 800.0, 800.0);
+        // image (200) < viewport (800) → centred: (800-200)/2 = 300.
+        assert!((v.offset_x - 300.0).abs() < 0.001);
+        assert!((v.offset_y - 300.0).abs() < 0.001);
+    }
+
+    /// Y-axis symmetric clamp (top/bottom drag should match).
+    #[test]
+    fn pan_walls_are_symmetric_on_y_axis() {
+        let mut v = Direct2DViewer::new(500, 500);
+        v.offset_y = (500.0_f32 - 1000.0) * 0.5; // centred
+        v.offset_y -= 10_000.0;
+        v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
+        let bottom_wall = v.offset_y;
+
+        let mut v = Direct2DViewer::new(500, 500);
+        v.offset_y = (500.0_f32 - 1000.0) * 0.5;
+        v.offset_y += 10_000.0;
+        v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
+        let top_wall = v.offset_y;
+
+        let centre = (500.0_f32 - 1000.0) * 0.5;
+        let bottom_distance = centre - bottom_wall;
+        let top_distance = top_wall - centre;
+        assert!(
+            (bottom_distance - top_distance).abs() < 0.5,
+            "bottom_distance={bottom_distance}, top_distance={top_distance}"
+        );
     }
 }
