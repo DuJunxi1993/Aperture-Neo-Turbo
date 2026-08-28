@@ -860,29 +860,6 @@ let window = event_loop.create_window(
         self.viewer_rect_with_widths(win_w, win_h, tree_w, thumb_w)
     }
 
-    /// Phase 11: the viewer rect after the panel animations SETTLE —
-    /// uses the panels' user widths instead of the mid-flight `anim`
-    /// values. Used to compute the fullscreen animation target in
-    /// window coords so the image glides to where it will actually
-    /// end up, independent of the panels' collapse/expand tween.
-    fn compute_final_viewer_rect(&self, win_w: u32, win_h: u32) -> (i32, i32, u32, u32) {
-        if self.is_fullscreen {
-            // Chrome hidden: the viewer covers the whole window.
-            return (0, 0, win_w, win_h);
-        }
-        let tree_w = if self.show_tree {
-            self.tree_panel.user_width.max(self.tree_panel.content_min).round() as u32
-        } else {
-            0
-        };
-        let thumb_w = if self.show_thumbs {
-            self.thumb_panel.user_width.max(self.thumb_panel.content_min).round() as u32
-        } else {
-            0
-        };
-        self.viewer_rect_with_widths(win_w, win_h, tree_w, thumb_w)
-    }
-
     fn viewer_rect_with_widths(
         &self, win_w: u32, win_h: u32, tree_w: u32, thumb_w: u32,
     ) -> (i32, i32, u32, u32) {
@@ -1423,25 +1400,26 @@ let window = event_loop.create_window(
         // twice would let the second SetWindowRgn overwrite the first).
         if self.show_shortcut_help {
             let anchor = HELP_ANCHOR.with(|c| c.get());
-            let screen = egui_state.ctx.input(|i| i.screen_rect);
-            // Phase 9 fix: anchor BELOW the top-bar "?" button,
-            // right-aligned (pivot RIGHT_TOP extends the window
-            // left+down from the anchor). The previous
-            // RIGHT_BOTTOM pivot at (right+8, top-8) expanded the
-            // window UP across the title bar, covering the very
-            // button that opened it.
-            let anchor_pos = if anchor.any_nan() || anchor == egui::Rect::NOTHING {
-                // Fallback: below the title bar's right side.
-                egui::pos2(
-                    screen.right() - 60.0,
-                    TOOLBAR_HEIGHT as f32 + 8.0,
-                )
-            } else {
-                egui::pos2(anchor.right() + 4.0, anchor.bottom() + 6.0)
-            };
+            // Place the popover to the LEFT of the `?` button, aligned
+            // with the top bar (y ≈ TOOLBAR_HEIGHT). This puts the
+            // popover above the CentralPanel and the image-quad pass,
+            // so neither covers it. The previous anchor.right() + 4 /
+            // anchor.bottom() + 6 placed it inside the bottom status
+            // bar — visually behind the canvas_clear grey that frames
+            // the viewer when the image isn't edge-to-edge.
+            let anchor_pos = egui::pos2(
+                anchor.left() - 280.0,         // popup width estimate
+                (TOOLBAR_HEIGHT as f32) + 6.0,
+            );
             let help_resp = egui::Window::new(
                 egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
             )
+            // .order(...) puts this above the egui CentralPanel so the
+            // image-quad's wgpu pass — which renders AFTER egui in
+            // submit_wgpu_frame — doesn't visually cover the popover
+            // when it overlaps the viewer rect. egui::Order::Tooltip is
+            // the highest available layer.
+            .order(egui::Order::Tooltip)
             // No default shadow/fill — the gray halo around the window
             // read as a stray background block on both themes.
             .frame(
@@ -2987,11 +2965,27 @@ let window = event_loop.create_window(
         // The image's path is then independent of the tree/thumb
         // collapse animation — the viewport churns underneath while
         // the image glides straight to its settled position.
+        //
+        // The previous code called `set_viewport_target` which feeds
+        // a `pending_viewport_target` consumed by `viewer.resize()`.
+        // But `resize` ALSO calls `compute_fit()` immediately, which
+        // clobbers the rect_anim's `from` state. The image therefore
+        // teleports instead of animating, and the post-fit position
+        // is computed against the still-narrow window before the
+        // OS finishes maximising it. Phase 0 fix: synchronously
+        // write the new viewport + re-fit, leaving the rect_anim
+        // path animation for Tier 1.
         let size = window.inner_size();
-        let (fx, fy, fw, fh) = self.compute_final_viewer_rect(size.width, size.height);
-        if let Some(v) = &self.viewer {
-            let target = v.lock().window_target_for_viewport(fx as f32, fy as f32, fw, fh);
-            v.lock().set_viewport_target(target);
+        if self.is_fullscreen {
+            if let Some(v) = &self.viewer {
+                v.lock().set_viewport_physical(size.width, size.height, 0.0, 0.0);
+                v.lock().fit_to_screen();
+            }
+        } else if let Some(v) = &self.viewer {
+            // Exit: re-fit into the now-restored windowed viewport. The
+            // next build_egui_ui will call set_viewport_physical with
+            // the real (now restored) egui CentralPanel size.
+            v.lock().fit_to_screen();
         }
     }
 
@@ -3621,9 +3615,41 @@ impl ApplicationHandler<AppMessage> for MainWindow {
             }
         }
 
-        // ---- Wheel over the viewer area → image zoom ----
+        // ---- Wheel: route to tree/thumb scroll OR viewer zoom ----
+        // Phase X: tree panel and thumb panel each contain an
+        // egui::ScrollArea. Without this check, every wheel event is
+        // consumed by the viewer zoom handler and the panels become
+        // un-scrollable.
         if let WindowEvent::MouseWheel { delta, .. } = &event {
             let cursor = self.router.cursor_pos;
+            let (tx, ty, tw, th) = self.tree_rect_phys;
+            let (hx, hy, hw, hh) = self.thumb_rect_phys;
+            let in_tree = self.show_tree
+                && tw > 0.0 && th > 0.0
+                && cursor.x >= tx && cursor.x <= tx + tw
+                && cursor.y >= ty && cursor.y <= ty + th;
+            let in_thumbs = self.show_thumbs
+                && hw > 0.0 && hh > 0.0
+                && cursor.x >= hx && cursor.x <= hx + hw
+                && cursor.y >= hy && cursor.y <= hy + hh;
+            if in_tree || in_thumbs {
+                // Re-emit the wheel event into egui so its ScrollArea
+                // (inside the tree/thumb closure) consumes it.
+                if let Some(es) = self.egui_state.as_ref() {
+                    es.ctx.input_mut(|i| {
+                        i.events.push(egui::Event::MouseWheel {
+                            unit: egui::MouseWheelUnit::Point,
+                            delta: match delta {
+                                MouseScrollDelta::LineDelta(_, y) => egui::Vec2::new(0.0, *y * 24.0),
+                                MouseScrollDelta::PixelDelta(p) => egui::Vec2::new(p.x as f32, p.y as f32),
+                            },
+                            modifiers: i.modifiers,
+                        });
+                    });
+                    es.ctx.request_repaint();
+                }
+                return;
+            }
             let dy = match delta {
                 MouseScrollDelta::LineDelta(_, y) => *y,
                 MouseScrollDelta::PixelDelta(p) => p.y as f32 / 100.0,

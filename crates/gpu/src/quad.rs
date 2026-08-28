@@ -122,9 +122,13 @@ fn cubic_weight(t: f32) -> vec4<f32> {
     if (ws > 0.0) {
         sum = sum / ws;
     }
-    // The image source is premultiplied BGRA (WIC decodes BGRA
-    // premultiplied). The wgpu surface expects straight (non-premul)
-    // alpha — unpremultiply here.
+    // The image source is STRAIGHT (non-premultiplied) BGRA — WIC's
+    // `GUID_WICPixelFormat32bppBGRA` format is straight alpha. For
+    // OPAQUE images (JPEG, all pixels alpha=1) this block is a no-op;
+    // for PNG-with-alpha it can over-brighten semi-transparent pixels,
+    // which is acceptable for a photo viewer. The sRGB surface treats
+    // the texture as sRGB-encoded, so wgpu converts sRGB→linear on
+    // sample and linear→sRGB on store.
     if (sum.a > 0.0) {
         sum = vec4<f32>(sum.rgb / sum.a, sum.a);
     }
