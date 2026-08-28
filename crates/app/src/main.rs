@@ -47,10 +47,10 @@ fn main() -> Result<()> {
         None => window::LaunchTarget::None,
     };
 
-    let event_loop = winit::event_loop::EventLoop::<window::AppMessage>::with_user_event().build()?;
+    let event_loop = winit::event_loop::EventLoop::new()?;
     event_loop.set_control_flow(winit::event_loop::ControlFlow::Poll);
 
-    let mut app = window::MainWindow::new(target, event_loop.create_proxy());
+    let mut app = window::MainWindow::new(target);
     event_loop.run_app(&mut app)?;
 
     Ok(())

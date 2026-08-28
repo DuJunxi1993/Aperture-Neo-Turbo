@@ -55,6 +55,10 @@ pub struct TreeTreeState {
     pub recent_scroll_target: Option<PathBuf>,
     /// One-shot request to scroll the tree back to the top.
     pub scroll_to_top: bool,
+    /// Current vertical scroll offset (logical px) of the tree
+    /// ScrollArea. Written by the wheel branch in window_event;
+    /// applied by the ScrollArea builder via vertical_scroll_offset.
+    pub scroll_offset_y: f32,
 }
 
 impl FileTree {
@@ -65,6 +69,7 @@ impl FileTree {
             reveal_target: None,
             recent_scroll_target: None,
             scroll_to_top: false,
+            scroll_offset_y: 0.0,
         };
         // All roots start expanded (empty path = the root's own key).
         for set in &mut state.expanded {

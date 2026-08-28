@@ -18,7 +18,7 @@ use parking_lot::Mutex;
 use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalPosition, LogicalSize};
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
-use winit::event_loop::{ActiveEventLoop, EventLoopProxy};
+use winit::event_loop::ActiveEventLoop;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowAttributes, WindowId};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
@@ -37,28 +37,29 @@ use crate::event_router::{self, RouterState};
 /// Phase 16: custom winit event that pops a native right-click
 /// TrackPopupMenu OUTSIDE the MouseInput handler. Popping a modal
 /// TrackPopupMenu synchronously inside the winit window_event callback
-/// conflicts with winit's own message pump (the popup's modal loop
-/// re-enters winit and the menu fails to appear), so the right-click
-/// handler records an intent and we post this event; `user_event` shows
-/// the menu in a clean context.
-#[derive(Debug, Clone)]
-pub enum AppMessage {
-    ShowImageMenu { pos_phys: (i32, i32) },
-    ShowTreeMenu {
-        pos_phys: (i32, i32),
-        path: PathBuf,
-        root_idx: usize,
-        is_favorite: bool,
-    },
-}
-
-/// Captured by the tree right-click handler, consumed when the native
-/// menu is shown.
+/// Captured by the tree right-click handler when the user right-clicks
+/// a folder in the tree; consumed when the egui context menu is shown
+/// inside `build_egui_ui`. The egui closure can't open the menu itself
+/// (would need `&mut self` while the frame holds it), so it writes this
+/// intent and the post-frame loop opens the popup.
 #[derive(Debug, Clone)]
 pub struct TreeCtxIntent {
     pub pos_phys: (i32, i32),
     pub path: PathBuf,
     pub root_idx: usize,
+}
+
+/// An open egui-drawn right-click context menu.
+enum CtxMenu {
+    /// Right-click on the viewer image.
+    Image { pos: egui::Pos2 },
+    /// Right-click on a folder in the tree.
+    Tree {
+        pos: egui::Pos2,
+        path: PathBuf,
+        root_idx: usize,
+        is_favorite: bool,
+    },
 }
 const TREE_WIDTH: u32 = 240;
 const THUMB_WIDTH: u32 = 220;
@@ -143,6 +144,10 @@ enum UiAction {
 // anchors directly above it.
 thread_local! {
     static HELP_ANCHOR: std::cell::Cell<egui::Rect> = const { std::cell::Cell::new(egui::Rect::NOTHING) };
+    /// Sticky vertical scroll offset of the thumbnail ScrollArea
+    /// (logical px). Shared across the static draw_thumbs_panel_static
+    /// helper and the window_event wheel branch.
+    static THUMB_SCROLL_Y: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
 }
 
 /// What the process was launched with.
@@ -337,8 +342,11 @@ pub struct MainWindow {
 
     // ── Input / action state ─────────────────────────────────────
     actions: Vec<UiAction>,
-    event_loop_proxy: EventLoopProxy<AppMessage>,
     pending_tree_intent: Option<TreeCtxIntent>,
+    /// Open right-click context menu (egui-drawn). `None` when closed.
+    /// Replacing it on a new right-click automatically closes the old
+    /// popup (the menu is redrawn at the new position next frame).
+    ctx_menu: Option<CtxMenu>,
 
     // ── Slide-show state ─────────────────────────────────────────
     slide_show_running: bool,
@@ -420,7 +428,7 @@ pub struct EguiState {
 
 impl MainWindow {
 
-    pub fn new(target: LaunchTarget, event_loop_proxy: EventLoopProxy<AppMessage>) -> Self {
+    pub fn new(target: LaunchTarget) -> Self {
         let nav = Arc::new(parking_lot::Mutex::new(NavigationService::new()));
         let settings = SettingsStore::new().expect("failed to load settings");
         let last = settings.window_size().unwrap_or((DEFAULT_W, DEFAULT_H));
@@ -489,8 +497,8 @@ impl MainWindow {
                 crate::texture_cache::TextureCache::new(thumb_cache.clone())
             ),
             actions: Vec::new(),
-            event_loop_proxy,
             pending_tree_intent: None,
+            ctx_menu: None,
             slide_show_running: false,
             slide_show_last: None,
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
@@ -801,7 +809,13 @@ let window = event_loop.create_window(
 
         let (cx, cy, cw, ch) = self.compute_viewer_rect(
             wgpu_state.config.width, wgpu_state.config.height);
-        tracing::info!("init_renderer: viewer rect ({},{},{},{})", cx, cy, cw, ch);
+        tracing::info!(
+            "init_renderer: viewer rect ({},{},{},{}) [config {}x{} ppp={:.3} scale={:.3}]",
+            cx, cy, cw, ch,
+            wgpu_state.config.width, wgpu_state.config.height,
+            wgpu_state.pixels_per_point,
+            window.scale_factor()
+        );
 
         // Hand the physical-pixel viewport to the viewer immediately so
         // the first decode (coordinator.request_current below) →
@@ -1150,8 +1164,23 @@ let window = event_loop.create_window(
         let dt = state.dt;
         let ppp = state.ppp;
 
-        let Some(egui_state) = self.egui_state.as_mut() else { return None; };
-        let Some(_wgpu_state) = self.wgpu_state.as_ref() else { return None; };
+        // Declared outside SCOPE 1 because the fullscreen-chrome
+        // countdown in SCOPE 2 reads it. `Option<Rect>` is Copy.
+        let mut toolbar_rect: Option<egui::Rect> = None;
+
+        // SCOPE 1: all egui_state-bound code runs in this inner block so
+        // its `&mut self.egui_state` borrow is released before the
+        // draw_context_menu call (which takes &mut self.actions and
+        // &self for self.pal()/self.nav.lock()). Re-acquired in SCOPE 2.
+        //
+        // Clone the egui Context (Arc-backed, cheap) HERE so SCOPE 2 and
+        // draw_context_menu can pass it around without keeping the
+        // &mut self.egui_state borrow alive across those calls.
+        let egui_ctx: egui::Context;
+        {
+            let Some(egui_state) = self.egui_state.as_mut() else { return None; };
+            let Some(_wgpu_state) = self.wgpu_state.as_ref() else { return None; };
+            egui_ctx = egui_state.ctx.clone();
 
         // Sync surface size to the ACTUAL client area. The wgpu surface
         // covers the client rect only — using outer_size (which includes
@@ -1241,7 +1270,6 @@ let window = event_loop.create_window(
         self.last_frame = Some(now);
 
         // ----- TITLEBAR (custom-drawn, replaces the OS frame) -----
-        let mut toolbar_rect: Option<egui::Rect> = None;
         if !self.is_fullscreen {
             let resp = egui::TopBottomPanel::top("titlebar")
                 .exact_height(TOOLBAR_HEIGHT as f32)
@@ -1399,27 +1427,26 @@ let window = event_loop.create_window(
         // once after the popup block (combined region — punching
         // twice would let the second SetWindowRgn overwrite the first).
         if self.show_shortcut_help {
-            let anchor = HELP_ANCHOR.with(|c| c.get());
-            // Place the popover to the LEFT of the `?` button, aligned
-            // with the top bar (y ≈ TOOLBAR_HEIGHT). This puts the
-            // popover above the CentralPanel and the image-quad pass,
-            // so neither covers it. The previous anchor.right() + 4 /
-            // anchor.bottom() + 6 placed it inside the bottom status
-            // bar — visually behind the canvas_clear grey that frames
-            // the viewer when the image isn't edge-to-edge.
+            // Force a fixed-size popover at top-center, above the egui
+            // CentralPanel. The wgpu image-quad pass runs AFTER egui's
+            // paint in `submit_wgpu_frame`, so any popover that overlaps
+            // the viewer rect would be visually overwritten by the image
+            // pixels. Parking the popover in the top bar (y=TOOLBAR) —
+            // which is egui-only chrome with no wgpu layer underneath
+            // — sidesteps that. Using Order::Foreground (layer 3 in
+            // egui 0.29) plus a Position above the CentralPanel
+            // guarantees it draws on top of the other chrome.
+            let screen = egui_state.ctx.input(|i| i.screen_rect);
+            let popup_w = 360.0_f32.min(screen.width() - 16.0);
+            let popup_h = 360.0_f32;
             let anchor_pos = egui::pos2(
-                anchor.left() - 280.0,         // popup width estimate
+                (screen.width() - popup_w) * 0.5,
                 (TOOLBAR_HEIGHT as f32) + 6.0,
             );
             let help_resp = egui::Window::new(
                 egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
             )
-            // .order(...) puts this above the egui CentralPanel so the
-            // image-quad's wgpu pass — which renders AFTER egui in
-            // submit_wgpu_frame — doesn't visually cover the popover
-            // when it overlaps the viewer rect. egui::Order::Tooltip is
-            // the highest available layer.
-            .order(egui::Order::Tooltip)
+            .order(egui::Order::Foreground)
             // No default shadow/fill — the gray halo around the window
             // read as a stray background block on both themes.
             .frame(
@@ -1435,7 +1462,8 @@ let window = event_loop.create_window(
                     .shadow(egui::Shadow::NONE),
             )
             .fixed_pos(anchor_pos)
-            .pivot(egui::Align2::RIGHT_TOP)
+            .fixed_size(egui::vec2(popup_w, popup_h))
+            .pivot(egui::Align2::CENTER_TOP)
             .resizable(false)
             .collapsible(false)
             .fade_in(false)
@@ -1510,6 +1538,44 @@ let window = event_loop.create_window(
                 }
             }
         }
+        // END SCOPE 1: the egui_state borrow on self.egui_state is
+        // released here so draw_context_menu can take &mut self.actions
+        // and self.pal()/self.nav.lock() can take &self without
+        // conflicting.
+        }
+
+        // ----- RIGHT-CLICK CONTEXT MENU (egui-drawn, Linear theme) -----
+        // Replaces the native Win32 TrackPopupMenu. Replacing
+        // `self.ctx_menu` on each right-click auto-closes any previous
+        // popup (the next frame redraws at the new position). Clicking
+        // a menu item dispatches its UiAction and closes the popup;
+        // clicking elsewhere closes it permanently (next right-click
+        // re-opens with fresh state).
+        //
+        // We extract everything the menu needs (current image path,
+        // palette, open-menu variant) and pass it to a free function
+        // so this call doesn't conflict with the egui_state borrow
+        // (already released in SCOPE 1).
+        if let Some(menu) = self.ctx_menu.take() {
+            let pal = self.pal();
+            let current_path = self.nav.lock().current().map(|i| i.path.clone());
+            Self::draw_context_menu(
+                &egui_ctx,
+                menu,
+                &pal,
+                current_path.as_deref(),
+                &mut self.actions,
+            );
+        }
+
+        // SCOPE 2: re-acquire egui_state for the remaining panels
+        // (status bar, fullscreen chrome, central panel) and the
+        // pass-ending calls (end_pass / tessellate). The egui pass
+        // opened in SCOPE 1 is still active — we just continue using
+        // the same egui::Context (`egui_ctx` outside this scope
+        // aliases the same Arc).
+        let Some(egui_state) = self.egui_state.as_mut() else { return None; };
+        let Some(wgpu_state) = self.wgpu_state.as_ref() else { return None; };
 
         // ----- STATUS BAR -----
         // Same three-zone layout as the fullscreen bar (filename left /
@@ -1649,6 +1715,7 @@ let window = event_loop.create_window(
                 viewer.lock().set_viewport_physical(cw, ch, cx as f32, cy as f32);
             }
         }
+        // END SCOPE 2: egui_state borrow released.
 
         central_rect_phys
     }
@@ -1885,26 +1952,24 @@ let window = event_loop.create_window(
         }
 
         // Phase 16: drain any tree right-click intent recorded during
-        // the egui frame and post the native TrackPopupMenu event. The
-        // egui closure can't call open_tree_context_menu (needs &mut
-        // self while the frame holds it), so it writes to
-        // pending_tree_intent; we send the AppMessage now that the
-        // egui borrows are released.
+        // the egui frame. The egui closure can't call
+        // open_tree_context_menu (needs &mut self while the frame
+        // holds it), so it writes to pending_tree_intent; we open the
+        // egui context menu here, once the egui borrows are released.
         if let Some(intent) = self.pending_tree_intent.take() {
             let is_fav = self.settings.favorite_folders().iter().any(|f| f == &intent.path);
-            // intent.pos_phys holds egui LOGICAL points; the Win32 menu
-            // anchor needs physical pixels.
-            let ppp = self.wgpu_state
-                .as_ref()
-                .map(|w| w.pixels_per_point)
-                .unwrap_or(1.0)
-                .max(0.1);
-            let _ = self.event_loop_proxy.send_event(AppMessage::ShowTreeMenu {
-                pos_phys: ((intent.pos_phys.0 as f32 * ppp) as i32, (intent.pos_phys.1 as f32 * ppp) as i32),
+            // intent.pos_phys holds egui LOGICAL points (the router
+            // position is already logical; egui menus want logical).
+            let pos = egui::pos2(intent.pos_phys.0 as f32, intent.pos_phys.1 as f32);
+            self.ctx_menu = Some(CtxMenu::Tree {
+                pos,
                 path: intent.path,
                 root_idx: intent.root_idx,
                 is_favorite: is_fav,
             });
+            if let Some(es) = self.egui_state.as_ref() {
+                es.ctx.request_repaint();
+            }
         }
     }
 
@@ -2374,8 +2439,10 @@ let window = event_loop.create_window(
                 ui.add_space(10.0);
             }
 
+            let tree_scroll_y = tree.state.lock().scroll_offset_y;
             egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
+                .vertical_scroll_offset(tree_scroll_y)
                 .show(ui, |ui| {
                     let mut state = tree.state.lock();
                     if state.scroll_to_top {
@@ -2658,6 +2725,7 @@ let window = event_loop.create_window(
 
             egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
+                .vertical_scroll_offset(THUMB_SCROLL_Y.with(|c| c.get()))
                 .show(ui, |ui| {
                     // Thumbnail decode virtualization: only request decodes
                     // for cards near the visible range (±buffer), not all
@@ -2759,6 +2827,115 @@ let window = event_loop.create_window(
                     }
                 });
         });
+    }
+
+    /// Draw the open right-click context menu (Linear-themed egui
+    /// window). Replaces the native Win32 TrackPopupMenu that was
+    /// introduced when the D2D child HWND clipped egui windows — that
+    /// D2D layer is gone, so egui popups work again and follow the
+    /// theme. A new right-click (which sets `ctx_menu`) closes any
+    /// previous menu because `ctx_menu` is replaced wholesale; clicking
+    /// anywhere else closes it via the outside-click detection below.
+    ///
+    /// Returns `true` if the menu should remain open (re-arm it on
+    /// `self.ctx_menu`); `false` if it should close.
+    fn draw_context_menu(
+        ctx: &egui::Context,
+        menu: CtxMenu,
+        pal: &Palette,
+        current_path: Option<&Path>,
+        actions: &mut Vec<UiAction>,
+    ) -> bool {
+        let mut close = false;
+
+        let frame = egui::Frame::default()
+            .fill(egui::Color32::from_rgba_unmultiplied(
+                pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
+            ))
+            .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
+            .rounding(egui::Rounding::same(8.0))
+            .inner_margin(egui::Margin::same(6.0))
+            .shadow(egui::Shadow {
+                spread: 0.0,
+                color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                offset: egui::vec2(0.0, 4.0),
+                blur: 24.0,
+            });
+
+        let mut item = |ui: &mut egui::Ui, label: &str, action: UiAction| -> bool {
+            let mut clicked = false;
+            let resp = egui::Widget::ui(
+                egui::Button::new(egui::RichText::new(label).size(12.5))
+                    .frame(false)
+                    .fill(egui::Color32::TRANSPARENT),
+                ui,
+            );
+            if resp.hovered() {
+                ui.painter().rect_filled(
+                    resp.rect,
+                    6.0,
+                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                );
+            }
+            if resp.clicked() {
+                clicked = true;
+                actions.push(action);
+            }
+            clicked
+        };
+
+        let window = egui::Window::new("")
+            .frame(frame)
+            .order(egui::Order::Foreground)
+            .resizable(false)
+            .collapsible(false)
+            .title_bar(false)
+            .fade_in(false)
+            .fade_out(false);
+
+        match &menu {
+            CtxMenu::Image { pos } => {
+                window.fixed_pos(*pos).show(ctx, |ui| {
+                    if item(ui, "复制图片路径", UiAction::CopyPath) { close = true; }
+                    if item(ui, "在资源管理器中打开", UiAction::OpenInExplorer) { close = true; }
+                    if item(ui, "打印", UiAction::Print) { close = true; }
+                    if item(ui, "设为桌面壁纸", UiAction::SetWallpaper) { close = true; }
+                    if let Some(p) = current_path {
+                        if let Some(parent) = p.parent().map(|q| q.to_path_buf()) {
+                            if item(ui, "在目录树中定位", UiAction::RevealInTree(parent)) { close = true; }
+                        }
+                    }
+                });
+            }
+            CtxMenu::Tree { pos, path, root_idx, is_favorite } => {
+                window.fixed_pos(*pos).show(ctx, |ui| {
+                    if item(ui, "在资源管理器中打开", UiAction::RevealInExplorer(path.clone())) { close = true; }
+                    if *is_favorite {
+                        if item(ui, "取消收藏", UiAction::RemoveFavorite(path.clone())) { close = true; }
+                    } else {
+                        if item(ui, "添加到收藏", UiAction::AddFavorite(path.clone())) { close = true; }
+                    }
+                    if *root_idx == 1 {
+                        if item(ui, "从 Recent 移除", UiAction::RemoveRecent(path.clone())) { close = true; }
+                    }
+                    if *root_idx != 2 {
+                        if item(ui, "在目录树中定位", UiAction::RevealInTree(path.clone())) { close = true; }
+                    }
+                });
+            }
+        }
+
+        // egui does NOT auto-close a non-modal Window on outside clicks,
+        // so detect it here. Without the egui-window rect (not exposed
+        // here) we approximate: any click is treated as outside, since
+        // menu item clicks already set `close = true` above.
+        let reopen = if close {
+            false
+        } else {
+            !ctx.input(|i| i.pointer.any_click())
+        };
+        let _ = menu; // `match &menu` above consumed a borrow; silence the lint
+        reopen
     }
 
     fn apply_action(&mut self, action: UiAction) {
@@ -3036,8 +3213,9 @@ let window = event_loop.create_window(
         let size = window.inner_size();
         if self.is_fullscreen {
             if let Some(v) = &self.viewer {
-                v.lock().set_viewport_physical(size.width, size.height, 0.0, 0.0);
-                v.lock().fit_to_screen();
+                let mut g = v.lock();
+                g.set_viewport_physical(size.width, size.height, 0.0, 0.0);
+                g.fit_to_screen();
             }
         } else if let Some(v) = &self.viewer {
             // Exit: re-fit into the now-restored windowed viewport. The
@@ -3103,147 +3281,15 @@ let window = event_loop.create_window(
     }
 
     /// Phase 8: image right-click context menu. Stores the cursor
-    /// position in `image_ctx_menu`; the actual popup is drawn by
-    /// `render_image_context_menu` after the egui frame. The popup
-    /// is an egui::Window — same approach as the shortcut help panel
-    /// (which works reliably) and avoids the native TrackPopupMenu
-    /// path that was being clipped by the D2D child HWND. Edge
-    /// detection shifts the popup left / up if the cursor is near
-    /// the right or bottom edge of the screen so no item is
-    /// truncated.
+    /// position in `ctx_menu`; the actual popup is drawn by
+    /// `draw_context_menu` inside `build_egui_ui`. Replacing
+    /// `ctx_menu` on a new right-click automatically closes any
+    /// previously-open popup and reopens at the new position.
     fn open_image_context_menu(&mut self, cursor: egui::Pos2) {
         if self.nav.lock().current().is_none() { return; }
-        // Phase 16: post a custom event; the native TrackPopupMenu pops
-        // in user_event (a modal menu inside the MouseInput callback
-        // conflicted with winit's pump). cursor is PHYSICAL pixels (the
-        // router position) — passed straight through for the Win32
-        // anchor.
-        let _ = self.event_loop_proxy.send_event(AppMessage::ShowImageMenu {
-            pos_phys: (cursor.x as i32, cursor.y as i32),
-        });
-    }
-
-    /// Phase 16: pop the native image right-click menu (Win32
-    /// TrackPopupMenu). Runs in `user_event` — a clean winit context
-    /// after the MouseInput dispatch, avoiding the modal-loop
-    /// re-entrancy that previously suppressed the menu. The selected
-    /// command id is mapped straight into a UiAction and queued.
-    fn show_native_image_menu(&mut self, pos_phys: (i32, i32)) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
-            SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
-        };
-        use windows::Win32::Graphics::Gdi::ClientToScreen;
-        use windows::Win32::Foundation::POINT;
-        use windows::core::PCWSTR;
-        let Some(current) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
-        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-        if hwnd_raw == 0 { return; }
-        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-        let parent = current.parent().map(|p| p.to_path_buf());
-
-        let cmd = unsafe {
-            let Some(menu) = CreatePopupMenu().ok() else {
-                tracing::warn!("CreatePopupMenu failed; skipping image context menu");
-                return;
-            };
-            let item = |menu: HMENU, id: u32, text: &str| {
-                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
-            };
-            item(menu, 1, "复制图片路径");
-            item(menu, 2, "在资源管理器中打开");
-            item(menu, 3, "打印");
-            item(menu, 4, "设为桌面壁纸");
-            item(menu, 5, "在目录树中定位");
-
-            let mut pt = POINT { x: pos_phys.0, y: pos_phys.1 };
-            let _ = ClientToScreen(hwnd, &mut pt);
-            let _ = SetForegroundWindow(hwnd);
-            let ret = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                pt.x, pt.y, 0, hwnd, None,
-            );
-            let _ = DestroyMenu(menu);
-            (ret.0 & 0xFFFF) as u32
-        };
-        match cmd {
-            1 => self.copy_text_to_clipboard(&current.to_string_lossy()),
-            2 => self.reveal_in_explorer(&current),
-            3 => self.print_image(current),
-            4 => self.set_wallpaper(current),
-            5 => if let Some(p) = parent { self.actions.push(UiAction::RevealInTree(p)); },
-            _ => {}
-        }
-    }
-
-    /// Phase 16: pop the native tree right-click menu. Items depend on
-    /// the entry's root + favorite state (a single mutually-exclusive
-    /// 添加到收藏 / 取消收藏 row).
-    fn show_native_tree_menu(
-        &mut self,
-        pos_phys: (i32, i32),
-        path: PathBuf,
-        root_idx: usize,
-        is_favorite: bool,
-    ) {
-        use windows::Win32::UI::WindowsAndMessaging::{
-            CreatePopupMenu, AppendMenuW, TrackPopupMenu, DestroyMenu, HMENU,
-            SetForegroundWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TPM_NONOTIFY, MF_STRING,
-        };
-        use windows::Win32::Graphics::Gdi::ClientToScreen;
-        use windows::Win32::Foundation::POINT;
-        use windows::core::PCWSTR;
-        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
-        if hwnd_raw == 0 { return; }
-        let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
-        const ID_EXPLORER: u32 = 1;
-        const ID_ADD_FAV: u32 = 2;
-        const ID_REMOVE_FAV: u32 = 3;
-        const ID_REMOVE_RECENT: u32 = 4;
-        const ID_REVEAL_TREE: u32 = 5;
-
-        let cmd = unsafe {
-            let Some(menu) = CreatePopupMenu().ok() else {
-                tracing::warn!("CreatePopupMenu failed; skipping tree context menu");
-                return;
-            };
-            let item = |menu: HMENU, id: u32, text: &str| {
-                let wide: Vec<u16> = text.encode_utf16().chain(std::iter::once(0)).collect();
-                let _ = AppendMenuW(menu, MF_STRING, id as usize, PCWSTR(wide.as_ptr()));
-            };
-            item(menu, ID_EXPLORER, "在资源管理器中打开");
-            if is_favorite {
-                item(menu, ID_REMOVE_FAV, "取消收藏");
-            } else {
-                item(menu, ID_ADD_FAV, "添加到收藏");
-            }
-            if root_idx == 1 {
-                item(menu, ID_REMOVE_RECENT, "从 Recent 移除");
-            }
-            if root_idx != 2 {
-                item(menu, ID_REVEAL_TREE, "在目录树中定位");
-            }
-
-            let mut pt = POINT { x: pos_phys.0, y: pos_phys.1 };
-            let _ = ClientToScreen(hwnd, &mut pt);
-            let _ = SetForegroundWindow(hwnd);
-            let ret = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON | TPM_NONOTIFY,
-                pt.x, pt.y, 0, hwnd, None,
-            );
-            let _ = DestroyMenu(menu);
-            (ret.0 & 0xFFFF) as u32
-        };
-        match cmd {
-            ID_EXPLORER => self.actions.push(UiAction::RevealInExplorer(path.clone())),
-            ID_ADD_FAV => self.actions.push(UiAction::AddFavorite(path.clone())),
-            ID_REMOVE_FAV => self.actions.push(UiAction::RemoveFavorite(path.clone())),
-            ID_REMOVE_RECENT => self.actions.push(UiAction::RemoveRecent(path.clone())),
-            ID_REVEAL_TREE => self.actions.push(UiAction::RevealInTree(path.clone())),
-            _ => {}
+        self.ctx_menu = Some(CtxMenu::Image { pos: cursor });
+        if let Some(es) = self.egui_state.as_ref() {
+            es.ctx.request_repaint();
         }
     }
 
@@ -3432,7 +3478,7 @@ let window = event_loop.create_window(
     }
 }
 
-impl ApplicationHandler<AppMessage> for MainWindow {
+impl ApplicationHandler for MainWindow {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         if self.window.is_none() {
             if let Err(e) = self.init_window(event_loop) {
@@ -3441,15 +3487,6 @@ impl ApplicationHandler<AppMessage> for MainWindow {
             }
             if let Some(w) = &self.window {
                 w.request_redraw();
-            }
-        }
-    }
-
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, message: AppMessage) {
-        match message {
-            AppMessage::ShowImageMenu { pos_phys } => self.show_native_image_menu(pos_phys),
-            AppMessage::ShowTreeMenu { pos_phys, path, root_idx, is_favorite } => {
-                self.show_native_tree_menu(pos_phys, path, root_idx, is_favorite)
             }
         }
     }
@@ -3695,19 +3732,25 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                 && cursor.x >= hx && cursor.x <= hx + hw
                 && cursor.y >= hy && cursor.y <= hy + hh;
             if in_tree || in_thumbs {
-                // Re-emit the wheel event into egui so its ScrollArea
-                // (inside the tree/thumb closure) consumes it.
-                if let Some(es) = self.egui_state.as_ref() {
-                    es.ctx.input_mut(|i| {
-                        i.events.push(egui::Event::MouseWheel {
-                            unit: egui::MouseWheelUnit::Point,
-                            delta: match delta {
-                                MouseScrollDelta::LineDelta(_, y) => egui::Vec2::new(0.0, *y * 24.0),
-                                MouseScrollDelta::PixelDelta(p) => egui::Vec2::new(p.x as f32, p.y as f32),
-                            },
-                            modifiers: i.modifiers,
-                        });
+                // Advance the panel's ScrollArea directly. The ScrollArea
+                // builder in build_egui_ui applies `vertical_scroll_offset`
+                // from these sticky fields each frame, so a wheel here
+                // scrolls the tree/thumbnail list even though the cursor
+                // never "enters" the egui widget that owns the area.
+                let dy = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => *y * 48.0,
+                    MouseScrollDelta::PixelDelta(p) => p.y as f32,
+                };
+                if in_tree {
+                    self.file_tree.state.lock().scroll_offset_y =
+                        (self.file_tree.state.lock().scroll_offset_y - dy).max(0.0);
+                }
+                if in_thumbs {
+                    THUMB_SCROLL_Y.with(|c| {
+                        c.set((c.get() - dy).max(0.0));
                     });
+                }
+                if let Some(es) = self.egui_state.as_ref() {
                     es.ctx.request_repaint();
                 }
                 return;
@@ -3822,6 +3865,16 @@ impl ApplicationHandler<AppMessage> for MainWindow {
                     wgpu_state.config.height = h;
                     wgpu_state.surface.configure(&wgpu_state.device, &wgpu_state.config);
                 }
+
+                // The pending egui frame's `ScreenDescriptor` was built
+                // against the previous size. If submit_wgpu_frame ran
+                // before the next build_egui_ui, the scissor/clip_rect
+                // would be scaled by the OLD pixels-per-pixel value
+                // against the NEW surface texture, producing scissor
+                // rectangles that wgpu rejects. Drop the pending
+                // output — the next build_egui_ui will refill it with
+                // the new size.
+                self._pending_egui_output = None;
 
                 let (vx, vy, vw, vh) = self.compute_viewer_rect(w, h);
                 let _ = (vx, vy);
