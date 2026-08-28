@@ -3260,10 +3260,18 @@ let window = event_loop.create_window(
         let Some(window) = &self.window else { return; };
         self.is_fullscreen = !self.is_fullscreen;
         IS_FULLSCREEN.store(self.is_fullscreen, std::sync::atomic::Ordering::Relaxed);
-        // Capture the on-screen image rect so the viewport transition can
-        // animate from it (path animation into fullscreen).
-        if let Some(v) = &self.viewer {
-            v.lock().mark_viewport_transition();
+        // Entering fullscreen always straightens the image first (snap
+        // rotation to 0, no spin) and re-fits to the CURRENT window, then
+        // the fit follows the monitor once the OS resizes it. This keeps
+        // the fullscreen transition deterministic — a live rotation angle
+        // would otherwise leave the image resolved at a rotated fit and
+        // land off-centre (the "rotate then fullscreen breaks fit" bug).
+        // We deliberately skip the rect-anim path animation here: it
+        // fought the rotation/fit re-fit. The fit itself is the transition.
+        if self.is_fullscreen {
+            if let Some(v) = &self.viewer {
+                v.lock().reset_rotation();
+            }
         }
         if self.is_fullscreen {
             // Enter immersive mode: chrome hidden until the mouse moves.

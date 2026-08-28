@@ -663,6 +663,20 @@ impl Direct2DViewer {
     pub fn offset(&self) -> (f32, f32) { (self.offset_x, self.offset_y) }
     pub fn rotation(&self) -> u8 { self.rotation }
 
+    /// Snap rotation back to 0 INSTANTLY (no spin animation) and re-fit.
+    /// Used when entering fullscreen so the image straightens before the
+    /// fullscreen fit — an in-flight angle animation would otherwise fight
+    /// the viewport transition and land the image off-centre.
+    pub fn reset_rotation(&mut self) {
+        if self.rotation == 0 && self.rotation_deg == 0.0 {
+            return;
+        }
+        self.rotation = 0;
+        self.rotation_deg = 0.0;
+        self.rot_anim = None;
+        self.compute_fit();
+    }
+
     pub fn set_rotation(&mut self, q: u8) {
         let prev = self.rotation;
         self.rotation = q & 3;
