@@ -237,14 +237,11 @@ impl Direct2DViewer {
 
     /// Build the image→screen affine with the rotation centred on the
     /// image itself. `dx, dy` is the viewer-space position of the
-    /// IMAGE CENTRE, not the top-left — the previous version used the
-    /// top-left and added `±sh / ±sw` per rotation quadrant, which
-    /// shifts the rotation origin off-image at 90°/270° (the image
-    /// visibly drifted out of the viewer).
-    ///
-    /// The shader inverts this to screen→image; with image centre
-    /// mapped to viewer centre, rotation 0/90/180/270 all keep the
-    /// centre pinned to (0.5, 0.5) → screen centre.
+    /// IMAGE CENTRE. The forward image→screen maps ORIGINAL image
+    /// coords (pre-rotation) and the per-quadrant translation term
+    /// compensates so the image-centre pixel `(bw/2, bh/2)` lands at
+    /// `(dx, dy)` regardless of rotation. The shader inverts this to
+    /// screen→image.
     pub fn display_transform(&self, dx: f32, dy: f32, s: f32) -> AffineTransform {
         let (bw, bh) = match &self.current_gpu {
             Some(img) => (img.width as f32, img.height as f32),
@@ -252,17 +249,21 @@ impl Direct2DViewer {
         };
         let sw = bw * s;
         let sh = bh * s;
-        // Subtract half the displayed size so (dx, dy) is the IMAGE
-        // CENTRE rather than its top-left. Undo with `0.5*(m11+m12)`
-        // and `0.5*(m21+m22)` (the centre of the 1-unit col matrix) at
-        // matrix-build time.
-        let cx = dx - sw * 0.5;
-        let cy = dy - sh * 0.5;
+        // For each rotation k:
+        //   rot 0: (img_x, img_y) → ( s*img_x,  s*img_y )
+        //   rot 1: (img_x, img_y) → ( s*img_y, -s*img_x )
+        //   rot 2: (img_x, img_y) → (-s*img_x, -s*img_y )
+        //   rot 3: (img_x, img_y) → (-s*img_y,  s*img_x )
+        // The translation term is solved so (bw/2, bh/2) → (dx, dy):
+        //   rot 0: dx_affine = dx - s*bw/2, dy_affine = dy - s*bh/2
+        //   rot 1: dx_affine = dx - s*bh/2, dy_affine = dy + s*bw/2
+        //   rot 2: dx_affine = dx + s*bw/2, dy_affine = dy + s*bh/2
+        //   rot 3: dx_affine = dx + s*bh/2, dy_affine = dy - s*bw/2
         match self.rotation {
-            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: cx + sh, dy: cy },
-            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: cx + sw, dy: cy + sh },
-            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx: cx, dy: cy + sw },
-            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx: cx, dy: cy },
+            1 => AffineTransform { m11: 0.0, m12: s, m21: -s, m22: 0.0, dx: dx - sh * 0.5, dy: dy + sw * 0.5 },
+            2 => AffineTransform { m11: -s, m12: 0.0, m21: 0.0, m22: -s, dx: dx + sw * 0.5, dy: dy + sh * 0.5 },
+            3 => AffineTransform { m11: 0.0, m12: -s, m21: s, m22: 0.0, dx: dx + sh * 0.5, dy: dy - sw * 0.5 },
+            _ => AffineTransform { m11: s, m12: 0.0, m21: 0.0, m22: s, dx: dx - sw * 0.5, dy: dy - sh * 0.5 },
         }
     }
 
@@ -281,8 +282,15 @@ impl Direct2DViewer {
             let scale_y = self.viewport_h as f32 / dh;
             self.fit_scale = scale_x.min(scale_y);
             self.zoom = self.fit_scale;
-            self.offset_x = (self.viewport_w as f32 - dw * self.zoom) * 0.5;
-            self.offset_y = (self.viewport_h as f32 - dh * self.zoom) * 0.5;
+            // Centre the image: its centre goes to the viewport's centre
+            // (in viewer-local coords). display_transform reads
+            // `offset_x/y` as the image-centre position, so we set it
+            // explicitly to viewport_centre here. The previous version
+            // stored the image-LEFT edge slack, which display_transform
+            // then incorrectly treated as image centre — producing an
+            // image shifted by `−sw/2` from its intended position.
+            self.offset_x = self.viewport_w as f32 * 0.5;
+            self.offset_y = self.viewport_h as f32 * 0.5;
         }
     }
 
@@ -350,16 +358,37 @@ impl Direct2DViewer {
     /// needing a real `current_gpu`. Pure logic, used both by the
     /// public `clamp_pan` and by unit tests.
     fn clamp_pan_to(&mut self, w: f32, h: f32, vw: f32, vh: f32) {
+        // offset_x/y is the IMAGE-CENTRE position (in viewer-local coords);
+        // see compute_fit / zoom_1_to_1. The image spans
+        //   [offset_x - w/2, offset_x + w/2]  in viewer-local x
+        //   [offset_y - h/2, offset_y + h/2]  in viewer-local y
+        //
+        // For w ≤ vw the image fits, so re-centre it. For w > vw we clamp
+        // the centre position so the image's edges stay within
+        // `±PAN_OVERSHOOT_PX` of the viewport. Using image-CENTRE coords
+        // gives a symmetric wall on both sides.
+        //
+        //   LEFT  wall: image is mostly off-viewport-RIGHT (the user
+        //   dragged left to see the right edge). Limit so its RIGHT edge
+        //   sits at `vw + PAN_OVERSHOOT_PX`:
+        //       offset_x + w/2 = vw + overshoot
+        //       offset_x = vw - w/2 + overshoot
+        //
+        //   RIGHT wall: image is mostly off-viewport-LEFT (dragged right
+        //   to see the left edge). Limit so its LEFT edge sits at
+        //   `-PAN_OVERSHOOT_PX`:
+        //       offset_x - w/2 = -overshoot
+        //       offset_x = w/2 - overshoot
         let overshoot = PAN_OVERSHOOT_PX;
         self.offset_x = if w <= vw {
-            (vw - w) * 0.5
+            vw * 0.5
         } else {
-            self.offset_x.clamp(vw - w + overshoot, -overshoot)
+            self.offset_x.clamp(vw - w * 0.5 + overshoot, w * 0.5 - overshoot)
         };
         self.offset_y = if h <= vh {
-            (vh - h) * 0.5
+            vh * 0.5
         } else {
-            self.offset_y.clamp(vh - h + overshoot, -overshoot)
+            self.offset_y.clamp(vh - h * 0.5 + overshoot, h * 0.5 - overshoot)
         };
     }
 
@@ -439,8 +468,10 @@ impl Direct2DViewer {
                 (img.width as f32, img.height as f32)
             };
             self.zoom = 1.0;
-            self.offset_x = (self.viewport_w as f32 - dw) * 0.5;
-            self.offset_y = (self.viewport_h as f32 - dh) * 0.5;
+            // Image centre at viewport centre (display_transform reads
+            // offset_x/y as image-centre; see compute_fit).
+            self.offset_x = self.viewport_w as f32 * 0.5;
+            self.offset_y = self.viewport_h as f32 * 0.5;
             let target = (self.offset_x, self.offset_y, dw, dh);
             self.start_rect_anim(target);
         }
@@ -626,16 +657,17 @@ mod tests {
 
     /// Bug G regression: clamp_pan_to must give the same drag distance
     /// from the centred position in both directions when the image is
-    /// bigger than the viewport. Previous code put the right wall at
-    /// `vw - 40` and the left wall at `vw - w + 40`, so right drag
-    /// was much longer than left drag.
+    /// bigger than the viewport. `offset_x/y` is the IMAGE-CENTRE
+    /// position (in viewer-local coords); both walls use the
+    /// `PAN_OVERSHOOT_PX` past-the-far-edge rule so the distance
+    /// from the centred position is identical in every direction.
     #[test]
     fn pan_walls_are_symmetric_when_image_bigger_than_viewport() {
         // 1000x1000 image, 500x500 viewport, 1x zoom → w > vw.
         let mut v = Direct2DViewer::new(500, 500);
-        // Centred start.
-        v.offset_x = (500.0_f32 - 1000.0) * 0.5; // = -250
-        v.offset_y = 0.0;
+        // Centred start: image CENTRE at viewport centre = (vw/2, vh/2).
+        v.offset_x = 250.0; // vw/2
+        v.offset_y = 250.0;
         let centre = v.offset_x;
 
         // Drag WAY past the left wall.
@@ -646,6 +678,7 @@ mod tests {
         // Reset and drag WAY past the right wall.
         let mut v = Direct2DViewer::new(500, 500);
         v.offset_x = centre;
+        v.offset_y = 250.0;
         v.offset_x += 10_000.0;
         v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
         let right_wall = v.offset_x;
@@ -657,53 +690,56 @@ mod tests {
             "left_distance={left_distance}, right_distance={right_distance} — clamp_pan_to is asymmetric"
         );
 
-        // Both walls leave the image mostly inside the viewport
-        // (PAN_OVERSHOOT_PX past the FAR edge), symmetric in rule.
+        // Both walls use `vw - w/2 + overshoot` (LEFT wall — dragged
+        // left so the image's right edge is at viewport right + overshoot)
+        // and `w/2 - overshoot` (RIGHT wall — dragged right so the
+        // image's left edge is at viewport left - overshoot). In both
+        // cases the image centre is `vw/2` away from the centre when
+        // the image fits; larger `vw` → same distance.
         let overshoot = PAN_OVERSHOOT_PX;
-        // LEFT wall (image's right edge is 40 px past viewport's right).
-        let expected_left = 500.0_f32 - 1000.0 + overshoot;
+        let expected_left  = 500.0_f32 - 1000.0 * 0.5 + overshoot; // = 40
+        let expected_right = 1000.0 * 0.5 - overshoot;              // = 460
         assert!(
             (left_wall - expected_left).abs() < 0.5,
             "left_wall={left_wall}, expected={expected_left}"
         );
-        // RIGHT wall (image's left edge is 40 px past viewport's left).
         assert!(
-            (right_wall - (-overshoot)).abs() < 0.5,
-            "right_wall={right_wall}, expected={}",
-            -overshoot
+            (right_wall - expected_right).abs() < 0.5,
+            "right_wall={right_wall}, expected={expected_right}"
         );
     }
 
     /// When the image is SMALLER than the viewport, the offset
-    /// should snap to centred (not follow whatever stale value was in
-    /// `offset_x`).
+    /// should snap to image-centre-at-viewport-centre (offset = vw/2).
     #[test]
     fn pan_centre_when_image_smaller_than_viewport() {
         let mut v = Direct2DViewer::new(800, 800);
         v.offset_x = 999.0;
         v.offset_y = 999.0;
         v.clamp_pan_to(200.0, 200.0, 800.0, 800.0);
-        // image (200) < viewport (800) → centred: (800-200)/2 = 300.
-        assert!((v.offset_x - 300.0).abs() < 0.001);
-        assert!((v.offset_y - 300.0).abs() < 0.001);
+        // image (200) < viewport (800) → centre the image: 800/2 = 400.
+        assert!((v.offset_x - 400.0).abs() < 0.001);
+        assert!((v.offset_y - 400.0).abs() < 0.001);
     }
 
     /// Y-axis symmetric clamp (top/bottom drag should match).
     #[test]
     fn pan_walls_are_symmetric_on_y_axis() {
         let mut v = Direct2DViewer::new(500, 500);
-        v.offset_y = (500.0_f32 - 1000.0) * 0.5; // centred
+        v.offset_x = 250.0;
+        v.offset_y = 250.0; // centred
         v.offset_y -= 10_000.0;
         v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
         let bottom_wall = v.offset_y;
 
         let mut v = Direct2DViewer::new(500, 500);
-        v.offset_y = (500.0_f32 - 1000.0) * 0.5;
+        v.offset_x = 250.0;
+        v.offset_y = 250.0;
         v.offset_y += 10_000.0;
         v.clamp_pan_to(1000.0, 1000.0, 500.0, 500.0);
         let top_wall = v.offset_y;
 
-        let centre = (500.0_f32 - 1000.0) * 0.5;
+        let centre = 250.0;
         let bottom_distance = centre - bottom_wall;
         let top_distance = top_wall - centre;
         assert!(

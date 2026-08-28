@@ -809,13 +809,6 @@ let window = event_loop.create_window(
 
         let (cx, cy, cw, ch) = self.compute_viewer_rect(
             wgpu_state.config.width, wgpu_state.config.height);
-        tracing::info!(
-            "init_renderer: viewer rect ({},{},{},{}) [config {}x{} ppp={:.3} scale={:.3}]",
-            cx, cy, cw, ch,
-            wgpu_state.config.width, wgpu_state.config.height,
-            wgpu_state.pixels_per_point,
-            window.scale_factor()
-        );
 
         // Hand the physical-pixel viewport to the viewer immediately so
         // the first decode (coordinator.request_current below) →
@@ -1217,12 +1210,37 @@ let window = event_loop.create_window(
                 wgpu_state.config.height as f32 / ppp,
             ),
         ));
-        // Keep egui's own scale factor in sync with the window's so
-        // logical→physical conversions (CentralPanel rect capture,
-        // tessellation) use the same factor we do.
-        if (egui_state.ctx.pixels_per_point() - ppp).abs() > 0.001 {
-            egui_state.ctx.set_pixels_per_point(ppp);
-        }
+        // Pass ppp to egui via ViewportInfo::native_pixels_per_point
+        // instead of Context::set_pixels_per_point. Setting
+        // native_pixels_per_point feeds directly into the
+        // pixels_per_point computation in begin_pass (`zoom_factor *
+        // native_pixels_per_point`) WITHOUT triggering the
+        // zoom-factor ratio adjustment.
+        //
+        // That ratio adjustment is the source of a scissor-validation
+        // crash on the FIRST frame: when set_pixels_per_point is
+        // called before begin_pass, begin_pass sees a non-None
+        // new_zoom_factor and rescales the input screen_rect by
+        // `old_zoom / new_zoom`. On the first frame `old_zoom` is the
+        // default 1.0 and `viewport.input.screen_rect` is still the
+        // ///InputState default of (0, 0, 10000, 10000) — so the
+        // adjustment produces a 8000×8000 screen_rect, blowing past
+        // the 2304×1296 surface in the egui_wgpu scissor clamp.
+        // Setting native_pixels_per_point sidesteps the ratio
+        // adjustment entirely while still keeping egui's internal ppp
+        // in sync (since ppp = zoom_factor * native_pixels_per_point
+        // = 1.0 * 1.25 = 1.25 on the first frame).
+        let active_viewport = raw_input
+            .viewport_id;
+        let mut vp_info = raw_input
+            .viewports
+            .get(&active_viewport)
+            .cloned()
+            .unwrap_or_default();
+        vp_info.native_pixels_per_point = Some(ppp);
+        raw_input
+            .viewports
+            .insert(active_viewport, vp_info);
         raw_input.time = Some(
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -3871,9 +3889,10 @@ impl ApplicationHandler for MainWindow {
                 // before the next build_egui_ui, the scissor/clip_rect
                 // would be scaled by the OLD pixels-per-pixel value
                 // against the NEW surface texture, producing scissor
-                // rectangles that wgpu rejects. Drop the pending
-                // output — the next build_egui_ui will refill it with
-                // the new size.
+                // rectangles that wgpu rejects with a validation error
+                // ("scissor rect not contained in render target").
+                // Drop the pending output — the next build_egui_ui
+                // will refill it with the new size.
                 self._pending_egui_output = None;
 
                 let (vx, vy, vw, vh) = self.compute_viewer_rect(w, h);
