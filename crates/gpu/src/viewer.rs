@@ -26,6 +26,27 @@ const MAX_ZOOM: f32 = 5.0;
 /// drag much further to the right than to the left.
 const PAN_OVERSHOOT_PX: f32 = 40.0;
 
+/// Clamp an image-centre coordinate against a viewport edge rule, returning
+/// the centred half-extent when the image fits or when the wall interval
+/// would invert. `w` = image extent, `vw` = viewport extent, `overshoot` =
+/// visible slack past the far edge.
+fn clamp_centre(cur: f32, w: f32, vw: f32, overshoot: f32) -> f32 {
+    if w <= vw {
+        vw * 0.5
+    } else {
+        // Interval that the image-centre may occupy. When it inverts
+        // (image just slightly larger than the viewport) there is no valid
+        // pan range — re-centre rather than calling f32::clamp with min>max.
+        let min = vw - w * 0.5 + overshoot;
+        let max = w * 0.5 - overshoot;
+        if min <= max {
+            cur.clamp(min, max)
+        } else {
+            vw * 0.5
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SlideDir {
     None,
@@ -358,10 +379,17 @@ impl Direct2DViewer {
     pub fn on_wheel(&mut self, delta: i32, cursor_x: f32, cursor_y: f32) {
         let zoom_factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        let cursor_rel_x = cursor_x - self.offset_x;
-        let cursor_rel_y = cursor_y - self.offset_y;
-        self.offset_x = cursor_x - cursor_rel_x * (new_zoom / self.zoom);
-        self.offset_y = cursor_y - cursor_rel_y * (new_zoom / self.zoom);
+        // cursor is in WINDOW physical coords (router.cursor_pos); the
+        // image centre offset is viewer-LOCAL, so shift by the viewport
+        // origin first. Otherwise zoom-to-cursor lands off (e.g. with a
+        // left tree panel the viewer starts at tree_width, so a physical
+        // cursor minus a viewer-local offset computes a bogus target).
+        let cx = cursor_x - self.viewport_origin.0;
+        let cy = cursor_y - self.viewport_origin.1;
+        let cursor_rel_x = cx - self.offset_x;
+        let cursor_rel_y = cy - self.offset_y;
+        self.offset_x = cx - cursor_rel_x * (new_zoom / self.zoom);
+        self.offset_y = cy - cursor_rel_y * (new_zoom / self.zoom);
         self.zoom = new_zoom;
         self.is_fit = false;
         self.clamp_pan();
@@ -443,17 +471,15 @@ impl Direct2DViewer {
         //   `-PAN_OVERSHOOT_PX`:
         //       offset_x - w/2 = -overshoot
         //       offset_x = w/2 - overshoot
+        //
+        // IMPORTANT: when the image is only slightly larger than the
+        // viewport (`vw < w < vw + 2·overshoot`) the wall interval
+        // INVERTS (min > max), and `f32::clamp` panics on min>max — that
+        // is the "scroll-to-zoom crashes the app" bug (killed by
+        // panic=abort). Detect the inversion and re-centre instead.
         let overshoot = PAN_OVERSHOOT_PX;
-        self.offset_x = if w <= vw {
-            vw * 0.5
-        } else {
-            self.offset_x.clamp(vw - w * 0.5 + overshoot, w * 0.5 - overshoot)
-        };
-        self.offset_y = if h <= vh {
-            vh * 0.5
-        } else {
-            self.offset_y.clamp(vh - h * 0.5 + overshoot, h * 0.5 - overshoot)
-        };
+        self.offset_x = clamp_centre(self.offset_x, w, vw, overshoot);
+        self.offset_y = clamp_centre(self.offset_y, h, vh, overshoot);
     }
 
     pub fn start_rect_anim(&mut self, target: (f32, f32, f32, f32)) {
@@ -761,6 +787,26 @@ impl Direct2DViewer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Crash regression: clamp_centre must NOT call f32::clamp with
+    /// min>max when the image is only slightly larger than the viewport
+    /// (`vw < w < vw + 2*overshoot`). That used to panic (killed by
+    /// panic=abort) the moment you scrolled to zoom to ~110%. It re-centres
+    /// instead of panicking.
+    #[test]
+    fn clamp_centre_survives_image_slightly_larger_than_viewport() {
+        // viewport 500, overshoot 40 → inversion zone w in (500, 580).
+        for w in [510.0_f32, 540.0, 560.0, 575.0] {
+            let r = clamp_centre(250.0, w, 500.0, PAN_OVERSHOOT_PX);
+            // Should re-centre (no panic) and stay within the viewport.
+            assert!(r.is_finite(), "clamp_centre produced NaN for w={w}");
+            // Centre stays in a sane band.
+            assert!((r - 250.0).abs() < 1.0, "expected centred for w={w}, got {r}");
+        }
+        // Larger images still clamp to the walls (min<=max).
+        let r = clamp_centre(900_000.0, 1000.0, 500.0, PAN_OVERSHOOT_PX);
+        assert!((r - (1000.0 * 0.5 - PAN_OVERSHOOT_PX)).abs() < 0.001, "right wall {r}");
+    }
 
     /// Bug G regression: clamp_pan_to must give the same drag distance
     /// from the centred position in both directions when the image is
