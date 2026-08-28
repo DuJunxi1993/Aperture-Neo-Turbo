@@ -347,6 +347,11 @@ pub struct MainWindow {
     /// Replacing it on a new right-click automatically closes the old
     /// popup (the menu is redrawn at the new position next frame).
     ctx_menu: Option<CtxMenu>,
+    /// When the context menu was opened (Instant). Used to ignore the
+    /// right-button-down click that OPENED the menu — otherwise the
+    /// `pointer.any_click()` outside-close detection fires on the very
+    /// first frame and the menu flashes away instantly.
+    ctx_menu_open_at: Option<std::time::Instant>,
 
     // ── Slide-show state ─────────────────────────────────────────
     slide_show_running: bool,
@@ -499,6 +504,7 @@ impl MainWindow {
             actions: Vec::new(),
             pending_tree_intent: None,
             ctx_menu: None,
+            ctx_menu_open_at: None,
             slide_show_running: false,
             slide_show_last: None,
             viewport_w: last.0.saturating_sub(TREE_WIDTH + THUMB_WIDTH),
@@ -861,6 +867,29 @@ let window = event_loop.create_window(
         Ok(())
     }
 
+    /// Physical size of the window CLIENT area, via Win32 GetClientRect.
+    /// More reliable than winit's `inner_size()` / `current_monitor().size()`
+    /// in borderless fullscreen, both of which can report the size scaled
+    /// by the DPI factor (making the wgpu surface larger than the display
+    /// and pushing the image off-centre). Falls back to inner_size() when
+    /// the HWND isn't registered yet.
+    ///
+    /// Takes the main HWND out-of-band so it can be called while
+    /// `self.egui_state` is mutably borrowed (a `&self` method would
+    /// conflict). Returns `(u32, u32)` physical client size.
+    fn client_area_physical_using(hwnd_raw: isize, fallback: (u32, u32)) -> (u32, u32) {
+        if hwnd_raw != 0 {
+            use windows::Win32::UI::WindowsAndMessaging::GetClientRect;
+            let hwnd = HWND(hwnd_raw as *mut core::ffi::c_void);
+            let mut rc = windows::Win32::Foundation::RECT::default();
+            let ok = unsafe { GetClientRect(hwnd, &mut rc) };
+            if ok.is_ok() && rc.right > rc.left && rc.bottom > rc.top {
+                return ((rc.right - rc.left) as u32, (rc.bottom - rc.top) as u32);
+            }
+        }
+        fallback
+    }
+
     fn compute_viewer_rect(&self, win_w: u32, win_h: u32) -> (i32, i32, u32, u32) {
         let tree_w = if self.show_tree { self.tree_panel.anim.round() as u32 } else { 0 };
         let thumb_w = if self.show_thumbs { self.thumb_panel.anim.round() as u32 } else { 0 };
@@ -1180,10 +1209,26 @@ let window = event_loop.create_window(
         // the title bar and borders) makes DWM squash the surface and
         // desyncs egui hit-testing from the drawn UI.
         {
+            // winit 0.30's `window.inner_size()` / `current_monitor().size()`
+            // report the window size SCALED by the DPI factor in fullscreen
+            // (e.g. 2560x1440 for a 2048x1152 monitor at 125%), which
+            // desyncs the wgpu surface config from the real monitor
+            // resolution and pushes the image off-centre. The most reliable
+            // physical size is the window CLIENT rect (Win32), which in
+            // borderless fullscreen equals the monitor resolution. Fall
+            // back to inner_size() if the HWND isn't available yet.
+            let fallback = self.window
+                .as_ref()
+                .map(|w| {
+                    let s = w.inner_size();
+                    (s.width.max(1), s.height.max(1))
+                })
+                .unwrap_or((1, 1));
+            let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+            let phys = Self::client_area_physical_using(hwnd_raw, fallback);
+            let cw = phys.0;
+            let ch = phys.1;
             let wgpu_state_mut = self.wgpu_state.as_mut().expect("checked above");
-            let phys = self.window.as_ref().unwrap().inner_size();
-            let cw = phys.width.max(1);
-            let ch = phys.height.max(1);
             if cw != wgpu_state_mut.config.width || ch != wgpu_state_mut.config.height
             {
                 wgpu_state_mut.config.width = cw;
@@ -1574,16 +1619,30 @@ let window = event_loop.create_window(
         // palette, open-menu variant) and pass it to a free function
         // so this call doesn't conflict with the egui_state borrow
         // (already released in SCOPE 1).
-        if let Some(menu) = self.ctx_menu.take() {
+        // ----- RIGHT-CLICK CONTEXT MENU (egui-drawn, Linear theme) -----
+        // Replaces the native Win32 TrackPopupMenu. The menu is drawn
+        // every frame while `ctx_menu` is Some. A new right-click simply
+        // replaces `ctx_menu` (closing any old popup). draw_context_menu
+        // returns whether to keep it open; if it returns false (menu item
+        // clicked, or an outside click after the open grace window) we
+        // clear `ctx_menu`. `ctx_menu_open_at` is set when a menu opens so
+        // the right-button-down that OPENED it isn't treated as an outside
+        // click on the first frame.
+        if let Some(menu) = self.ctx_menu.as_ref() {
             let pal = self.pal();
             let current_path = self.nav.lock().current().map(|i| i.path.clone());
-            Self::draw_context_menu(
+            let keep_open = Self::draw_context_menu(
                 &egui_ctx,
                 menu,
                 &pal,
                 current_path.as_deref(),
                 &mut self.actions,
+                self.ctx_menu_open_at,
             );
+            if !keep_open {
+                self.ctx_menu = None;
+                self.ctx_menu_open_at = None;
+            }
         }
 
         // SCOPE 2: re-acquire egui_state for the remaining panels
@@ -1808,32 +1867,20 @@ let window = event_loop.create_window(
                 a: 1.0,
             }
         };
-        let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-            label: Some("egui"),
-            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                view: &view,
-                resolve_target: None,
-                ops: wgpu::Operations {
-                    load: wgpu::LoadOp::Clear(clear_color),
-                    store: wgpu::StoreOp::Store,
-                },
-            })],
-            depth_stencil_attachment: None,
-            timestamp_writes: None,
-            occlusion_query_set: None,
-        });
-
-        egui_state.renderer.render(
-            &mut rpass.forget_lifetime(),
-            &paint_jobs,
-            &screen_descriptor,
-        );
-
-        // Phase 3: wgpu image-quad pass. Drawn after egui's chrome
-        // so the image appears on top of any egui panels that
-        // overlap the viewer rect (which they shouldn't — the
-        // CentralPanel's `Frame::none()` is invisible — but
-        // ordering this way matches the expected Z-order).
+        // Phase 3: wgpu image-quad pass, now rendered FIRST with a
+        // background clear. The image-quad shader covers the WHOLE
+        // surface: pixels outside the viewer rect return `u.bg`
+        // (canvas background), pixels inside sample the texture. So
+        // this single pass both clears the canvas AND draws the image
+        // (and any outgoing slide frame), all in one LoadOp::Clear.
+        //
+        // The egui pass then runs AFTER with LoadOp::Load (no clear) so
+        // the UI chrome (title bar, tree/thumbs panels, status bar) and
+        // any popovers (right-click menu, shortcut panel) paint ON TOP of
+        // the image. Previously egui ran first (Clear) and the image-quad
+        // ran after, so any egui window overlapping the viewer rect was
+        // visually overwritten by the image — the reason right-click
+        // menus and the shortcut popup appeared to not open at all.
         //
         // Capture everything we need from self before locking
         // (Rust's borrow checker is conservative about reentrancy
@@ -1876,7 +1923,15 @@ let window = event_loop.create_window(
         // to glide: outgoing slides out, incoming slides in. When
         // `previous` is None (no active slide) only the current
         // pass runs and the layout is identical to the pre-Tier-1 path.
-        if let Some(((p_uni, p_img, pvx, pvy, pvw, pvh), cur)) = image_quad_args.as_ref() {
+        // Render the image-quad FIRST. The FIRST image draw of the frame
+        // uses LoadOp::Clear to reset the whole surface to the canvas
+        // background (the image-quad shader covers the full surface; the
+        // scissor just restricts rasterisation to the viewer rect). During
+        // a slide, the PREVIOUS (outgoing) frame is the first draw, so it
+        // Clears; otherwise the CURRENT image Clears. The subsequent draw
+        // uses LoadOp::Load to composite over the cleared surface.
+        let mut canvas_cleared = false;
+        if let Some(((p_uni, p_img, pvx, pvy, pvw, pvh), _cur)) = image_quad_args.as_ref() {
             if p_uni.has_image == 1 {
                 let pvx = *pvx; let pvy = *pvy; let pvw = *pvw; let pvh = *pvh;
                 wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, p_uni);
@@ -1890,7 +1945,7 @@ let window = event_loop.create_window(
                         view: &view,
                         resolve_target: None,
                         ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Load,
+                            load: wgpu::LoadOp::Clear(clear_color),
                             store: wgpu::StoreOp::Store,
                         },
                     })],
@@ -1908,13 +1963,21 @@ let window = event_loop.create_window(
                 rpass.set_bind_group(0, &bg, &[]);
                 rpass.draw(0..3, 0..1);
                 drop(rpass);
+                canvas_cleared = true;
             }
-            // (cur is always Some if prev was checked — see match above)
-            let _ = cur;
         }
         if let Some((cur, _prev)) = image_quad_args.as_ref() {
             let (uniforms, gpu_image, vx, vy, vw, vh) = cur;
             let vx = *vx; let vy = *vy; let vw = *vw; let vh = *vh;
+            // If the previous frame wasn't drawn (no slide), this is the
+            // first image draw → Clear. If it WAS drawn, Load to composite
+            // the incoming image over the outgoing one.
+            let second_pass_load = if canvas_cleared {
+                wgpu::LoadOp::Load
+            } else {
+                canvas_cleared = true;
+                wgpu::LoadOp::Clear(clear_color)
+            };
             wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, uniforms);
             let bind_group = wgpu_state.image_quad.create_bind_group(
                 &wgpu_state.device,
@@ -1925,11 +1988,8 @@ let window = event_loop.create_window(
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
-                    // Load the existing egui output as input —
-                    // the image quad is drawn on top of the
-                    // chrome, not cleared.
                     ops: wgpu::Operations {
-                        load: wgpu::LoadOp::Load,
+                        load: second_pass_load,
                         store: wgpu::StoreOp::Store,
                     },
                 })],
@@ -1948,6 +2008,37 @@ let window = event_loop.create_window(
             iq_rpass.draw(0..3, 0..1);
             drop(iq_rpass);
         }
+
+        // Now the egui pass, renders AFTER the image-quad so the UI
+        // chrome and popovers paint on top of the image. If the
+        // image-quad pass already Cleared the surface, use LoadOp::Load
+        // (no clear) so the UI composits on top; otherwise Clear so the
+        // surface doesn't show stale pixels from the previous frame.
+        let egui_load = if canvas_cleared {
+            wgpu::LoadOp::Load
+        } else {
+            wgpu::LoadOp::Clear(clear_color)
+        };
+        let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("egui"),
+            color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                view: &view,
+                resolve_target: None,
+                ops: wgpu::Operations {
+                    load: egui_load,
+                    store: wgpu::StoreOp::Store,
+                },
+            })],
+            depth_stencil_attachment: None,
+            timestamp_writes: None,
+            occlusion_query_set: None,
+        });
+
+        egui_state.renderer.render(
+            &mut rpass.forget_lifetime(),
+            &paint_jobs,
+            &screen_descriptor,
+        );
 
         wgpu_state.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
@@ -1985,6 +2076,7 @@ let window = event_loop.create_window(
                 root_idx: intent.root_idx,
                 is_favorite: is_fav,
             });
+            self.ctx_menu_open_at = Some(std::time::Instant::now());
             if let Some(es) = self.egui_state.as_ref() {
                 es.ctx.request_repaint();
             }
@@ -2859,10 +2951,11 @@ let window = event_loop.create_window(
     /// `self.ctx_menu`); `false` if it should close.
     fn draw_context_menu(
         ctx: &egui::Context,
-        menu: CtxMenu,
+        menu: &CtxMenu,
         pal: &Palette,
         current_path: Option<&Path>,
         actions: &mut Vec<UiAction>,
+        opened_at: Option<std::time::Instant>,
     ) -> bool {
         let mut close = false;
 
@@ -2911,7 +3004,7 @@ let window = event_loop.create_window(
             .fade_in(false)
             .fade_out(false);
 
-        match &menu {
+        match menu {
             CtxMenu::Image { pos } => {
                 window.fixed_pos(*pos).show(ctx, |ui| {
                     if item(ui, "复制图片路径", UiAction::CopyPath) { close = true; }
@@ -2944,16 +3037,28 @@ let window = event_loop.create_window(
         }
 
         // egui does NOT auto-close a non-modal Window on outside clicks,
-        // so detect it here. Without the egui-window rect (not exposed
-        // here) we approximate: any click is treated as outside, since
-        // menu item clicks already set `close = true` above.
-        let reopen = if close {
+        // so detect it here. Menu item clicks already set `close = true`
+        // above; any OTHER click is treated as "outside" and closes.
+        //
+        // IMPORTANT: the right-button-DOWN that OPENED the menu is still
+        // "in flight" on the frame the menu first appears (egui reports
+        // `pointer.any_click()` true for that same click). If we closed on
+        // that, the menu would flash and vanish instantly. So we ignore
+        // clicks within a short grace window (120 ms) after opening.
+        let should_stay_open = if close {
             false
         } else {
-            !ctx.input(|i| i.pointer.any_click())
+            let opened_just_now = opened_at.map_or(false, |t| {
+                t.elapsed().as_millis() < 120
+            });
+            if opened_just_now {
+                true
+            } else {
+                !ctx.input(|i| i.pointer.any_click())
+            }
         };
-        let _ = menu; // `match &menu` above consumed a borrow; silence the lint
-        reopen
+        let _ = menu; // menu is a borrow; keep the binding alive
+        should_stay_open
     }
 
     fn apply_action(&mut self, action: UiAction) {
@@ -3228,11 +3333,18 @@ let window = event_loop.create_window(
         // OS finishes maximising it. Phase 0 fix: synchronously
         // write the new viewport + re-fit, leaving the rect_anim
         // path animation for Tier 1.
-        let size = window.inner_size();
+        //
+        // Use the CLIENT rect (Win32) for the fullscreen size — winit's
+        // inner_size() reports it scaled by the DPI factor, which would
+        // configure a surface larger than the display and shift the image.
+        let isize = window.inner_size();
+        let fallback = (isize.width.max(1), isize.height.max(1));
+        let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+        let (csw, csh) = Self::client_area_physical_using(hwnd_raw, fallback);
         if self.is_fullscreen {
             if let Some(v) = &self.viewer {
                 let mut g = v.lock();
-                g.set_viewport_physical(size.width, size.height, 0.0, 0.0);
+                g.set_viewport_physical(csw, csh, 0.0, 0.0);
                 g.fit_to_screen();
             }
         } else if let Some(v) = &self.viewer {
@@ -3303,9 +3415,23 @@ let window = event_loop.create_window(
     /// `draw_context_menu` inside `build_egui_ui`. Replacing
     /// `ctx_menu` on a new right-click automatically closes any
     /// previously-open popup and reopens at the new position.
+    ///
+    /// `cursor` arrives in PHYSICAL pixels (from the router's
+    /// `cursor_pos`). egui::Window::fixed_pos expects LOGICAL points, so
+    /// we convert here before storing. Storing the raw physical value put
+    /// the popup WAY off to the bottom-right (the whole window is ~1843
+    /// physical wide, so a click at physical x=1100 got placed at logical
+    /// x=1100 which is ~2× the logical width — off-screen).
     fn open_image_context_menu(&mut self, cursor: egui::Pos2) {
         if self.nav.lock().current().is_none() { return; }
-        self.ctx_menu = Some(CtxMenu::Image { pos: cursor });
+        let ppp = self.wgpu_state
+            .as_ref()
+            .map(|w| w.pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.1);
+        let logical = egui::pos2(cursor.x / ppp, cursor.y / ppp);
+        self.ctx_menu = Some(CtxMenu::Image { pos: logical });
+        self.ctx_menu_open_at = Some(std::time::Instant::now());
         if let Some(es) = self.egui_state.as_ref() {
             es.ctx.request_repaint();
         }
@@ -3866,8 +3992,19 @@ impl ApplicationHandler for MainWindow {
             }
 
             WindowEvent::Resized(new_size) => {
-                let w = new_size.width.max(1);
-                let h = new_size.height.max(1);
+                // winit 0.30 reports the resized PhysicalSize scaled by the
+                // DPI factor in borderless fullscreen (e.g. 2560x1440 for a
+                // 2048x1152 monitor at 125%). Prefer the Win32 CLIENT rect
+                // so the surface matches the real display; keep the winit
+                // size only before the renderer exists (initial launch,
+                // where winit's value is correct for windowed mode).
+                let (w, h) = if self.wgpu_state.is_some() {
+                    let fallback = (new_size.width.max(1), new_size.height.max(1));
+                    let hwnd_raw = MAIN_HWND.load(std::sync::atomic::Ordering::Relaxed);
+                    Self::client_area_physical_using(hwnd_raw, fallback)
+                } else {
+                    (new_size.width.max(1), new_size.height.max(1))
+                };
 
                 // First Resized: create the wgpu/egui/d2d stack at the
                 // authoritative OS-reported size.
