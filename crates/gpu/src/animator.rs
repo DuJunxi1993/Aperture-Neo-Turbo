@@ -147,6 +147,12 @@ impl Animator {
         self.anim_type == AnimType::Slide && self.progress() < 1.0
     }
 
+    /// Eased slide progress in [0, 1]. Returns 1.0 when not sliding so a
+    /// caller can treat the animation as finished.
+    pub fn slide_progress(&self) -> f32 {
+        self.eased_progress()
+    }
+
     fn progress(&self) -> f32 {
         let elapsed = self.start_time.elapsed().as_secs_f32();
         (elapsed / self.duration).min(1.0)
@@ -159,59 +165,5 @@ impl Animator {
             AnimType::Slide => 1.0 - (1.0 - t).powi(5),
             _ => t * t * (3.0 - 2.0 * t),
         }
-    }
-
-    pub fn current_transform(
-        &self,
-        zoom: f32, offset_x: f32, offset_y: f32,
-        fit_scale: f32, slide_dir: crate::viewer::SlideDir, viewport_w: f32,
-    ) -> AffineTransform {
-        if !self.is_animating() {
-            return AffineTransform::translate(offset_x, offset_y)
-                .mul(AffineTransform::scale(zoom));
-        }
-
-        let t = self.eased_progress();
-
-        match self.anim_type {
-            AnimType::Fit => {
-                let scale = 1.0 + (fit_scale - 1.0) * t;
-                AffineTransform::scale(scale)
-            }
-            AnimType::Zoom | AnimType::Pan => {
-                self.from_transform.lerp(self.to_transform, t)
-            }
-            AnimType::Slide => {
-                let dir = match slide_dir {
-                    crate::viewer::SlideDir::Next => 1.0,
-                    crate::viewer::SlideDir::Previous => -1.0,
-                    crate::viewer::SlideDir::None => 0.0,
-                };
-                let shift = dir * viewport_w * (1.0 - t);
-                AffineTransform::translate(offset_x + shift, offset_y)
-                    .mul(AffineTransform::scale(zoom))
-            }
-            AnimType::None => AffineTransform::identity(),
-        }
-    }
-
-    pub fn prev_transform(
-        &self,
-        prev_fit: f32, prev_ox: f32, prev_oy: f32,
-        slide_dir: crate::viewer::SlideDir, viewport_w: f32,
-    ) -> AffineTransform {
-        if !self.is_sliding() { return AffineTransform::identity(); }
-
-        let t = self.eased_progress();
-        let dir = match slide_dir {
-            crate::viewer::SlideDir::Next => 1.0,
-            crate::viewer::SlideDir::Previous => -1.0,
-            crate::viewer::SlideDir::None => 0.0,
-        };
-        // Exit from its own fitted position, in parallel with the incoming
-        // image (same easing → same speed → carousel-strip feel).
-        let shift = -dir * viewport_w * t;
-        AffineTransform::translate(prev_ox + shift, prev_oy)
-            .mul(AffineTransform::scale(prev_fit))
     }
 }

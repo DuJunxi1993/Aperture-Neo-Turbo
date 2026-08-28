@@ -193,30 +193,31 @@ impl Direct2DViewer {
         let (m11, m12, m21, m22, dx, dy) = if let Some(t) = self.current_rect_anim_transform() {
             (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
         } else if self.animator.is_sliding() {
+            // iOS-style gallery slide. `offset_x/offset_y` is the IMAGE
+            // CENTRE (viewer-local). Build the affine via display_transform
+            // so the centre-to-affine conversion matches the static-fit
+            // path exactly — otherwise the image centre gets double-shifted
+            // (the slide used to be built from a top-left-anchored affine
+            // while offset_x is now a centre, sliding the image out of the
+            // viewport to the bottom-right and then snapping back).
+            let t = self.animator.slide_progress();
             let vw = self.viewport_w as f32;
-            let slide = self.animator.current_transform(
-                self.zoom, self.offset_x, self.offset_y,
-                self.fit_scale, self.slide_dir, vw,
-            );
-            if for_previous {
-                // Previous image: reverse the slide direction so the
-                // outgoing image moves opposite the incoming one.
-                let dir = match self.slide_dir {
-                    crate::viewer::SlideDir::Next => -1.0,
-                    crate::viewer::SlideDir::Previous => 1.0,
-                    crate::viewer::SlideDir::None => 0.0,
-                };
-                let shift = dir * vw * (1.0 - slide.m11.max(0.0).min(1.0));
-                // Place previous at its prior fit (offset,offset_y) and
-                // shift by `shift` in the OPPOSITE direction of the
-                // incoming slide. `current_transform`'s base is
-                // `offset_x` so the inverse direction is `offset_x
-                // - shift*sign(incoming)`. We just override dx.
-                (slide.m11, slide.m12, slide.m21, slide.m22,
-                 self.offset_x - shift, slide.dy)
+            let dir = match self.slide_dir {
+                crate::viewer::SlideDir::Next => 1.0,
+                crate::viewer::SlideDir::Previous => -1.0,
+                crate::viewer::SlideDir::None => 0.0,
+            };
+            let (cx, cy) = if for_previous {
+                // Outgoing image: centre starts at the middle and exits
+                // toward the OPPOSITE side of the incoming one.
+                (self.offset_x - dir * vw * t, self.offset_y)
             } else {
-                (slide.m11, slide.m12, slide.m21, slide.m22, slide.dx, slide.dy)
-            }
+                // Incoming image: centre enters from the direction side
+                // and settles at the middle.
+                (self.offset_x + dir * vw * (1.0 - t), self.offset_y)
+            };
+            let sl = self.display_transform(cx, cy, self.zoom);
+            (sl.m11, sl.m12, sl.m21, sl.m22, sl.dx, sl.dy)
         } else {
             let t = self.display_transform(self.offset_x, self.offset_y, self.zoom);
             (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
