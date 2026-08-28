@@ -45,6 +45,13 @@ pub struct Direct2DViewer {
     pub offset_x: f32,
     pub offset_y: f32,
     pub fit_scale: f32,
+    /// Whether the viewer is currently in "fit image to viewport" mode.
+    /// A real flag (not `zoom == fit_scale`) so that `set_viewport_physical`
+    /// can reliably re-centre the image when the viewport changes (tree/
+    /// thumb animation, fullscreen transition) without depending on a
+    /// fragile float comparison that breaks after a rotation or a zoom
+    /// that accidentally matches fit_scale.
+    pub is_fit: bool,
     pub bg: [f32; 3],
     rect_anim: Option<RectAnim>,
     pending_viewport_anim_from: Option<(f32, f32, f32, f32)>,
@@ -74,6 +81,7 @@ impl Direct2DViewer {
             offset_x: 0.0,
             offset_y: 0.0,
             fit_scale: 1.0,
+            is_fit: true,
             bg: [0.059, 0.063, 0.067],
             rect_anim: None,
             pending_viewport_anim_from: None,
@@ -291,6 +299,7 @@ impl Direct2DViewer {
             // image shifted by `−sw/2` from its intended position.
             self.offset_x = self.viewport_w as f32 * 0.5;
             self.offset_y = self.viewport_h as f32 * 0.5;
+            self.is_fit = true;
         }
     }
 
@@ -302,6 +311,7 @@ impl Direct2DViewer {
         self.offset_x = cursor_x - cursor_rel_x * (new_zoom / self.zoom);
         self.offset_y = cursor_y - cursor_rel_y * (new_zoom / self.zoom);
         self.zoom = new_zoom;
+        self.is_fit = false;
         self.clamp_pan();
         self.animator.reset();
     }
@@ -314,6 +324,7 @@ impl Direct2DViewer {
         let rel_y = cy - self.offset_y;
         self.offset_x = cx - rel_x * factor;
         self.offset_y = cy - rel_y * factor;
+        self.is_fit = false;
         self.clamp_pan();
         self.animator.reset();
     }
@@ -321,6 +332,7 @@ impl Direct2DViewer {
     pub fn on_pan(&mut self, dx: f32, dy: f32) {
         self.offset_x += dx;
         self.offset_y += dy;
+        self.is_fit = false;
         self.clamp_pan();
         self.rect_anim = None;
     }
@@ -468,6 +480,7 @@ impl Direct2DViewer {
                 (img.width as f32, img.height as f32)
             };
             self.zoom = 1.0;
+            self.is_fit = false;
             // Image centre at viewport centre (display_transform reads
             // offset_x/y as image-centre; see compute_fit).
             self.offset_x = self.viewport_w as f32 * 0.5;
@@ -513,13 +526,26 @@ impl Direct2DViewer {
     /// fit / offset — those are owned by user actions (pan/zoom) and
     /// `set_image_gpu`. Called every frame from `render_frame` so the
     /// viewer's internal viewport stays in sync with the egui
-    /// CentralPanel as panel animations change its width — without
-    /// disturbing the user's current pan/zoom state.
+    /// CentralPanel as panel animations change its width.
+    ///
+    /// HOWEVER: if the image is currently in FIT state (zoom == fit_scale)
+    /// and the viewport size/origin CHANGED, we must re-fit. Otherwise the
+    /// image's centre (offset_x/y) was computed against the OLD viewport
+    /// and stays put in the CENTRAL PANEL while the panel itself slides
+    /// (e.g. the tree/thumb width animation on startup, or the fullscreen
+    /// transition) — leaving the image visibly off-centre. Re-fitting here
+    /// keeps the image centred as the panel animates.
     #[inline]
     pub fn set_viewport_physical(&mut self, w: u32, h: u32, x: f32, y: f32) {
+        let size_changed = self.viewport_w != w || self.viewport_h != h;
+        let origin_changed =
+            (self.viewport_origin.0 - x).abs() > 0.5 || (self.viewport_origin.1 - y).abs() > 0.5;
         self.viewport_w = w;
         self.viewport_h = h;
         self.viewport_origin = (x, y);
+        if self.current_gpu.is_some() && self.is_fit && (size_changed || origin_changed) {
+            self.compute_fit();
+        }
     }
 
     /// Returns the current rect-anim interpolated transform, or None if
