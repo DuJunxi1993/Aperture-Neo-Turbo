@@ -21,9 +21,6 @@ use crate::{WicLoader, Direct2DViewer, SlideDir, decode_file, DecodedPixels, Dec
 
 type DecodeId = u64;
 
-/// Max queued navigation steps before we start coalescing.
-const MAX_QUEUED_STEPS: usize = 60;
-
 pub struct DecodeCoordinator {
     nav: Arc<Mutex<NavigationService>>,
     loader: Arc<WicLoader>,
@@ -68,15 +65,19 @@ impl DecodeCoordinator {
     }
 
     pub fn request_current(&self, direction: SlideDir) -> DecodeId {
-        // If a decode is already in flight, queue this step for sequential
-        // replay instead of overwriting the pending request.
+        // Cover-style navigation: if a decode is already in flight, the
+        // user is likely holding an arrow key and paging FAST. We don't
+        // want to replay a backlog (that lags behind and keeps flipping
+        // after the key is released) — we OVERWRITE any queued step with
+        // the newest direction so the next decode jumps straight to the
+        // latest requested image ("follow the hand"). This makes hold-to-
+        // page feel immediate and stop exactly on release.
         {
             let mut pending = self.pending.lock();
             if pending.is_some() {
                 let mut q = self.queued_steps.lock();
-                if q.len() < MAX_QUEUED_STEPS {
-                    q.push_back(direction);
-                }
+                q.clear();
+                q.push_back(direction);
                 return 0;
             }
             // Reserve the slot so chained requests see "busy".
