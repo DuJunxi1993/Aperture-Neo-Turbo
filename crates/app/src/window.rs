@@ -264,23 +264,23 @@ struct PanelWidth {
 
 impl PanelWidth {
     fn new(default_w: f32) -> Self {
-        Self { user_width: default_w, anim: default_w, content_min: 0.0 }
+        // anim starts at 0 so the panel animates open from 0 on launch
+        // (rather than being at full width immediately) and closes back
+        // to 0 smoothly. user_width is the drag-adjusted target.
+        Self { user_width: default_w, anim: 0.0, content_min: 0.0 }
     }
 
     /// Advance the animation and return the width to draw with this frame.
+    /// Both expand (target = user_width) and collapse (target = 0) ease
+    /// exponentially (~120 ms settle) so the tree/thumb panels slide open
+    /// and closed instead of snapping. Snap the LAST few percent so the
+    /// fully-collapsed panel isn't left with a sub-pixel sliver.
     fn tick(&mut self, expanded: bool, dt: f32) -> f32 {
-        // Collapsing to 0 is instant — only the expansion direction
-        // animates. This avoids a flash of the panel for several frames
-        // when show_tree/show_thumbs are toggled false (e.g. by
-        // SingleImage launch, which starts at the default full width
-        // and would otherwise leave a visible tree column for ~30
-        // frames until the exponential easing settles).
-        if !expanded {
-            self.anim = 0.0;
-            return 0.0;
-        }
-        let target = self.user_width.max(self.content_min);
-        // Exponential smoothing ≈ 120ms settle time.
+        let target = if expanded {
+            self.user_width.max(self.content_min)
+        } else {
+            0.0
+        };
         let k = (dt / 0.12).clamp(0.0, 1.0);
         self.anim += (target - self.anim) * k;
         if (self.anim - target).abs() < 0.5 {
@@ -400,7 +400,6 @@ pub struct MainWindow {
     arrow_held: Option<NavigationDirection>,
     pending_nav: Option<NavigationDirection>,
     pending_slide_dir: SlideDir,
-    last_arrow_nav_at: Option<std::time::Instant>,
 }
 
 pub struct WgpuState {
@@ -520,7 +519,6 @@ impl MainWindow {
             arrow_held: None,
             pending_nav: None,
             pending_slide_dir: SlideDir::None,
-            last_arrow_nav_at: None,
             initial_folder: folder,
             show_shortcut_help: false,
             chrome_visible: true,
@@ -945,7 +943,6 @@ let window = event_loop.create_window(
         if self.arrow_held.is_none() {
             // First press in a fresh hold — jump immediately.
             self.handle_navigation(direction, slide_dir);
-            self.last_arrow_nav_at = Some(std::time::Instant::now());
         }
         // Always mark the key as held + queue the direction so the
         // per-frame dispatcher can keep advancing while the user
@@ -959,29 +956,20 @@ let window = event_loop.create_window(
 
     /// Per-frame dispatcher for held arrow keys. Called from
     /// `render_frame` BEFORE the egui frame. If `pending_nav` is
-    /// set AND `arrow_held` matches the queued direction AND
-    /// at least ~200 ms has passed since the last nav, fire one
-    /// navigation. KEYUP already cleared both, so a frame after
-    /// release sees no pending nav and this is a no-op — that's
-    /// the immediate-stop behavior the user wants.
-    ///
-    /// We never POP `pending_nav` from here — KEYUP is the only
-    /// thing that clears it. The 200 ms gate is what caps the
-    /// continuous-hold rate (≈ one nav per slide-animation
-    /// duration).
+    /// set AND `arrow_held` matches the queued direction, fire one
+    /// navigation EVERY FRAME — no rate cap, so the fastest the system
+    /// can decode/prepare an image is how fast the user pages through.
+    /// KEYUP already cleared both, so a frame after release sees no
+    /// pending nav and this is a no-op — that's the immediate-stop
+    /// behavior the user wants. (Decode is cover-style: the coordinator
+    /// overwrites any in-flight request with the latest direction so a
+    /// fast hold "jumps to the newest" image rather than replaying a
+    /// backlog.)
     fn tick_arrow_nav(&mut self) {
         let Some(dir) = self.pending_nav else { return; };
         if self.arrow_held != Some(dir) { return; }
-        const MIN_GAP: std::time::Duration = std::time::Duration::from_millis(200);
-        let now = std::time::Instant::now();
-        let ready = match self.last_arrow_nav_at {
-            Some(prev) => now.duration_since(prev) >= MIN_GAP,
-            None => true,
-        };
-        if !ready { return; }
         let slide_dir = self.pending_slide_dir;
         self.handle_navigation(dir, slide_dir);
-        self.last_arrow_nav_at = Some(now);
     }
 
     fn navigate_to_folder(&mut self, path: PathBuf) {
