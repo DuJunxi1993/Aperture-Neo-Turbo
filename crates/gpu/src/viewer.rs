@@ -680,6 +680,21 @@ impl Direct2DViewer {
         self.rect_anim = None;
     }
 
+    /// Advance the rect-anim to completion. Once the delay has elapsed the
+    /// anim is committed (final zoom/offset applied) and dropped. Called
+    /// once per frame from `render_frame` — without this, a rect-anim
+    /// started by set_rotation / fit_to_screen stays resident forever, so
+    /// `current_rect_anim_transform` keeps returning its (frozen) transform
+    /// and `gpu_uniforms_for` ignores pan/zoom/offset. That is the bug
+    /// behind "wheel zoom stops working after a rotation / fullscreen
+    /// doesn't fit until I drag" — dragging clears rect_anim via on_pan,
+    /// which accidentally unblocked the pipeline.
+    pub fn tick_rect_anim(&mut self) {
+        if self.rect_anim_done() {
+            self.commit_rect_anim();
+        }
+    }
+
     pub fn is_transitioning(&self) -> bool {
         self.animator.is_animating() || self.rect_anim.is_some()
     }

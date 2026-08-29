@@ -1093,9 +1093,15 @@ let window = event_loop.create_window(
             coordinator.poll();
         }
 
-        // Advance the rotation animation (spin to the target quadrant).
+        // Advance the rotation + rect animations. The rect-anim MUST be
+        // committed when it finishes — otherwise a rect-anim started by
+        // set_rotation / fit_to_screen stays resident forever and the
+        // image-quad ignores pan/zoom/offset (the "rotation breaks wheel
+        // zoom / fullscreen doesn't fit until I drag" bug).
         if let Some(viewer) = &self.viewer {
-            viewer.lock().tick_rotation();
+            let mut v = viewer.lock();
+            v.tick_rotation();
+            v.tick_rect_anim();
         }
 
         // Held-arrow-key dispatcher. Fires one navigation per
