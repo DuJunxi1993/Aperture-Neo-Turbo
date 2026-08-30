@@ -3373,17 +3373,34 @@ let window = event_loop.create_window(
                 .auto_shrink([false, false])
                 .vertical_scroll_offset(THUMB_SCROLL_Y.with(|c| c.get()))
                 .show(ui, |ui| {
-                    // Multi-column thumbnail grid: equal-width columns based
-                    // on panel width, with consistent row height for
-                    // already-loaded thumbnails.
+                    // Multi-column thumbnail grid with EXPLICIT width
+                    // thresholds so the square cards grow between thresholds
+                    // instead of the count jittering at every pixel:
+                    //   < T1     -> 1 col (card fills width)
+                    //   T1..T2   -> 2 cols (cards grow with width)
+                    //   >= T2    -> 3 cols
+                    // The per-card Frame adds 2*inner_margin (8px), which the
+                    // old formula ignored -> the last column overflowed and
+                    // was clipped by the window right edge.
+                    const CARD_MARGIN_TOTAL: f32 = 8.0; // 2 × inner_margin(4)
                     let avail = (ui.available_width() - 8.0).max(80.0);
-                    let target_card_w: f32 = 160.0;
                     let gap: f32 = 6.0;
-                    let cols = ((avail + gap) / (target_card_w + gap)).floor() as usize;
-                    let cols = cols.clamp(1, 3);
-                    let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
-                    let row_h: f32 = 170.0;
-                    let row_full_h: f32 = card_w + 24.0; // image + label area + margin
+                    // Effective width available across all cards + gaps.
+                    let col_count = if avail >= 520.0 {
+                        3usize
+                    } else if avail >= 340.0 {
+                        2usize
+                    } else {
+                        1usize
+                    };
+                    let cols = col_count.max(1);
+                    let card_w = ((avail - gap * (cols as f32 - 1.0) - CARD_MARGIN_TOTAL * cols as f32)
+                        / cols as f32)
+                        .max(60.0);
+                    // Row height = square image (card_w) + filename line +
+                    // margins/spacing. Used only by the scroll prefetch
+                    // estimator below.
+                    let row_full_h: f32 = card_w + 26.0;
 
                     // Thumbnail decode virtualization: only request decodes
                     // for cards near the visible range (±buffer), not all
@@ -3442,21 +3459,15 @@ let window = event_loop.create_window(
                                     .map(|n| n.to_string_lossy().into_owned())
                                     .unwrap_or_default();
 
-                                // Image area: aspect-correct from the
-                                // actual decoded thumb (200×200 source preserved
-                                // to its source AR), capped at row_h. Until the
-                                // thumb has decoded, we fall back to a fixed
-                                // placeholder height so unloaded cards don't
-                                // break the row grid.
-                                let tex_size = texture_cache
-                                    .get_thumb(&path)
-                                    .map(|e| e.texture.size_vec2());
-                                let img_h = match tex_size {
-                                    Some(sz) => (card_w / (sz.x / sz.y.max(1.0)).max(0.0001))
-                                        .min(row_h)
-                                        .max(60.0),
-                                    None => row_h.min(100.0),
-                                };
+                                // Square image area: the card is a SQUARE frame
+                                // (card_w × card_w). The thumbnail is contained
+                                // (fit) inside it with padding so its corners
+                                // don't clip the card's rounded corners. The
+                                // filename goes on its OWN line BELOW the image
+                                // (the card.inner ui is forced top-down so the
+                                // label isn't laid out to the image's right).
+                                let img_h = card_w;
+                                const IMG_PAD: f32 = 6.0;
 
                                 let card = egui::Frame::default()
                                     .fill(if is_selected {
@@ -3472,53 +3483,65 @@ let window = event_loop.create_window(
                                     .rounding(egui::Rounding::same(8.0))
                                     .inner_margin(egui::Margin::same(4.0));
                                 let resp = card.show(ui, |ui| {
-                                    let (rect, _) = ui.allocate_exact_size(
-                                        egui::vec2(card_w, img_h),
-                                        egui::Sense::hover(),
-                                    );
-                                    if let Some(entry) = texture_cache.get_thumb(&path) {
-                                        let size = entry.texture.size_vec2();
-                                        let scale = (rect.width() / size.x.max(1.0))
-                                            .min(rect.height() / size.y.max(1.0));
-                                        let fit_size =
-                                            egui::vec2(size.x * scale, size.y * scale);
-                                        let fit_rect = egui::Rect::from_center_size(
-                                            rect.center(),
-                                            fit_size,
+                                    // Force a vertical stack so the image area
+                                    // and the filename line up top-to-bottom
+                                    // instead of side by side (the inherited
+                                    // `horizontal` row layout put the label to
+                                    // the image's right).
+                                    ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        let (rect, _) = ui.allocate_exact_size(
+                                            egui::vec2(card_w, img_h),
+                                            egui::Sense::hover(),
                                         );
-                                        ui.painter().image(
-                                            entry.texture.id(),
-                                            fit_rect,
-                                            egui::Rect::from_min_max(
-                                                egui::Pos2::ZERO,
-                                                egui::Pos2::new(1.0, 1.0),
-                                            ),
-                                            egui::Color32::WHITE,
+                                        if let Some(entry) = texture_cache.get_thumb(&path) {
+                                            let size = entry.texture.size_vec2();
+                                            let inner = rect.shrink(IMG_PAD);
+                                            let scale = (inner.width() / size.x.max(1.0))
+                                                .min(inner.height() / size.y.max(1.0));
+                                            let fit_size =
+                                                egui::vec2(size.x * scale, size.y * scale);
+                                            let fit_rect = egui::Rect::from_center_size(
+                                                inner.center(),
+                                                fit_size,
+                                            );
+                                            ui.painter().image(
+                                                entry.texture.id(),
+                                                fit_rect,
+                                                egui::Rect::from_min_max(
+                                                    egui::Pos2::ZERO,
+                                                    egui::Pos2::new(1.0, 1.0),
+                                                ),
+                                                egui::Color32::WHITE,
+                                            );
+                                        } else {
+                                            ui.painter().rect_filled(
+                                                rect,
+                                                6.0,
+                                                pal.thumb_placeholder,
+                                            );
+                                            ui.painter().text(
+                                                rect.center(),
+                                                egui::Align2::CENTER_CENTER,
+                                                "···",
+                                                egui::FontId::proportional(12.0),
+                                                pal.text_dim,
+                                            );
+                                        }
+                                        // Filename on its own truncated line.
+                                        ui.add_space(2.0);
+                                        ui.add(
+                                            egui::Label::new(
+                                                egui::RichText::new(name)
+                                                    .size(10.5)
+                                                    .color(if is_selected {
+                                                        pal.text_primary
+                                                    } else {
+                                                        pal.text_tertiary
+                                                    }),
+                                            )
+                                            .truncate(),
                                         );
-                                    } else {
-                                        ui.painter().rect_filled(
-                                            rect,
-                                            6.0,
-                                            pal.thumb_placeholder,
-                                        );
-                                        ui.painter().text(
-                                            rect.center(),
-                                            egui::Align2::CENTER_CENTER,
-                                            "···",
-                                            egui::FontId::proportional(12.0),
-                                            pal.text_dim,
-                                        );
-                                    }
-                                    ui.add_space(2.0);
-                                    ui.label(
-                                        egui::RichText::new(name)
-                                            .size(10.5)
-                                            .color(if is_selected {
-                                                pal.text_primary
-                                            } else {
-                                                pal.text_tertiary
-                                            }),
-                                    );
+                                    });
                                 }).response.interact(egui::Sense::click());
                                 resp_rects.push(resp.rect);
                                 if is_selected && force_scroll {
@@ -4488,7 +4511,7 @@ impl ApplicationHandler for MainWindow {
                                     (self.drawer_user_width + dx / ppp).clamp(DRAWER_MIN_W, DRAWER_MAX_W);
                             }
                         }
-                        1 => self.thumb_panel.apply_drag(-dx / ppp, 180.0, 440.0),
+                        1 => self.thumb_panel.apply_drag(-dx / ppp, 180.0, 560.0),
                         _ => {}
                     }
                     if let Some(w) = &self.window { w.request_redraw(); }
