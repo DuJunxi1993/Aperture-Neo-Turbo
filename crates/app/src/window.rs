@@ -3864,15 +3864,42 @@ let window = event_loop.create_window(
                 blur: 24.0,
             });
 
+        // Self-size the menu to the widest item (NOT the whole screen): the
+        // item rows allocate a FIXED width (below) so auto-sizing can't blow
+        // them out to the full window width. Measured via layout_job.
+        fn label_w(ctx: &egui::Context, t: &str) -> f32 {
+            let job = egui::text::LayoutJob::simple(
+                t.into(),
+                egui::FontId::proportional(12.5),
+                egui::Color32::WHITE,
+                200.0,
+            );
+            ctx.fonts(|f| f.layout_job(job).size().x)
+        }
+        // Compute the width from the union of every possible menu label so
+        // it fits whichever variant currently shows. Only visible items are
+        // drawn; the width is the widest of all possibilities + padding.
+        let all_labels = [
+            "复制图片路径",
+            "在资源管理器中打开",
+            "打印",
+            "设为桌面壁纸",
+            "在目录树中定位",
+            "取消收藏",
+            "添加到收藏",
+            "从 Recent 移除",
+        ];
+        let widest = all_labels.iter().map(|t| label_w(ctx, t)).fold(0.0_f32, f32::max);
+        let menu_width = (widest + 26.0).max(140.0);
+
         let mut item = |ui: &mut egui::Ui, label: &str, action: UiAction| -> bool {
             let mut clicked = false;
-            // Allocate a FULL-WIDTH row first so the hover highlight spans
-            // the whole menu item, not just the text extents (the old
-            // Button::frame(false) made the highlight a variable-width box
-            // hugging the label).
+            // Allocate a row of `menu_width` (not available_width, which is
+            // unconstrained inside an auto-sized window and stretched the
+            // menu to the screen width). The highlight spans the full row.
             let row_h: f32 = 28.0;
             let (row_rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), row_h),
+                egui::vec2(menu_width, row_h),
                 egui::Sense::click(),
             );
             if resp.hovered() {
@@ -3910,9 +3937,10 @@ let window = event_loop.create_window(
             .collapsible(false)
             .title_bar(false)
             .fade_in(false)
-            .fade_out(false);
-
-        let window = window.auto_sized();
+            .fade_out(false)
+            // Fixed width from the widest label (NOT auto_sized, which lets
+            // item rows expand to the whole screen width).
+            .default_width(menu_width);
 
         match menu {
             CtxMenu::Image { pos } => {
