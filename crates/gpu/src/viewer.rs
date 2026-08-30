@@ -26,6 +26,22 @@ const MAX_ZOOM: f32 = 5.0;
 /// drag much further to the right than to the left.
 const PAN_OVERSHOOT_PX: f32 = 40.0;
 
+/// Eased progress for a rect-anim (0→1).
+fn ease(easing: Easing, raw: f32) -> f32 {
+    match easing {
+        // Fast start, quick settle: feels immediate for repeated zoom steps.
+        Easing::EaseOut => 1.0 - (1.0 - raw).powi(3),
+        // Slow at both ends: for discrete fit ↔ 1:1 transitions.
+        Easing::EaseInOut => {
+            if raw < 0.5 {
+                4.0 * raw * raw * raw
+            } else {
+                1.0 - (-2.0 * raw + 2.0).powi(3) / 2.0
+            }
+        }
+    }
+}
+
 /// Clamp an image-centre coordinate against a viewport edge rule, returning
 /// the centred half-extent when the image fits or when the wall interval
 /// would invert. `w` = image extent, `vw` = viewport extent, `overshoot` =
@@ -126,11 +142,20 @@ struct RotAnim {
     dur: f32,
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Easing {
+    /// Fast start, slow end — feels instant for repeated user zoom steps.
+    EaseOut,
+    /// Slow at both ends — used for discrete fit ↔ 1:1 transitions.
+    EaseInOut,
+}
+
 struct RectAnim {
     from: (f32, f32, f32, f32),
     to: (f32, f32, f32, f32),
     start: std::time::Instant,
     dur: f32,
+    easing: Easing,
     window_space: bool,
 }
 
@@ -442,9 +467,15 @@ impl Direct2DViewer {
     }
 
     pub fn on_wheel(&mut self, delta: i32, cursor_x: f32, cursor_y: f32) {
-        let zoom_factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
+        // Continuous, delta-proportional zoom factor: one full scroll notch
+        // (~±2400 from the LineDelta→*100 pipeline) maps to roughly ×1.5 /
+        // ÷1.5, and sub-notch pixel scrolls scale proportionally, so a single
+        // wheel turn produces an obvious, smooth change instead of needing
+        // many turns for a fixed 1.1× step.
+        let clamped = (delta as f32).clamp(-6000.0, 6000.0) / 2400.0;
+        let zoom_factor = 1.5_f32.powf(clamped);
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
-        let new_zoom = if new_zoom == self.zoom { return; } else { new_zoom };
+        if new_zoom == self.zoom { return; }
         // cursor is in WINDOW physical coords (router.cursor_pos); the
         // image centre offset is viewer-LOCAL, so shift by the viewport
         // origin first. Otherwise zoom-to-cursor lands off (e.g. with a
@@ -461,7 +492,13 @@ impl Direct2DViewer {
         // zoom is smooth like a pinch instead of stepping per notch.
         if self.current_gpu.is_some() {
             let (ew, eh) = self.effective_size();
-            self.start_rect_anim((target_off_x, target_off_y, ew * new_zoom, eh * new_zoom));
+            self.start_rect_anim_eased_with(
+                self.anim_rect(),
+                (target_off_x, target_off_y, ew * new_zoom, eh * new_zoom),
+                0.14,
+                Easing::EaseOut,
+                false,
+            );
         } else {
             self.offset_x = target_off_x;
             self.offset_y = target_off_y;
@@ -484,7 +521,13 @@ impl Direct2DViewer {
         self.is_fit = false;
         if self.current_gpu.is_some() {
             let (ew, eh) = self.effective_size();
-            self.start_rect_anim((target_off_x, target_off_y, ew * new_zoom, eh * new_zoom));
+            self.start_rect_anim_eased_with(
+                self.anim_rect(),
+                (target_off_x, target_off_y, ew * new_zoom, eh * new_zoom),
+                0.14,
+                Easing::EaseOut,
+                false,
+            );
         } else {
             self.offset_x = target_off_x;
             self.offset_y = target_off_y;
@@ -567,10 +610,36 @@ impl Direct2DViewer {
     }
 
     pub fn start_rect_anim(&mut self, target: (f32, f32, f32, f32)) {
+        // Default used by fit ↔ 1:1 transitions: ease-in-out, 0.28s.
+        self.start_rect_anim_eased(self.anim_rect(), target, 0.28, Easing::EaseInOut);
+    }
+
+    /// Start a rect-anim from an EXPLICIT `from`, with the given duration and
+    /// easing. Used by fit/1:1 where `from` must be captured BEFORE the zoom /
+    /// offset are mutated (otherwise `from == to` and there's no animation).
+    pub fn start_rect_anim_eased(
+        &mut self,
+        from: (f32, f32, f32, f32),
+        target: (f32, f32, f32, f32),
+        dur: f32,
+        easing: Easing,
+    ) {
+        self.start_rect_anim_eased_with(from, target, dur, easing, false);
+    }
+
+    /// Full control: explicit from/to, duration, easing, and whether the rect
+    /// is in WINDOW space (vs viewer-local). Skips a no-op anim (from≈to).
+    pub fn start_rect_anim_eased_with(
+        &mut self,
+        from: (f32, f32, f32, f32),
+        target: (f32, f32, f32, f32),
+        dur: f32,
+        easing: Easing,
+        window_space: bool,
+    ) {
         if self.current_gpu.is_none() {
             return;
         }
-        let from = self.anim_rect();
         if (from.2 - target.2).abs() < 0.5 && (from.0 - target.0).abs() < 0.5 {
             return;
         }
@@ -578,8 +647,9 @@ impl Direct2DViewer {
             from,
             to: target,
             start: std::time::Instant::now(),
-            dur: 0.28,
-            window_space: false,
+            dur,
+            easing,
+            window_space,
         });
     }
 
@@ -590,11 +660,7 @@ impl Direct2DViewer {
     fn anim_rect(&self) -> (f32, f32, f32, f32) {
         if let Some(anim) = &self.rect_anim {
             let raw = (anim.start.elapsed().as_secs_f32() / anim.dur).min(1.0);
-            let t = if raw < 0.5 {
-                4.0 * raw * raw * raw
-            } else {
-                1.0 - (-2.0 * raw + 2.0).powi(3) / 2.0
-            };
+            let t = ease(anim.easing, raw);
             return (
                 anim.from.0 + (anim.to.0 - anim.from.0) * t,
                 anim.from.1 + (anim.to.1 - anim.from.1) * t,
@@ -639,16 +705,20 @@ impl Direct2DViewer {
     }
 
     pub fn fit_to_screen(&mut self) {
-        self.compute_fit();
         if self.current_gpu.is_some() {
+            // Capture the CURRENT on-screen rect BEFORE compute_fit mutates
+            // zoom/offset — otherwise the anim's `from` equals the target and
+            // the fit snaps instead of animating.
             let (ew, eh) = self.effective_size();
+            let from = self.anim_rect();
+            self.compute_fit();
             let target = (
                 self.offset_x,
                 self.offset_y,
                 ew * self.zoom,
                 eh * self.zoom,
             );
-            self.start_rect_anim(target);
+            self.start_rect_anim_eased(from, target, 0.28, Easing::EaseInOut);
         }
     }
 
@@ -663,6 +733,7 @@ impl Direct2DViewer {
             } else {
                 (img.width as f32, img.height as f32)
             };
+            let from = self.anim_rect();
             self.zoom = 1.0;
             self.is_fit = false;
             // Image centre at viewport centre (display_transform reads
@@ -670,7 +741,7 @@ impl Direct2DViewer {
             self.offset_x = self.viewport_w as f32 * 0.5;
             self.offset_y = self.viewport_h as f32 * 0.5;
             let target = (self.offset_x, self.offset_y, dw, dh);
-            self.start_rect_anim(target);
+            self.start_rect_anim_eased(from, target, 0.28, Easing::EaseInOut);
         }
     }
 
@@ -691,6 +762,7 @@ impl Direct2DViewer {
                 to,
                 start: std::time::Instant::now(),
                 dur: 0.35,
+                easing: Easing::EaseInOut,
                 window_space: true,
             });
         }
@@ -967,6 +1039,7 @@ impl Direct2DViewer {
             to: target,
             start: std::time::Instant::now(),
             dur,
+            easing: Easing::EaseInOut,
             window_space: false,
         });
     }

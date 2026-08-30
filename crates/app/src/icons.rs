@@ -8,11 +8,19 @@
 
 use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 
-/// Expand a normalized point (in `[-0.5, 0.5]`) into the icon rect.
-fn map(p: Vec2, rect: Rect) -> Pos2 {
+/// The side of the square box all icons live in. Buttons are non-square
+/// (e.g. 42×30), so scale by the SMALLER edge and centre the box — otherwise a
+/// width-based radius overflows the button height and clips into a stray line.
+fn icon_side(rect: Rect) -> f32 {
+    rect.width().min(rect.height()) * 0.92
+}
+
+/// Expand a normalized point (in `[-0.5, 0.5]`) into a centred square box of
+/// side `u` inside `rect`.
+fn map(p: Vec2, rect: Rect, u: f32) -> Pos2 {
     Pos2::new(
-        rect.center().x + p.x * rect.width(),
-        rect.center().y + p.y * rect.height(),
+        rect.center().x + p.x * u,
+        rect.center().y + p.y * u,
     )
 }
 
@@ -65,57 +73,58 @@ fn rounded_closed(vertices: &[Vec2], radius: f32, segs: usize) -> Vec<Vec2> {
 
 /// Draw the settings gear: a toothed cog outline with a circular centre hole.
 pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.7_f32, color);
+    let u = icon_side(rect);
+    let stroke = Stroke::new(u / 15.0, color);
     let cx = rect.center();
-    let outer_r = rect.width() * 0.44;
+    let outer_r = u * 0.42;
     let teeth = 8;
-    let tooth_h = outer_r * 0.30;
+    let tooth_h = outer_r * 0.26;
     let mut pts = Vec::new();
     for i in 0..teeth {
         let a0 = (i as f32 / teeth as f32) * std::f32::consts::TAU;
         let a1 = ((i as f32 + 1.0) / teeth as f32) * std::f32::consts::TAU;
         let a_mid = (a0 + a1) * 0.5;
         // valley → tooth tip → valley (rounded transitions baked by arcs)
-        arc_into(&mut pts, cx, outer_r - tooth_h, a0, a_mid - 0.04, 5);
-        arc_into(&mut pts, cx, outer_r, a_mid - 0.04, a_mid + 0.04, 3);
-        arc_into(&mut pts, cx, outer_r - tooth_h, a_mid + 0.04, a1, 5);
+        arc_into(&mut pts, cx, outer_r - tooth_h, a0, a_mid - 0.05, 5);
+        arc_into(&mut pts, cx, outer_r, a_mid - 0.05, a_mid + 0.05, 3);
+        arc_into(&mut pts, cx, outer_r - tooth_h, a_mid + 0.05, a1, 5);
     }
     painter.add(Shape::closed_line(pts, stroke));
-    painter.circle_stroke(cx, outer_r * 0.34, stroke);
+    painter.circle_stroke(cx, outer_r * 0.36, stroke);
 }
 
 /// Draw the help speech-bubble: a rounded-square outline with a tail at the
 /// bottom-left and a filled `?` glyph.
 pub fn help(painter: &Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.7_f32, color);
-    let w = rect.width();
-    let h = rect.height();
+    let u = icon_side(rect);
+    let stroke = Stroke::new(u / 15.0, color);
     let left = -0.5;
     let right = 0.5;
     let top = -0.5;
     let bottom = 0.5;
-    // Outline: rounded square with a tail pointing down-left.
+    // Outline: rounded square with a tail pointing down-left (kept inside the
+    // box so it never clips past the button's height).
     let verts = [
         Vec2::new(left, top),
         Vec2::new(right, top),
         Vec2::new(right, bottom),
         Vec2::new(-0.04, bottom),
-        Vec2::new(-0.42, bottom + 0.34),
+        Vec2::new(-0.30, bottom + 0.22),
         Vec2::new(left, bottom),
     ];
-    let pts: Vec<Pos2> = rounded_closed(&verts, 0.30, 7).iter().map(|p| map(*p, rect)).collect();
+    let pts: Vec<Pos2> = rounded_closed(&verts, 0.28, 7).iter().map(|p| map(*p, rect, u)).collect();
     painter.add(Shape::closed_line(pts, stroke));
 
     // Filled "?" — a horseshoe arc, a descending stem, and a dot.
-    let qw = w * 0.30;
+    let qw = u * 0.30;
     let stroke_q = Stroke::new(qw * 0.48, color);
     let arc_r = qw * 0.62;
-    let arc_c = Pos2::new(rect.center().x, rect.center().y - h * 0.12);
+    let arc_c = Pos2::new(rect.center().x, rect.center().y - u * 0.12);
     let mut qpts = Vec::new();
     arc_into(&mut qpts, arc_c, arc_r, std::f32::consts::PI * 0.90, std::f32::consts::PI * 2.10, 13);
     painter.add(Shape::line(qpts, stroke_q));
     let stem_top = Pos2::new(arc_c.x, arc_c.y + arc_r * 0.40);
-    let stem_bot = Pos2::new(rect.center().x, rect.center().y + h * 0.14);
+    let stem_bot = Pos2::new(rect.center().x, rect.center().y + u * 0.14);
     painter.line_segment([stem_top, stem_bot], stroke_q);
     painter.circle_filled(Pos2::new(stem_bot.x, stem_bot.y + qw * 0.36), qw * 0.26, color);
 }
@@ -123,9 +132,8 @@ pub fn help(painter: &Painter, rect: Rect, color: Color32) {
 /// Draw the home glyph: a stroked house outline (pitched rounded roof, square
 /// body) with a short rounded horizontal door bar inside.
 pub fn home(painter: &Painter, rect: Rect, color: Color32) {
-    let stroke = Stroke::new(1.7_f32, color);
-    let w = rect.width();
-    let h = rect.height();
+    let u = icon_side(rect);
+    let stroke = Stroke::new(u / 15.0, color);
     let left = -0.5;
     let right = 0.5;
     let top = -0.5;
@@ -137,13 +145,13 @@ pub fn home(painter: &Painter, rect: Rect, color: Color32) {
         Vec2::new(left, bottom),
         Vec2::new(left, top + 0.40),
     ];
-    let pts: Vec<Pos2> = rounded_closed(&verts, 0.13, 7).iter().map(|p| map(*p, rect)).collect();
+    let pts: Vec<Pos2> = rounded_closed(&verts, 0.13, 7).iter().map(|p| map(*p, rect, u)).collect();
     painter.add(Shape::closed_line(pts, stroke));
     // Door bar: a short rounded horizontal stroke inside, near the bottom.
-    let y = rect.center().y + h * 0.26;
-    let half = w * 0.16;
+    let y = rect.center().y + u * 0.26;
+    let half = u * 0.16;
     painter.line_segment(
         [Pos2::new(rect.center().x - half, y), Pos2::new(rect.center().x + half, y)],
-        Stroke::new(w * 0.22, color),
+        Stroke::new(u / 14.0, color),
     );
 }
