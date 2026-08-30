@@ -63,7 +63,7 @@ enum CtxMenu {
 }
 const TREE_WIDTH: u32 = 240;
 const THUMB_WIDTH: u32 = 220;
-const TOOLBAR_HEIGHT: u32 = 40;
+const TOOLBAR_HEIGHT: u32 = 48;
 const STATUS_BAR_HEIGHT: u32 = 48;
 /// Default initial size (logical). Picked to fit a 1280×800 logical screen
 /// after subtracting chrome (toolbar 36 + status 24 + panel widths 240+220).
@@ -173,6 +173,9 @@ enum UiAction {
     /// can emit an action without holding a `&mut self` borrow
     /// inside the egui closure.
     CopyPath,
+    /// Copy a folder path to the clipboard (used by the tree header's
+    /// double-click path label).
+    CopyFolderPath(PathBuf),
     /// Phase 8: open the print dialog for the current image.
     Print,
 }
@@ -233,6 +236,7 @@ pub struct Palette {
     pub selection_text: egui::Color32,
     pub hover_fill: egui::Color32,
     pub button_fill: egui::Color32,
+    pub button_hover: egui::Color32,
     pub card_stroke: egui::Color32,
     pub selected_card_fill: egui::Color32,
     pub selected_card_stroke: egui::Color32,
@@ -256,6 +260,7 @@ pub fn dark_palette() -> Palette { Palette {
     selection_text: egui::Color32::from_rgb(140, 148, 255),
     hover_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
     button_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+    button_hover: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38),
     selected_card_stroke: egui::Color32::from_rgb(95, 106, 210),
@@ -268,7 +273,7 @@ pub fn dark_palette() -> Palette { Palette {
 }
 
 pub fn light_palette() -> Palette { Palette {
-    panel_bg: egui::Color32::from_rgb(243, 244, 245),
+    panel_bg: egui::Color32::from_rgb(246, 246, 246),
     text_primary: egui::Color32::from_rgb(26, 27, 30),
     text_secondary: egui::Color32::from_rgb(60, 63, 68),
     text_tertiary: egui::Color32::from_rgb(107, 112, 120),
@@ -278,6 +283,7 @@ pub fn light_palette() -> Palette { Palette {
     selection_text: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
     hover_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
     button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 13),
+    button_hover: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
     selected_card_stroke: egui::Color32::from_rgb(94, 106, 210),
@@ -1640,7 +1646,7 @@ let window = event_loop.create_window(
             let mut visuals = match self.theme {
                 Theme::Light => {
                     let mut v = egui::Visuals::light();
-                    v.panel_fill = egui::Color32::from_rgb(243, 244, 245);
+                    v.panel_fill = egui::Color32::from_rgb(246, 246, 246);
                     v.window_fill = v.panel_fill;
                     v.override_text_color = Some(egui::Color32::from_rgb(26, 27, 30));
                     v
@@ -2747,7 +2753,7 @@ let window = event_loop.create_window(
     /// fallback issues). Returns true when clicked.
     fn window_control(ui: &mut egui::Ui, _id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(42.0, 30.0),
+            egui::vec2(42.0, TOOLBAR_HEIGHT as f32),
             egui::Sense::click(),
         );
         if resp.hovered() {
@@ -2756,7 +2762,7 @@ let window = event_loop.create_window(
             } else {
                 pal.hover_fill
             };
-            ui.painter().rect_filled(rect, 0.0, bg);
+            ui.painter().rect_filled(rect, 6.0, bg);
         }
         let p = ui.painter();
         let c = rect.center();
@@ -2902,15 +2908,22 @@ let window = event_loop.create_window(
             if let Some(p) = folder {
                 let path_short = crate::path_shorten::shorten(p);
                 // Truncate so a long path can't force the panel wider
-                // than the user set it.
-                ui.add(
+                // than the user set it. Double-click anywhere on the
+                // label emits a CopyFolderPath action so the actual
+                // clipboard write happens after the egui borrow ends.
+                let path_label = ui.add(
                     egui::Label::new(
                         egui::RichText::new(path_short)
                             .size(12.0)
                             .color(pal.text_tertiary),
                     )
-                    .truncate(),
+                    .truncate()
+                    .sense(egui::Sense::click()),
                 );
+                let path_resp = path_label.on_hover_text("Double click to copy folder path");
+                if path_resp.double_clicked() {
+                    actions.push(UiAction::CopyFolderPath(p.clone()));
+                }
                 ui.add_space(2.0);
                 ui.label(
                     egui::RichText::new(format!("{} image{}", nav_count, if nav_count == 1 { "" } else { "s" }))
@@ -2925,19 +2938,52 @@ let window = event_loop.create_window(
                 .auto_shrink([false; 2])
                 .vertical_scroll_offset(tree_scroll_y)
                 .show(ui, |ui| {
-                    let mut state = tree.state.lock();
-                    if state.scroll_to_top {
-                        state.scroll_to_top = false;
-                        ui.scroll_to_rect(
-                            egui::Rect::from_min_size(ui.min_rect().min, egui::Vec2::ZERO),
-                            None,
-                        );
-                    }
-                    let mut roots = std::mem::take(&mut state.roots);
-                    let mut expanded = std::mem::take(&mut state.expanded);
-                    let reveal = state.reveal_target.take();
-                    let mut revealed = false;
-                    let mut recent_scroll = state.recent_scroll_target.take();
+                    // Scope the guard so it's DROPPED before the recursion
+                    // below. `draw_tree_node` re-locks `tree.state` (to set
+                    // pending_expand_scroll when the user expands a node) —
+                    // holding the guard across the recursive call is a
+                    // SELF-DEADLOCK (parking_lot mutex is not reentrant),
+                    // which is exactly the "window opens but never paints"
+                    // hang. All the state we need is pulled out here.
+                    let (mut roots, mut expanded, reveal, recent_scroll_target) = {
+                        let mut state = tree.state.lock();
+                        // Pending expand-scroll: if a directory header was
+                        // expanded on the previous frame and its subtree
+                        // overflows the viewport, scroll the header to align
+                        // with the top. If it fits, leave the scroll alone.
+                        if let (Some(path), Some(header_rect)) = (
+                            state.pending_expand_scroll.take(),
+                            state.pending_expand_rect.take(),
+                        ) {
+                            let subtree_h = state.pending_expand_subtree_h;
+                            state.pending_expand_subtree_h = 0.0;
+                            let clip_h = ui.clip_rect().height();
+                            if subtree_h > clip_h + 1.0 {
+                                ui.scroll_to_rect(
+                                    egui::Rect::from_min_size(
+                                        header_rect.min,
+                                        egui::vec2(header_rect.width(), 0.0),
+                                    ),
+                                    None,
+                                );
+                            }
+                            let _ = path; // suppress unused-warning
+                        }
+                        if state.scroll_to_top {
+                            state.scroll_to_top = false;
+                            ui.scroll_to_rect(
+                                egui::Rect::from_min_size(ui.min_rect().min, egui::Vec2::ZERO),
+                                None,
+                            );
+                        }
+                        let roots = std::mem::take(&mut state.roots);
+                        let expanded = std::mem::take(&mut state.expanded);
+                        let reveal = state.reveal_target.take();
+                        let recent_scroll_target = state.recent_scroll_target.take();
+                        (roots, expanded, reveal, recent_scroll_target)
+                    };
+                    let mut revealed_node = false;
+                    let mut recent_scroll = recent_scroll_target;
                     // Phase 2 + Phase 8 修复: 之前用闭包内局部 `pending` 变量，
                     // 闭包返回时被 drop 导致右键事件被静默丢弃。Phase 8 改用
                     // 传入 `&mut Option<TreeCtxMenu>` 指向 self.tree_ctx_menu。
@@ -2946,21 +2992,26 @@ let window = event_loop.create_window(
                     // 菜单只显示 1 帧即消失。现在字段只在用户选中菜单项或
                     // 点击外部时由 popup 绘制块显式清除。
                     let mut max_w: f32 = 0.0;
+                    // IMPORTANT: `tree.state` lock is NOT held here — the final
+                    // `draw_tree_node` call may lock it briefly. This block is
+                    // the recursion; the outer guard is already dropped.
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
-                            ui, root, 0, &current_folder, &mut expanded, actions, root_idx,
-                            &reveal, &mut revealed, pending_ctx,
+                            ui, tree, root, 0, &current_folder, &mut expanded, actions, root_idx,
+                            &reveal, &mut revealed_node, pending_ctx,
                             &mut recent_scroll, &pal,
                         ));
                     }
-                    state.roots = roots;
-                    state.expanded = expanded;
-                    if !revealed {
-                        // Target not drawn this frame (still expanding) —
-                        // retry next frame.
-                        state.reveal_target = reveal;
+                    // Re-lock to restore the taken state for the next frame.
+                    {
+                        let mut state = tree.state.lock();
+                        state.roots = roots;
+                        state.expanded = expanded;
+                        if !revealed_node {
+                            state.reveal_target = reveal;
+                        }
+                        state.recent_scroll_target = recent_scroll;
                     }
-                    state.recent_scroll_target = recent_scroll;
                     max_w
                 });
             // Read back the ScrollArea's ACTUAL (clamped) offset so the
@@ -2980,6 +3031,7 @@ let window = event_loop.create_window(
     #[allow(clippy::too_many_arguments)]
     fn draw_tree_node(
         ui: &mut egui::Ui,
+        tree: &crate::file_tree::FileTree,
         node: &mut crate::file_tree::TreeNode,
         depth: usize,
         // Phase 14: the nav's current FOLDER (used for the active
@@ -3054,6 +3106,9 @@ let window = event_loop.create_window(
         // Leaf entries (Favorites / Recent): custom-painted rounded
         // highlight (egui selectable_label's built-in selected color mixes
         // green/blue with our indigo). Click navigates, right-click manages.
+        // Linear-style: rounded background card + left accent bar on the
+        // selected edge + bolded label so it stays visually distinct from
+        // the collapsed directory rows below it.
         if is_leaf_entry {
             let selected = is_current || is_reveal_target;
             let (rect, resp) = ui.allocate_exact_size(
@@ -3062,6 +3117,14 @@ let window = event_loop.create_window(
             );
             if selected {
                 ui.painter().rect_filled(rect, 6.0, pal.selected_card_fill);
+                // Left accent bar — a darker indigo strip on the leading
+                // edge to anchor the highlight. Same color as the border so
+                // the card reads as one shape, not two.
+                let bar = egui::Rect::from_min_size(
+                    rect.min,
+                    egui::vec2(3.0, rect.height()),
+                );
+                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
             } else if resp.hovered() {
                 ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
             }
@@ -3069,7 +3132,11 @@ let window = event_loop.create_window(
                 egui::pos2(rect.left() + 10.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
                 display,
-                egui::FontId::proportional(14.0),
+                if selected {
+                    egui::FontId::proportional(15.0)
+                } else {
+                    egui::FontId::proportional(14.0)
+                },
                 if selected { pal.selection_text } else { pal.text_secondary },
             );
             let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
@@ -3103,8 +3170,33 @@ let window = event_loop.create_window(
                 }
             }
         } else {
+            // Directory rows: lay down a full-width click + highlight strip
+            // UNDER the CollapsingHeader. The header's own click region only
+            // covers the label + triangle; the strip gives "click anywhere on
+            // the row" semantics (matching leaf entries and Recent/Favorites)
+            // and lets us draw the full-row background + left accent bar when
+            // the row is the current folder.
+            let dir_row_h: f32 = 26.0;
+            let (dir_row_rect, dir_row_resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), dir_row_h),
+                egui::Sense::click(),
+            );
+            let dir_selected = is_current || is_reveal_target;
+            // This PC expanded directories get only bold — no bg, no bar.
+            // See root_idx==2 (This PC) + is_virtual_root=false below.
+            let this_pc_expanded = root_idx == 2 && !is_virtual_root;
+            if dir_selected && !this_pc_expanded {
+                ui.painter().rect_filled(dir_row_rect, 6.0, pal.selected_card_fill);
+                let bar = egui::Rect::from_min_size(
+                    dir_row_rect.min,
+                    egui::vec2(3.0, dir_row_rect.height()),
+                );
+                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+            } else if dir_row_resp.hovered() {
+                ui.painter().rect_filled(dir_row_rect, 6.0, pal.hover_fill);
+            }
             let header = egui::CollapsingHeader::new(
-                egui::RichText::new(display).size(14.0).color(text_color)
+                egui::RichText::new(display).size(if dir_selected { 15.0 } else { 14.0 }).color(text_color)
             )
             .id_salt(id_salt)
             // `expanded` is the single source of truth — force the open
@@ -3122,23 +3214,45 @@ let window = event_loop.create_window(
                     }
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
-                            ui, child, depth + 1, current_folder, expanded, actions, root_idx,
+                            ui, tree, child, depth + 1, current_folder, expanded, actions, root_idx,
                             reveal, revealed, pending, recent_scroll, pal,
                         );
                         max_w = max_w.max(w);
                     }
                 }
             });
+            // Capture this header's rect + subtree height if it's the
+            // pending expand target, so the next frame can decide whether
+            // to scroll to align the header with the viewport top.
+            let should_capture = tree.state.lock().pending_expand_scroll.as_ref().is_some_and(|p| p == &path_clone);
+            if should_capture {
+                let header_rect = header.header_response.rect;
+                let subtree_bottom = header.body_response.as_ref()
+                    .map(|r| r.rect.bottom())
+                    .unwrap_or(header_rect.bottom());
+                let mut st = tree.state.lock();
+                st.pending_expand_rect = Some(header_rect);
+                st.pending_expand_subtree_h = subtree_bottom - header_rect.top();
+            }
             if is_reveal_target && !*revealed {
                 ui.scroll_to_rect(header.header_response.rect, Some(egui::Align::Center));
                 *revealed = true;
             }
-            // Click toggles expansion; non-root nodes also navigate.
-            if header.header_response.clicked() {
+            // Click toggles expansion; non-root nodes also navigate. The
+            // "click anywhere on the row" full-row strip routes through
+            // `dir_row_resp`; the header label itself routes through
+            // `header.header_response`. We OR both so any click on the
+            // row triggers the same logic.
+            let header_clicked = header.header_response.clicked() || dir_row_resp.clicked();
+            if header_clicked {
                 if is_open {
                     expanded[root_idx].remove(&path_clone);
                 } else {
                     expanded[root_idx].insert(path_clone.clone());
+                    // Expanding: defer a scroll decision to the next
+                    // frame so the expanded subtree has actually been
+                    // laid out and we can measure its height.
+                    tree.state.lock().pending_expand_scroll = Some(path_clone.clone());
                 }
                 // Collapsing an ancestor of the current folder (inside
                 // This PC) hides the current node — scroll the matching
@@ -3215,133 +3329,181 @@ let window = event_loop.create_window(
                 .auto_shrink([false, false])
                 .vertical_scroll_offset(THUMB_SCROLL_Y.with(|c| c.get()))
                 .show(ui, |ui| {
+                    // Multi-column thumbnail grid: equal-width columns based
+                    // on panel width, with consistent row height for
+                    // already-loaded thumbnails.
+                    let avail = (ui.available_width() - 8.0).max(80.0);
+                    let target_card_w: f32 = 160.0;
+                    let gap: f32 = 6.0;
+                    let cols = ((avail + gap) / (target_card_w + gap)).floor() as usize;
+                    let cols = cols.clamp(1, 3);
+                    let card_w = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).max(80.0);
+                    let row_h: f32 = 170.0;
+                    let row_full_h: f32 = card_w + 24.0; // image + label area + margin
+
                     // Thumbnail decode virtualization: only request decodes
                     // for cards near the visible range (±buffer), not all
-                    // images in the folder. Cards are ~200px tall on average.
+                    // images in the folder. We now compute by *rows*
+                    // (each row contains `cols` cards), and the prefetch
+                    // covers ~2 extra rows in the direction of scroll.
                     let clip = ui.clip_rect();
                     let content_top = ui.min_rect().top();
-                    let est_card: f32 = 200.0;
-                    let i0 = (((clip.top() - content_top) / est_card).floor() as usize)
-                        .saturating_sub(5);
-                    let i1 = ((((clip.top() - content_top) + clip.height()) / est_card).ceil()
-                        as usize
-                        + 10)
-                        .min(nav_items.len());
+                    let est_row_h = row_full_h;
+                    let first_row = (((clip.top() - content_top) / est_row_h).floor() as isize - 5)
+                        .max(0) as usize;
+                    let last_row = ((((clip.top() - content_top) + clip.height()) / est_row_h).ceil()
+                        as isize + 10)
+                        .max(0) as usize;
+                    let i0 = (first_row * cols).min(nav_items.len());
+                    let i1 = ((last_row + 1) * cols).min(nav_items.len());
                     // Prefetch in the direction of scroll: a fast scroll shows
                     // placeholders for cards about to enter. We request decodes
-                    // for an extra screen of cards in the direction the user is
-                    // moving toward, so those land before they're visible
-                    // (the C# "predecode ahead" idea, for thumbs).
+                    // for an extra ~2 rows in the direction the user is moving.
                     let cur_scroll = THUMB_SCROLL_Y.with(|c| c.get());
                     let last_scroll = THUMB_LAST_SCROLL_Y.with(|c| c.get());
                     THUMB_LAST_SCROLL_Y.set(cur_scroll);
-                    let screen_cards = (clip.height() / est_card).ceil() as usize + 1;
-                    let (pf_lo, pf_hi) = if cur_scroll > last_scroll {
-                        // Scrolling down (to larger indices).
-                        (i0, (i1 + screen_cards).min(nav_items.len()))
+                    let rows_screen = (clip.height() / est_row_h).ceil() as isize + 2;
+                    let first_row_with_prefetch = if cur_scroll > last_scroll {
+                        first_row
                     } else if cur_scroll < last_scroll {
-                        // Scrolling up (to smaller indices).
-                        (i0.saturating_sub(screen_cards), i1)
+                        (first_row as isize - rows_screen).max(0) as usize
                     } else {
-                        // No scroll direction — cover both a little.
-                        (i0.saturating_sub(screen_cards / 2), (i1 + screen_cards / 2).min(nav_items.len()))
+                        (first_row as isize - rows_screen / 2).max(0) as usize
                     };
+                    let last_row_with_prefetch = if cur_scroll > last_scroll {
+                        ((last_row as isize + rows_screen) as usize).min((nav_items.len() + cols - 1) / cols)
+                    } else {
+                        last_row
+                    };
+                    let pf_lo = (first_row_with_prefetch * cols).min(nav_items.len());
+                    let pf_hi = ((last_row_with_prefetch + 1) * cols).min(nav_items.len());
                     for item in nav_items.get(pf_lo..pf_hi).unwrap_or(&[]) {
                         texture_cache.request_thumb(item.path.clone());
                     }
-                    // Card width adapts to the (resizable) panel width.
-                    let thumb_w = (ui.available_width() - 8.0).max(80.0);
-                    for (i, item) in nav_items.iter().enumerate() {
-                        let path = item.path.clone();
-                        let is_selected = i == cur_idx;
-                        let name = path
-                            .file_name()
-                            .map(|n| n.to_string_lossy().into_owned())
-                            .unwrap_or_default();
 
-                        // Reserve the image area: aspect-correct height,
-                        // capped so tall images don't dominate the list.
-                        let tex_size = texture_cache
-                            .get_thumb(&path)
-                            .map(|e| e.texture.size_vec2());
-                        let img_h = match tex_size {
-                            Some(sz) => (thumb_w / (sz.x / sz.y.max(1.0)).max(0.0001)).min(170.0),
-                            None => 100.0,
-                        };
+                    let n = nav_items.len();
+                    let mut i = 0usize;
+                    let mut resp_rects: Vec<egui::Rect> = Vec::with_capacity(n);
+                    while i < n {
+                        let row_count = (n - i).min(cols);
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = gap;
+                            for col in 0..row_count {
+                                let idx = i + col;
+                                let item = &nav_items[idx];
+                                let path = item.path.clone();
+                                let is_selected = idx == cur_idx;
+                                let name = path
+                                    .file_name()
+                                    .map(|n| n.to_string_lossy().into_owned())
+                                    .unwrap_or_default();
 
-                        let card = egui::Frame::default()
-                            .fill(if is_selected {
-                                pal.selected_card_fill
-                            } else {
-                                egui::Color32::TRANSPARENT
-                            })
-                            .stroke(if is_selected {
-                                egui::Stroke::new(1.2_f32, pal.selected_card_stroke)
-                            } else {
-                                egui::Stroke::new(1.0_f32, pal.card_stroke)
-                            })
-                            .rounding(egui::Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(4.0));
-                        let resp = card.show(ui, |ui| {
-                            let (rect, _) =
-                                ui.allocate_exact_size(egui::vec2(thumb_w, img_h), egui::Sense::hover());
-                            if let Some(entry) = texture_cache.get_thumb(&path) {
-                                let size = entry.texture.size_vec2();
-                                // Contain-fit: uniform scale so panel
-                                // resizing never stretches thumbnails.
-                                let scale = (rect.width() / size.x.max(1.0))
-                                    .min(rect.height() / size.y.max(1.0));
-                                let fit_size = egui::vec2(size.x * scale, size.y * scale);
-                                let fit_rect = egui::Rect::from_center_size(rect.center(), fit_size);
-                                ui.painter().image(
-                                    entry.texture.id(),
-                                    fit_rect,
-                                    egui::Rect::from_min_max(egui::Pos2::ZERO, egui::Pos2::new(1.0, 1.0)),
-                                    egui::Color32::WHITE,
-                                );
-                            } else {
-                                ui.painter().rect_filled(
-                                    rect,
-                                    6.0,
-                                    pal.thumb_placeholder,
-                                );
-                                ui.painter().text(
-                                    rect.center(),
-                                    egui::Align2::CENTER_CENTER,
-                                    "···",
-                                    egui::FontId::proportional(12.0),
-                                    pal.text_dim,
-                                );
-                            }
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new(name)
-                                    .size(10.5)
-                                    .color(if is_selected {
-                                        pal.text_primary
+                                // Image area: aspect-correct from the
+                                // actual decoded thumb (200×200 source preserved
+                                // to its source AR), capped at row_h. Until the
+                                // thumb has decoded, we fall back to a fixed
+                                // placeholder height so unloaded cards don't
+                                // break the row grid.
+                                let tex_size = texture_cache
+                                    .get_thumb(&path)
+                                    .map(|e| e.texture.size_vec2());
+                                let img_h = match tex_size {
+                                    Some(sz) => (card_w / (sz.x / sz.y.max(1.0)).max(0.0001))
+                                        .min(row_h)
+                                        .max(60.0),
+                                    None => row_h.min(100.0),
+                                };
+
+                                let card = egui::Frame::default()
+                                    .fill(if is_selected {
+                                        pal.selected_card_fill
                                     } else {
-                                        pal.text_tertiary
-                                    }),
-                            );
-                        }).response.interact(egui::Sense::click());
-                        if is_selected && force_scroll {
-                            ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
-                        }
-                        if resp.clicked() || resp.double_clicked() {
-                            actions.push(UiAction::ThumbClicked(i));
-                        }
-                        ui.add_space(6.0);
+                                        egui::Color32::TRANSPARENT
+                                    })
+                                    .stroke(if is_selected {
+                                        egui::Stroke::new(1.2_f32, pal.selected_card_stroke)
+                                    } else {
+                                        egui::Stroke::new(1.0_f32, pal.card_stroke)
+                                    })
+                                    .rounding(egui::Rounding::same(8.0))
+                                    .inner_margin(egui::Margin::same(4.0));
+                                let resp = card.show(ui, |ui| {
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(card_w, img_h),
+                                        egui::Sense::hover(),
+                                    );
+                                    if let Some(entry) = texture_cache.get_thumb(&path) {
+                                        let size = entry.texture.size_vec2();
+                                        let scale = (rect.width() / size.x.max(1.0))
+                                            .min(rect.height() / size.y.max(1.0));
+                                        let fit_size =
+                                            egui::vec2(size.x * scale, size.y * scale);
+                                        let fit_rect = egui::Rect::from_center_size(
+                                            rect.center(),
+                                            fit_size,
+                                        );
+                                        ui.painter().image(
+                                            entry.texture.id(),
+                                            fit_rect,
+                                            egui::Rect::from_min_max(
+                                                egui::Pos2::ZERO,
+                                                egui::Pos2::new(1.0, 1.0),
+                                            ),
+                                            egui::Color32::WHITE,
+                                        );
+                                    } else {
+                                        ui.painter().rect_filled(
+                                            rect,
+                                            6.0,
+                                            pal.thumb_placeholder,
+                                        );
+                                        ui.painter().text(
+                                            rect.center(),
+                                            egui::Align2::CENTER_CENTER,
+                                            "···",
+                                            egui::FontId::proportional(12.0),
+                                            pal.text_dim,
+                                        );
+                                    }
+                                    ui.add_space(2.0);
+                                    ui.label(
+                                        egui::RichText::new(name)
+                                            .size(10.5)
+                                            .color(if is_selected {
+                                                pal.text_primary
+                                            } else {
+                                                pal.text_tertiary
+                                            }),
+                                    );
+                                }).response.interact(egui::Sense::click());
+                                resp_rects.push(resp.rect);
+                                if is_selected && force_scroll {
+                                    ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
+                                }
+                                if resp.clicked() || resp.double_clicked() {
+                                    actions.push(UiAction::ThumbClicked(idx));
+                                }
+                            }
+                        });
+                        i += row_count;
+                        // Inter-row spacing: small fixed gap so the rows
+                        // don't run into each other and the label has room.
+                        ui.add_space(8.0);
                     }
+                    // `i0`/`i1` are still useful as a sentinel — they bound
+                    // the visible+decoded range. Mark them used here.
+                    let _ = (i0, i1, first_row, last_row);
                 });
-            // Read back the ScrollArea's ACTUAL offset (egui clamps it to
-            // [0, max] before returning) so the sticky value stays bounded.
-            // This is the fix for: (a) scrollbar drag not working (the
-            // read/write now agree), (b) scroll_to_rect centering, (c) the
-            // "scroll into blank space then freeze" bug — the stale sticky
-            // value was unbounded, and `vertical_scroll_offset` forced it
-            // every frame, so egui fought to reach an unreachable offset.
-            let off = scroll_out.state.offset.y;
-            THUMB_SCROLL_Y.with(|c| c.set(off));
+                // Read back the ScrollArea's ACTUAL offset (egui clamps it
+                // to [0, max] before returning) so the sticky value stays
+                // bounded. This is the fix for: (a) scrollbar drag not
+                // working (the read/write now agree), (b) scroll_to_rect
+                // centering, (c) the "scroll into blank space then freeze"
+                // bug — the stale sticky value was unbounded, and
+                // `vertical_scroll_offset` forced it every frame, so egui
+                // fought to reach an unreachable offset.
+                let off = scroll_out.state.offset.y;
+                THUMB_SCROLL_Y.with(|c| c.set(off));
         });
     }
 
@@ -3547,15 +3709,39 @@ let window = event_loop.create_window(
                 self.show_shortcut_help = !self.show_shortcut_help;
             }
             UiAction::ToggleFavorite => {
+                // Favorites store FOLDERS (not files) — and only folders
+                // that directly contain images, mirroring the gate on
+                // `navigate_to_folder` that keeps Recent useful. The toggle
+                // from the image context menu flips the current image's
+                // parent folder in/out of favorites.
                 if let Some(current) = self.nav.lock().current() {
-                    let path = current.path.clone();
-                    self.settings.toggle_favorite_folder(path);
-                    self.file_tree.refresh_favorites(&self.settings.favorite_folders());
+                    if let Some(parent) = current.path.parent().map(|p| p.to_path_buf()) {
+                        if Self::folder_has_images(&parent) {
+                            self.settings.toggle_favorite_folder(parent);
+                            self.file_tree
+                                .refresh_favorites(&self.settings.favorite_folders());
+                        } else {
+                            tracing::debug!(
+                                "ToggleFavorite skipped: {} has no images",
+                                parent.display()
+                            );
+                        }
+                    }
                 }
             }
             UiAction::AddFavorite(p) => {
-                self.settings.add_favorite_folder(p);
-                self.file_tree.refresh_favorites(&self.settings.favorite_folders());
+                // Gate: only add the folder if it directly contains images
+                // (same rule as Recent in `navigate_to_folder`).
+                if Self::folder_has_images(&p) {
+                    self.settings.add_favorite_folder(p);
+                    self.file_tree
+                        .refresh_favorites(&self.settings.favorite_folders());
+                } else {
+                    tracing::debug!(
+                        "AddFavorite skipped: {} has no images",
+                        p.display()
+                    );
+                }
             }
             UiAction::RemoveFavorite(p) => {
                 self.settings.remove_favorite_folder(&p);
@@ -3623,6 +3809,10 @@ let window = event_loop.create_window(
                 if let Some(current) = self.nav.lock().current() {
                     self.copy_text_to_clipboard(&current.path.to_string_lossy());
                 }
+            }
+            UiAction::CopyFolderPath(p) => {
+                self.copy_text_to_clipboard(&p.to_string_lossy());
+                tracing::info!("copied folder path to clipboard: {}", p.display());
             }
             UiAction::Print => {
                 if let Some(current) = self.nav.lock().current() {
@@ -4763,7 +4953,7 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
 }
 
 fn init_egui(device: &wgpu::Device, format: wgpu::TextureFormat) -> EguiState {    let ctx = egui::Context::default();
-    apply_linear_dark_theme(&ctx);
+    apply_linear_dark_theme(&ctx, &dark_palette());
     install_fonts(&ctx);
     let renderer = egui_wgpu::Renderer::new(device, format, None, 1, false);
     EguiState { ctx, renderer }
@@ -4889,7 +5079,7 @@ fn install_fonts(ctx: &egui::Context) {
 
 /// Linear-style dark theme (DESIGN.md §2). Slightly bluer near-black,
 /// violet brand accent, near-transparent surfaces, hairline borders.
-fn apply_linear_dark_theme(ctx: &egui::Context) {
+fn apply_linear_dark_theme(ctx: &egui::Context, pal: &Palette) {
     let mut style = (*ctx.style()).clone();
 
     // ---- Colors (Linear palette, dark mode) ----
@@ -4935,12 +5125,12 @@ fn apply_linear_dark_theme(ctx: &egui::Context) {
     // matches the new chip language. Subtle but consistent — the
     // previous 6 was visually heavy on the larger 30-px-tall
     // title-bar / bottom-bar buttons.
-    visuals.widgets.inactive.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 8);
+    visuals.widgets.inactive.bg_fill = pal.button_fill;
     visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0_f32, border_subtle);
     visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0_f32, text_secondary);
     visuals.widgets.inactive.rounding = egui::Rounding::same(8.0);
 
-    visuals.widgets.hovered.bg_fill = egui::Color32::from_rgba_unmultiplied(255, 255, 255, 12);
+    visuals.widgets.hovered.bg_fill = pal.button_hover;
     visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0_f32, border_std);
     visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0_f32, text_primary);
     visuals.widgets.hovered.rounding = egui::Rounding::same(8.0);

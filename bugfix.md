@@ -394,17 +394,133 @@ any Rust + egui + DXGI / Metal / Vulkan hybrid renderer.
 
 ---
 
+## v1.0.8 — egui-native migration pitfalls
+
+The biggest regression arc in this codebase: the viewer moved from a
+custom wgpu image-quad pipeline to being painted as an `egui::Mesh` inside
+the central panel. Most of the bugs below would be re-introduced by
+anyone touching the rendering pipeline without re-reading this section.
+
+### 1. Cross-frame texture use-after-free (`OBJECT_DELETED_WHILE_STILL_IN_USE`)
+
+**Symptom.** Navigating between images (especially rapid Next/Prev
+through a folder whose ±1 neighbours are cached full-size) crashed
+with `D3D12 ERROR ... ID3D12Resource ... referenced by GPU operations
+in-flight ... [EXECUTION ERROR #921: OBJECT_DELETED_WHILE_STILL_IN_USE]`
+and exit code `0xCFFFFFFF`.
+
+**Root cause.** The viewer was migrated to `DecodedGpuImage`
+holding an `egui::TextureHandle`. The mesh we draw only stores a
+`TextureId`. The texture's real lifetime is the `Arc<DecodedGpuImage>`
+held by the viewer. Two paths dropped that Arc prematurely:
+
+1. `set_image_gpu` *directional* branch overwrote `previous_gpu`
+   with `self.previous_gpu = outgoing`, releasing the old `previous_gpu`
+   straight away — even though the slide still needed it for that frame's
+   outgoing paint.
+2. A frame-count retire budget (`RETIRE_FRAMES`) is a heuristic, not a
+   fence: under heavy decode the GPU can lag more than N frames, so
+   the texture can still be in flight when we let egui free it.
+
+**Fix.** A *real fence* via wgpu 22's `Maintain::WaitForSubmissionIndex`,
+plus routing every outgoing image through a `retired: VecDeque<(Arc, epoch)>`
+queue instead of dropping it. Released only after a submit we know has
+completed. First attempt blocked on `WaitForSubmissionIndex` — see #2.
+
+### 2. Reentrant lock deadlock via `WaitForSubmissionIndex`
+
+**Symptom.** Process hung at `0xcfffffff` exit, never self-exiting.
+Reproduced with ~12 Right-arrows via Win32 `PostMessage` on `C:\…\folder_a`.
+
+**Root cause.** wgpu 22 exposes **no non-blocking** "which submission
+completed" query. We first tried `Maintain::WaitForSubmissionIndex` on
+the main thread, but:
+
+- The egui render closure took `viewer.lock()` to call `retire_epoch_pending()`.
+- The Rust temporary-lifetime rules keep that `parking_lot::MutexGuard`
+  alive across the entire `if let` block — including the blocking
+  `WaitForSubmissionIndex` call AND the subsequent
+  `viewer.lock().release_retired_through(...)`, which is a **reentrant
+  lock on the same thread**. `parking_lot` hangs forever on reentry.
+
+**Fix.** Removed the blocking wait entirely. `submit_wgpu_frame`
+advances `safe_release_epoch = render_epoch - RETIRE_FRAME_BUDGET` and
+releases only entries whose tag epoch is ≤ that watermark. With
+`PresentMode::Fifo` + `desired_maximum_frame_latency: 1`, the GPU is
+guaranteed ≤ 1 frame behind, so a small `RETIRE_FRAME_BUDGET` (4) is
+provably past every in-flight submit. The render thread **never blocks**.
+Also fixed the `viewer.lock().retire_epoch_pending()` pattern by scoping
+the guard so it doesn't span the release call.
+
+### 3. egui `load_texture` debug_asserts on oversized textures
+
+**Symptom.** Panic in `egui-0.29.1/src/context.rs:2043`:
+`Texture "aperture_main" has size 1242x2688, but the maximum texture
+side is 2048`.
+
+**Root cause.** `Context::load_texture` enforces a hard `debug_assert`
+against `RawInput.max_texture_side` (default `None` ⇒ assumed 2048). The
+app fed it textures decoded from 8K source images (1024-8192px on the
+long edge) — well over the device's actual `max_texture_dimension_2d`.
+
+**Fix.** Two parts:
+
+1. The coordinator's full-tier clamp now uses
+   `(viewport_max * 2).clamp(1080, FULL_RES_DIM.min(max_texture_dim))`,
+   where `max_texture_dim` comes from `device.limits()..max_texture_dimension_2d`
+   passed through `DecodeCoordinator::new(…)`. `FULL_RES_DIM = 4096`
+   is the editorial ceiling.
+2. `build_egui_ui` now sets `raw_input.max_texture_side = Some(limit as
+   usize)` each frame so egui's `load_texture` uses the real limit.
+
+### 4. 8K thumbnail thread flood
+
+**Symptom.** Opening `C:\Users\1234_\Pictures\4K壁纸` (279 images, up to
+8K) froze the app: thumbnails never loaded, UI wedged.
+
+**Root cause.** `decode_thumb_blocking(200, path)` calls
+`decode_file(path, 200, 200)` which uses WIC's
+`CreateBitmapScaler` to scale from the **full source**. With ~30 thumbs
+requesting simultaneously, each one internally decoded ~30 MP of BGRA,
+dozens of WIC allocations in flight at once. System thrash + blocked
+main thread + stalled decode-pipeline.
+
+**Fix.** A tiny `parking_lot::Mutex<usize>` + `Condvar` semaphore
+(`THUMB_DECODE_PERMITS = 4`) around the `std::thread::spawn` body so
+only 4 thumbs decode concurrently. The remaining requests queue in
+`thumbs_pending` and pick up a permit as soon as one frees. Main thread
+never blocks on the semaphore.
+
+### 5. EXIF Orientation is silently ignored
+
+**Status.** **Known gap, unfixed.** WIC decodes source pixels
+unrotated; portrait photos from phones/DSLRs render sideways. egui
+renders whatever pixels WIC gave it; the viewer has no per-image
+rotation metadata. `decode_file` preserves source aspect ratio but not
+EXIF `0x0112`. Fixing this requires reading the EXIF `Orientation` tag
+in WIC and either rotating the BGRA pixels CPU-side at decode time, or
+storing an `orientation` per `DecodedImage` and applying it in
+`paint_viewer` (similar to the existing `rotation` state). Track via
+follow-up; touched again in the next round.
+
+---
+
 ## Files referenced
 
-- `crates/app/src/window.rs` — main window, wgpu surface, render
-  pipeline, layout, input handling
-- `crates/app/src/viewer_child.rs` — D2D child HWND wrapper, swapchain
-  state, wnd_proc
-- `crates/gpu/src/swapchain.rs` — DXGI swapchain creation, resize, present
-- `crates/gpu/src/viewer.rs` — Direct2D render pipeline, fit math,
-  rotation, slide animation
-- `crates/app/src/event_router.rs` — translates winit events into
-  egui InputEvents
+- `crates/app/src/window.rs` — main window, wgpu surface, egui build,
+  submission fence, render loop
+- `crates/app/src/texture_cache.rs` — thumbnail cache, semaphore-bounded
+  decode, egui::TextureHandle lifecycle
+- `crates/gpu/src/viewer.rs` — Direct2DViewer state machine, image→screen
+  affine, retire queue + fence release
+- `crates/gpu/src/coordinator.rs` — DecodeCoordinator, two-tier cache, full
+  clamp, progressive low→full upgrade
+- `crates/gpu/src/texture.rs` — DecodedGpuImage (egui TextureHandle), BGRA→RGBA
+  swap, average luminance
+- `crates/gpu/src/animator.rs` — slide state machine (Animator)
+- `crates/gpu/src/lib.rs` — module exports
+- `crates/app/src/event_router.rs` — translates winit events into egui
+  InputEvents
 - `crates/core/src/settings.rs` — JSON-backed settings persistence
   (window size, theme, recents, favorites)
 - `Installer/installer.iss` — Inno Setup script (per-user, no admin,

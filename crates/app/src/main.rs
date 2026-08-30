@@ -11,6 +11,7 @@ mod event_router;
 mod file_tree;
 mod texture_cache;
 mod path_shorten;
+mod effects;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

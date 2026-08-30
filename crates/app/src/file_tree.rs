@@ -55,6 +55,19 @@ pub struct TreeTreeState {
     pub recent_scroll_target: Option<PathBuf>,
     /// One-shot request to scroll the tree back to the top.
     pub scroll_to_top: bool,
+    /// Set when a directory header is expanded; the next draw tick
+    /// measures the expanded subtree and either scrolls to align the
+    /// header with the viewport top (if the subtree overflows) or leaves
+    /// the scroll alone (if the subtree fits).
+    pub pending_expand_scroll: Option<PathBuf>,
+    /// Rect of a header to evaluate next frame for the
+    /// pending_expand_scroll decision. Filled during the draw that
+    /// expanded the node, consumed by the next draw.
+    pub pending_expand_rect: Option<egui::Rect>,
+    /// Height (logical px) of the subtree rooted at pending_expand_scroll.
+    /// Filled during the draw that expanded the node, consumed by the
+    /// next draw.
+    pub pending_expand_subtree_h: f32,
     /// Current vertical scroll offset (logical px) of the tree
     /// ScrollArea. Written by the wheel branch in window_event;
     /// applied by the ScrollArea builder via vertical_scroll_offset.
@@ -70,6 +83,9 @@ impl FileTree {
             recent_scroll_target: None,
             scroll_to_top: false,
             scroll_offset_y: 0.0,
+            pending_expand_scroll: None,
+            pending_expand_rect: None,
+            pending_expand_subtree_h: 0.0,
         };
         // All roots start expanded (empty path = the root's own key).
         for set in &mut state.expanded {
@@ -168,18 +184,54 @@ impl FileTree {
     }
 
     fn enumerate_drives() -> Vec<TreeNode> {
-        // Enumerate Windows drive letters A:..Z:
+        // Enumerate Windows drive letters A:..Z:, showing each drive's
+        // volume label when one exists (e.g. "C: 本地磁盘" or "D: 数据").
         let mut out = Vec::new();
         for letter in b'A'..=b'Z' {
             let path = PathBuf::from(format!("{}:\\", letter as char));
             if path.exists() {
-                let mut node = TreeNode::root(path.clone(), format!("{}:", letter as char));
+                let label = volume_label(&path);
+                let display = match label {
+                    Some(l) if !l.is_empty() => format!("{}: {}", letter as char, l),
+                    _ => format!("{}:", letter as char),
+                };
+                let mut node = TreeNode::root(path.clone(), display);
                 node.children = Some(Vec::new());
                 out.push(node);
             }
         }
         out
     }
+}
+
+/// Read a drive's volume label via Win32 `GetVolumeInformationW`. Returns
+/// `None` if the label can't be read (e.g. the drive is a CD/removable
+/// without a filesystem label or access is denied).
+fn volume_label(root: &Path) -> Option<String> {
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+    use windows::core::PCWSTR;
+
+    let root_wide: Vec<u16> = root.to_string_lossy().encode_utf16().chain(std::iter::once(0)).collect();
+    if root_wide.is_empty() { return None; }
+
+    // Max volume label is 32 chars; 261 = MAX_PATH+1 headroom.
+    let mut label_buf = vec![0u16; 261];
+    unsafe {
+        let result = GetVolumeInformationW(
+            PCWSTR(root_wide.as_ptr()),
+            Some(&mut label_buf),
+            None,
+            None,
+            None,
+            None,
+        );
+        if result.is_ok() {
+            let len = label_buf.iter().position(|&c| c == 0).unwrap_or(0);
+            let label = String::from_utf16_lossy(&label_buf[..len]);
+            return Some(label);
+        }
+    }
+    None
 }
 
 fn enumerate_subdirs(dir: &Path) -> Vec<TreeNode> {
