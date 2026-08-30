@@ -3403,8 +3403,11 @@ let window = event_loop.create_window(
         // the collapsed directory rows below it.
         if is_leaf_entry {
             let selected = is_current || is_reveal_target;
+            // Leave a small gutter on the right so rows don't touch the
+            // vertical scrollbar.
+            let row_w = (ui.available_width() - 10.0).max(20.0);
             let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), 26.0),
+                egui::vec2(row_w, 26.0),
                 egui::Sense::click(),
             );
             if selected {
@@ -3483,8 +3486,10 @@ let window = event_loop.create_window(
             let this_pc_expanded = root_idx == 2 && !is_virtual_root;
             let indent = depth as f32 * 14.0;
             let row_h = 26.0_f32;
+            // Right gutter so the directory row doesn't touch the scrollbar.
+            let row_w = (ui.available_width() - 10.0).max(20.0);
             let (row_rect, row_resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), row_h),
+                egui::vec2(row_w, row_h),
                 egui::Sense::click(),
             );
             // Full-row background + accent bar + bold (skip bar/bg for This
@@ -3663,7 +3668,9 @@ let window = event_loop.create_window(
                     // old formula ignored -> the last column overflowed and
                     // was clipped by the window right edge.
                     const CARD_MARGIN_TOTAL: f32 = 8.0; // 2 × inner_margin(4)
-                    let avail = (ui.available_width() - 8.0).max(80.0);
+                    // Leave a small gutter on the right so the cards don't
+                    // run under / touch the vertical scrollbar.
+                    let avail = (ui.available_width() - 8.0 - 10.0).max(80.0);
                     let gap: f32 = 6.0;
                     // Effective width available across all cards + gaps.
                     let col_count = if avail >= 520.0 {
@@ -3769,6 +3776,13 @@ let window = event_loop.create_window(
                                     // `horizontal` row layout put the label to
                                     // the image's right).
                                     ui.with_layout(egui::Layout::top_down(egui::Align::Min), |ui| {
+                                        // Constrain the card's content to the
+                                        // square width so a long filename can't
+                                        // stretch the card outward (and push the
+                                        // last column off the right / hide the
+                                        // scrollbar). The label's truncate() then
+                                        // works against this max width.
+                                        ui.set_max_width(card_w);
                                         let (rect, _) = ui.allocate_exact_size(
                                             egui::vec2(card_w, img_h),
                                             egui::Sense::hover(),
