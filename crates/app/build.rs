@@ -4,8 +4,8 @@ fn main() {
         res.set_icon("../../assets/apertureneo_turbo.ico");
         res.set("ProductName", "Aperture Neo Turbo");
         res.set("FileDescription", "Aperture Neo Turbo - High-performance GPU image viewer");
-        res.set("FileVersion", "1.0.0");
-        res.set("ProductVersion", "1.0.0");
+        res.set("FileVersion", "1.0.8");
+        res.set("ProductVersion", "1.0.8");
         res.set("LegalCopyright", "DuJunxi1993");
         if let Err(e) = res.compile() {
             println!("cargo:warning=winresource embed failed: {e}");

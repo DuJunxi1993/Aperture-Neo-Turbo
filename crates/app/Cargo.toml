@@ -1,6 +1,6 @@
 [package]
 name = "aperture-neo-turbo"
-version = "1.0.0"
+version = "1.0.8"
 edition = "2021"
 description = "Aperture Neo Turbo - High-performance GPU image viewer"
 license = "MIT"

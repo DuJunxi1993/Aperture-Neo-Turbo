@@ -122,7 +122,7 @@ dependencies = [
 
 [[package]]
 name = "aperture-neo-turbo"
-version = "1.0.0"
+version = "1.0.8"
 dependencies = [
  "anyhow",
  "aperture-core",
