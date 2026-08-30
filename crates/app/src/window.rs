@@ -3308,13 +3308,6 @@ let window = event_loop.create_window(
             .unwrap_or(false);
         let display = node.display_name.clone();
         let path_clone = node.path.clone();
-        // Use the full path + root_idx as the id salt so same-named folders in
-        // different parents (or different roots) don't share collapsing state.
-        let id_salt = if is_virtual_root {
-            format!("tree-root-r{root_idx}-{depth}-{}", display)
-        } else {
-            format!("tree-r{root_idx}-{}", path_clone.display())
-        };
         let is_reveal_target = reveal.as_ref() == Some(&node.path) && root_idx == 2;
         let text_color = if is_current || is_reveal_target {
             pal.selection_text
@@ -3411,107 +3404,92 @@ let window = event_loop.create_window(
                 }
             }
         } else {
-            // Directory rows: draw the CollapsingHeader FIRST so it reserves
-            // exactly its own row height (no extra blank strip — the old
-            // `allocate_exact_size(26px)` before it injected ~32px of dead
-            // space between every directory/drive row, which looked like
-            // phantom blank items and shifted clicks to the node below).
-            // After the header resolves its own rect we paint the full-row
-            // highlight over THAT rect and make the whole row clickable.
+            // ---- Handwritten directory row (replaces CollapsingHeader) ----
+            // We draw the row OURSELVES so height/indent/click/highlight are
+            // deterministic and never fight egui's internal header state.
+            // Each row: indent = depth*14px, a disclosure triangle, the
+            // label, and (when open) its children indented one level.
             let dir_selected = is_current || is_reveal_target;
             // This PC expanded directories get only bold — no bg, no bar.
-            // See root_idx==2 (This PC) + is_virtual_root=false below.
             let this_pc_expanded = root_idx == 2 && !is_virtual_root;
-            let header = egui::CollapsingHeader::new(
-                egui::RichText::new(display).size(if dir_selected { 15.0 } else { 14.0 }).color(text_color)
-            )
-            .id_salt(id_salt)
-            // `expanded` is the single source of truth — force the open
-            // state every frame so reveal() (and clicks) reliably expand
-            // headers regardless of egui's internal memory.
-            .open(Some(is_open))
-            .show(ui, |ui| {
-                if let Some(children) = node.children.as_mut() {
-                    if children.is_empty() && !is_virtual_root && node.loading {
-                        ui.label(
-                            egui::RichText::new("(empty)")
-                                .size(11.0)
-                                .color(pal.text_dim),
-                        );
-                    }
-                    for child in children.iter_mut() {
-                        let w = Self::draw_tree_node(
-                            ui, tree, child, depth + 1, current_folder, expanded, actions, root_idx,
-                            reveal, revealed, pending, recent_scroll, pal,
-                        );
-                        max_w = max_w.max(w);
-                    }
-                }
-            });
-            // The CollapsingHeader's own clickable rect only covers the
-            // label + triangle, not the full row width. Allocate the SAME
-            // rect (egui allows re-allocating an already-used rect without
-            // moving the cursor) to get a full-width click region, and paint
-            // the highlight over it. `allocate_rect` returns a response for
-            // the header's Y-range, so a click anywhere on the row (including
-            // the blank area to the right of the label) toggles THIS node.
-            let dir_row_rect = header.header_response.rect;
-            let dir_selected_rect = egui::Rect::from_min_size(
-                egui::pos2(dir_row_rect.min.x, dir_row_rect.min.y),
-                egui::vec2(ui.available_width(), dir_row_rect.height()),
+            let indent = depth as f32 * 14.0;
+            let row_h = 26.0_f32;
+            let (row_rect, row_resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Sense::click(),
             );
-            let dir_row_resp = ui.allocate_rect(dir_selected_rect, egui::Sense::click());
-            // Paint the full-row highlight / hover / accent bar over the row
-            // (after the header, so it sits on top and is not clipped).
+            // Full-row background + accent bar + bold (skip bar/bg for This
+            // PC expanded directories).
             if dir_selected && !this_pc_expanded {
-                ui.painter().rect_filled(dir_selected_rect, 6.0, pal.selected_card_fill);
+                ui.painter().rect_filled(row_rect, 6.0, pal.selected_card_fill);
                 let bar = egui::Rect::from_min_size(
-                    egui::pos2(dir_selected_rect.left() + 2.0, dir_selected_rect.top() + 3.0),
-                    egui::vec2(2.0, dir_selected_rect.height() - 6.0),
+                    egui::pos2(row_rect.left() + 2.0, row_rect.top() + 3.0),
+                    egui::vec2(2.0, row_rect.height() - 6.0),
                 );
                 ui.painter().rect_filled(bar, 1.0, pal.selected_card_stroke);
                 crate::effects::paint_edge_shine(
-                    ui.painter(), dir_selected_rect, pal.selected_card_stroke, 36,
+                    ui.painter(), row_rect, pal.selected_card_stroke, 36,
                 );
-            } else if dir_row_resp.hovered() {
-                ui.painter().rect_filled(dir_selected_rect, 6.0, pal.hover_fill);
+            } else if row_resp.hovered() {
+                ui.painter().rect_filled(row_rect, 6.0, pal.hover_fill);
             }
-            // Grain breaks up the flat fill (Linear).
-            crate::effects::paint_grain(ui.painter(), dir_selected_rect, 3);
-            // Capture this header's rect + subtree height if it's the
-            // pending expand target, so the next frame can decide whether
-            // to scroll to align the header with the viewport top.
-            let should_capture = tree.state.lock().pending_expand_scroll.as_ref().is_some_and(|p| p == &path_clone);
-            if should_capture {
-                let header_rect = header.header_response.rect;
-                let subtree_bottom = header.body_response.as_ref()
-                    .map(|r| r.rect.bottom())
-                    .unwrap_or(header_rect.bottom());
-                let mut st = tree.state.lock();
-                st.pending_expand_rect = Some(header_rect);
-                st.pending_expand_subtree_h = subtree_bottom - header_rect.top();
+            crate::effects::paint_grain(ui.painter(), row_rect, 3);
+            // Disclosure triangle (rotates on open).
+            let tri_c = egui::pos2(row_rect.left() + indent + 7.0, row_rect.center().y);
+            if is_open {
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        tri_c + egui::vec2(-3.5, -2.5),
+                        tri_c + egui::vec2(3.5, -2.5),
+                        tri_c + egui::vec2(0.0, 2.5),
+                    ],
+                    pal.text_secondary,
+                    egui::Stroke::NONE,
+                ));
+            } else {
+                ui.painter().add(egui::Shape::convex_polygon(
+                    vec![
+                        tri_c + egui::vec2(-2.5, -3.5),
+                        tri_c + egui::vec2(2.5, 0.0),
+                        tri_c + egui::vec2(-2.5, 3.5),
+                    ],
+                    pal.text_secondary,
+                    egui::Stroke::NONE,
+                ));
+            }
+            // Label (bold when selected). Text is drawn at fixed x so long
+            // names never wrap and never overlap the next row.
+            let text_x = row_rect.left() + indent + 18.0;
+            ui.painter().text(
+                egui::pos2(text_x, row_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                display,
+                if dir_selected {
+                    egui::FontId::proportional(15.0)
+                } else {
+                    egui::FontId::proportional(14.0)
+                },
+                text_color,
+            );
+            // Capture this row for the pending-expand scroll decision.
+            if tree.state.lock().pending_expand_scroll.as_ref().is_some_and(|p| p == &path_clone) {
+                tree.state.lock().pending_expand_rect = Some(row_rect);
             }
             if is_reveal_target && !*revealed {
-                ui.scroll_to_rect(header.header_response.rect, Some(egui::Align::Center));
+                ui.scroll_to_rect(row_rect, Some(egui::Align::Center));
                 *revealed = true;
             }
-            // Click toggles expansion; non-root nodes also navigate. Full-row
-            // click routes through `dir_row_resp`, and the header label via
-            // `header.header_response` — OR them so a click lands regardless.
-            let header_clicked = header.header_response.clicked() || dir_row_resp.clicked();
+            // Click toggles expansion; non-root nodes also navigate. We
+            // check the row response AND a triangle/label hit so the whole
+            // row (including the blank area right of the label) is clickable.
+            let header_clicked = row_resp.clicked();
             if header_clicked {
                 if is_open {
                     expanded[root_idx].remove(&path_clone);
                 } else {
                     expanded[root_idx].insert(path_clone.clone());
-                    // Expanding: defer a scroll decision to the next
-                    // frame so the expanded subtree has actually been
-                    // laid out and we can measure its height.
                     tree.state.lock().pending_expand_scroll = Some(path_clone.clone());
                 }
-                // Collapsing an ancestor of the current folder (inside
-                // This PC) hides the current node — scroll the matching
-                // Recent entry into view so the selection keeps a home.
                 if is_open && root_idx == 2 {
                     if let Some(cur) = current_folder {
                         if cur != &path_clone && cur.starts_with(&path_clone) {
@@ -3523,20 +3501,42 @@ let window = event_loop.create_window(
                     actions.push(UiAction::FolderChosen(path_clone.clone(), root_idx));
                 }
             }
-            // Phase 2: native context menu (replaces the previous
-            // egui context_menu closure). The popup is deferred
-            // to render_frame() so the egui borrow is released
-            // before show_tree_context_menu is called. show_tree_context_menu
-            // already filters out items that don't apply (e.g.
-            // virtual roots get nothing; root 0 favorites get
-            // "取消收藏" but not "添加到收藏" etc.).
-            if header.header_response.secondary_clicked() {
+            // Right-click → deferred native context menu.
+            if row_resp.secondary_clicked() {
                 if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
                     *pending = Some(TreeCtxIntent {
                         pos_phys: (pos.x as i32, pos.y as i32),
                         path: path_clone.clone(),
                         root_idx,
                     });
+                }
+            }
+            // Render children (indented) when the node is open. After they
+            // lay out, if this row was the pending-expand target, record the
+            // subtree height so the consumer can scroll it to the top.
+            if is_open {
+                if let Some(children) = node.children.as_mut() {
+                    if children.is_empty() && !is_virtual_root && node.loading {
+                        ui.painter().text(
+                            egui::pos2(row_rect.left() + indent + 18.0, row_rect.bottom() + 12.0),
+                            egui::Align2::LEFT_TOP,
+                            "(empty)",
+                            egui::FontId::proportional(11.0),
+                            pal.text_dim,
+                        );
+                    }
+                    for child in children.iter_mut() {
+                        let w = Self::draw_tree_node(
+                            ui, tree, child, depth + 1, current_folder, expanded, actions, root_idx,
+                            reveal, revealed, pending, recent_scroll, pal,
+                        );
+                        max_w = max_w.max(w);
+                    }
+                }
+                // Record subtree height for the pending-expand scroll.
+                if tree.state.lock().pending_expand_scroll.as_ref().is_some_and(|p| p == &path_clone) {
+                    let bottom = ui.min_rect().bottom();
+                    tree.state.lock().pending_expand_subtree_h = bottom - row_rect.top();
                 }
             }
         }
