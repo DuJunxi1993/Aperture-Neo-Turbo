@@ -1784,12 +1784,18 @@ let window = event_loop.create_window(
                 egui::pos2(0.0, bar_y),
                 egui::vec2(egui_state.ctx.input(|i| i.screen_rect.width()), bar_h),
             );
+            let bar_w = egui_state.ctx.input(|i| i.screen_rect.width());
             let bar_resp = egui::Area::new(egui::Id::new("overlay_toolbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(bar_rect_outer.min)
+                // Give the Area its actual size so ui.max_rect() (which
+                // draw_fullscreen_bar reads for the bar height) is correct
+                // instead of degenerating to ~0 and clipping every button.
+                .default_size(egui::vec2(bar_w, bar_h))
                 .show(&egui_state.ctx, |ui| {
                     let area_rect = ui.max_rect();
                     ui.set_clip_rect(area_rect);
+                    ui.allocate_rect(area_rect, egui::Sense::hover());
                     // Semi-transparent surface behind the row, over the
                     // area's own rect (local coords).
                     ui.painter().rect_filled(
