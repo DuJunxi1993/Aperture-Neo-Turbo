@@ -3125,9 +3125,20 @@ let window = event_loop.create_window(
                     egui::vec2(3.0, rect.height()),
                 );
                 ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+                // Linear-style edge shine: a faint accent glow along the
+                // leading edge to lift the selected row off the panel.
+                crate::effects::paint_edge_shine(
+                    ui.painter(),
+                    rect,
+                    pal.selected_card_stroke,
+                    36,
+                );
             } else if resp.hovered() {
                 ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
             }
+            // Faint grain over the whole card breaks up the flat fill so it
+            // reads as a surface rather than a solid block (Linear's Grain).
+            crate::effects::paint_grain(ui.painter(), rect, 4);
             ui.painter().text(
                 egui::pos2(rect.left() + 10.0, rect.center().y),
                 egui::Align2::LEFT_CENTER,
@@ -3192,9 +3203,15 @@ let window = event_loop.create_window(
                     egui::vec2(3.0, dir_row_rect.height()),
                 );
                 ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+                crate::effects::paint_edge_shine(
+                    ui.painter(), dir_row_rect, pal.selected_card_stroke, 36,
+                );
             } else if dir_row_resp.hovered() {
                 ui.painter().rect_filled(dir_row_rect, 6.0, pal.hover_fill);
             }
+            // Grain on every directory row keeps the tree surface from being
+            // a flat block; matches the leaf-row grain.
+            crate::effects::paint_grain(ui.painter(), dir_row_rect, 3);
             let header = egui::CollapsingHeader::new(
                 egui::RichText::new(display).size(if dir_selected { 15.0 } else { 14.0 }).color(text_color)
             )
