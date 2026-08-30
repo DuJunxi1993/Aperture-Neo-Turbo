@@ -253,6 +253,8 @@ pub struct Palette {
     pub card_stroke: egui::Color32,
     /// 1px divider line between menu item groups (theme-aware).
     pub separator: egui::Color32,
+    /// Green ✓ used to mark an enabled setting toggle (Linear success green).
+    pub toggle_on: egui::Color32,
     pub selected_card_fill: egui::Color32,
     pub selected_card_stroke: egui::Color32,
     pub thumb_placeholder: egui::Color32,
@@ -294,6 +296,7 @@ pub fn dark_palette() -> Palette { Palette {
     button_hover: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
     separator: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
+    toggle_on: egui::Color32::from_rgb(0x4c, 0xaf, 0x50),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38),
     selected_card_stroke: egui::Color32::from_rgb(95, 106, 210),
     thumb_placeholder: egui::Color32::from_rgb(28, 30, 36),
@@ -318,6 +321,7 @@ pub fn light_palette() -> Palette { Palette {
     button_hover: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
     separator: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
+    toggle_on: egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
     selected_card_stroke: egui::Color32::from_rgb(94, 106, 210),
     thumb_placeholder: egui::Color32::from_rgb(226, 228, 231),
@@ -1801,7 +1805,7 @@ let window = event_loop.create_window(
             // strip). We fix that by sizing the content ui explicitly with a
             // child UiBuilder whose max_rect is the full bar rect in AREA-LOCAL
             // coords (the Area's origin is fixed_pos, so local top-left = ZERO).
-            let bar_resp = egui::Area::new(egui::Id::new("overlay_toolbar"))
+            let _bar_resp = egui::Area::new(egui::Id::new("overlay_toolbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(bar_rect_outer.min)
                 .show(&egui_state.ctx, |ui| {
@@ -1832,7 +1836,7 @@ let window = event_loop.create_window(
                         0.0,
                         egui::Color32::from_rgba_unmultiplied(
                             pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
-                            235,
+                            (235.0 * a) as u8,
                         ),
                     );
                     Self::draw_fullscreen_bar(
@@ -1841,8 +1845,8 @@ let window = event_loop.create_window(
                         &pal, true, self.slide_show_running,
                     );
                 });
-            toolbar_rect = Some(bar_resp.response.rect);
-            self.fullscreen_bar_rect = Some(bar_resp.response.rect);
+            toolbar_rect = Some(bar_rect_outer);
+            self.fullscreen_bar_rect = Some(bar_rect_outer);
         } else {
             self.fullscreen_bar_rect = None;
         }
@@ -1981,9 +1985,7 @@ let window = event_loop.create_window(
             // read as a stray background block on both themes.
             .frame(
                 egui::Frame::default()
-                    .fill(egui::Color32::from_rgba_unmultiplied(
-                        pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
-                    ))
+                    .fill(pal.panel_bg)
                     .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                     .rounding(8.0)
                     .outer_margin(egui::Margin::same(2.0))
@@ -2119,9 +2121,7 @@ let window = event_loop.create_window(
                 egui::pos2(16.0, (TOOLBAR_HEIGHT as f32) + 4.0)
             };
             let menu_frame = egui::Frame::default()
-                .fill(egui::Color32::from_rgba_unmultiplied(
-                    pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
-                ))
+                .fill(pal.panel_bg)
                 .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                 .rounding(egui::Rounding::same(8.0))
                 .inner_margin(egui::Margin::same(6.0))
@@ -2147,18 +2147,18 @@ let window = event_loop.create_window(
                 .resizable(false)
                 .collapsible(false)
                 .title_bar(false);
-            // Use an egui::Button (reliable click semantics) for each row so
-            // a click reliably sends a UiAction (the hand-painted
-            // allocate_exact_size row hit-testing was flaky here).
-            let make_item = |ui: &mut egui::Ui, label: &str, checked: Option<bool>| -> bool {
+            // Each row allocates a FIXED `menu_w` (not `ui.available_width()`),
+            // matching the proven context-menu `item` pattern. In an
+            // auto-measured fixed_pos window, `available_width()` returns the
+            // parent/measuring-pass width, which offsets the interact rect so
+            // clicks only land on the right edge. Returns (clicked, row_rect)
+            // so the divider can be placed from the previous row.
+            let make_item = |ui: &mut egui::Ui, label: &str, checked: Option<bool>| -> (bool, egui::Rect) {
                 let row_h = 28.0_f32;
                 let (rect, resp) = ui.allocate_exact_size(
-                    egui::vec2(ui.available_width(), row_h),
+                    egui::vec2(menu_w, row_h),
                     egui::Sense::click(),
                 );
-                // Whole-row click via the allocated response (same reliable
-                // path as the context-menu `item`). Paint the highlight/press
-                // fill over the full row and the label/check on top.
                 if resp.is_pointer_button_down_on() {
                     ui.painter().rect_filled(rect, 6.0, pal.button_hover);
                 } else if resp.hovered() {
@@ -2178,36 +2178,41 @@ let window = event_loop.create_window(
                         egui::Align2::RIGHT_CENTER,
                         if chk { "✓" } else { "" },
                         egui::FontId::proportional(12.5),
-                        pal.accent,
+                        if chk { pal.toggle_on } else { pal.text_tertiary },
                     );
                 }
-                resp.clicked()
+                (resp.clicked(), rect)
             };
             let settings_resp = settings_win.show(&egui_ctx, |ui| {
-                if make_item(ui, "Clear browse history", None) {
+                let (c1, _r1) = make_item(ui, "Clear browse history", None);
+                if c1 {
                     settings_action = Some(UiAction::SettingsClearRecent);
                     close_menu = true;
                 }
-                if make_item(ui, "Clear favorites", None) {
+                let (c2, r2) = make_item(ui, "Clear favorites", None);
+                if c2 {
                     settings_action = Some(UiAction::SettingsClearFavorites);
                     close_menu = true;
                 }
+                // Thin 1px divider placed from the previous row's rect so it
+                // always lands inside the menu (not the measuring rect).
                 ui.add_space(4.0);
-                let avail = ui.available_rect_before_wrap();
                 ui.painter().rect_filled(
                     egui::Rect::from_min_max(
-                        egui::pos2(avail.left(), avail.center().y - 0.5),
-                        egui::pos2(avail.right(), avail.center().y + 0.5),
+                        egui::pos2(r2.left() + 6.0, r2.bottom() + 4.0),
+                        egui::pos2(r2.right() - 6.0, r2.bottom() + 4.5),
                     ),
                     0.0,
                     pal.separator,
                 );
                 ui.add_space(4.0);
-                if make_item(ui, "Follow system theme", Some(theme_system)) {
+                let (c3, _r3) = make_item(ui, "Follow system theme", Some(theme_system));
+                if c3 {
                     settings_action = Some(UiAction::SettingsThemeSystem);
                     close_menu = true;
                 }
-                if make_item(ui, "Show sidebar on launch", Some(sidebar_on_launch)) {
+                let (c4, _r4) = make_item(ui, "Show sidebar on launch", Some(sidebar_on_launch));
+                if c4 {
                     settings_action = Some(UiAction::SettingsSidebarOnLaunch);
                     close_menu = true;
                 }
@@ -3617,15 +3622,6 @@ let window = event_loop.create_window(
             // subtree height so the consumer can scroll it to the top.
             if is_open {
                 if let Some(children) = node.children.as_mut() {
-                    if children.is_empty() && !is_virtual_root && node.loading {
-                        ui.painter().text(
-                            egui::pos2(row_rect.left() + indent + 18.0, row_rect.bottom() + 12.0),
-                            egui::Align2::LEFT_TOP,
-                            "(empty)",
-                            egui::FontId::proportional(11.0),
-                            pal.text_dim,
-                        );
-                    }
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
                             ui, tree, child, depth + 1, current_folder, expanded, actions, root_idx,
@@ -3916,9 +3912,7 @@ let window = event_loop.create_window(
         let mut close = false;
 
         let frame = egui::Frame::default()
-            .fill(egui::Color32::from_rgba_unmultiplied(
-                pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
-            ))
+            .fill(pal.panel_bg)
             .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
             .rounding(egui::Rounding::same(8.0))
             .inner_margin(egui::Margin::same(6.0))
@@ -5152,7 +5146,13 @@ impl ApplicationHandler for MainWindow {
                     let (top, hh) = self.drawer_draw.map(|(_, _, t, h)| (t, h)).unwrap_or((TOOLBAR_HEIGHT as f32, (self.viewport_h as f32) - STATUS_BAR_HEIGHT as f32));
                     clx <= dw && cly >= top && cly <= top + hh
                 };
-                viewer_hit && !over_drawer
+                // In fullscreen a click on the floating overlay control bar
+                // must reach egui (button actions), not be consumed by the
+                // pan/double-click branch below — same rule as the drawer.
+                let over_bar = self
+                    .fullscreen_bar_rect
+                    .map_or(false, |r| r.contains(egui::pos2(clx, cly)));
+                viewer_hit && !over_drawer && !over_bar
             } else {
                 false
             };
