@@ -2950,11 +2950,20 @@ let window = event_loop.create_window(
                         // Pending expand-scroll: if a directory header was
                         // expanded on the previous frame and its subtree
                         // overflows the viewport, scroll the header to align
-                        // with the top. If it fits, leave the scroll alone.
-                        if let (Some(path), Some(header_rect)) = (
-                            state.pending_expand_scroll.take(),
-                            state.pending_expand_rect.take(),
-                        ) {
+                        // with the top (Align::Min pins to TOP, `None` only
+                        // scrolls the minimum to bring it into view). If it
+                        // fits, leave the scroll alone. Gated on all three
+                        // being set so the scroll only fires AFTER the
+                        // subtree has been measured on the open frame — the
+                        // expand-click sets pending_expand_scroll, and the
+                        // `should_capture` block in draw_tree_node fills
+                        // rect + subtree height on the following draw.
+                        if state.pending_expand_scroll.is_some()
+                            && state.pending_expand_rect.is_some()
+                            && state.pending_expand_subtree_h > 0.0
+                        {
+                            let path = state.pending_expand_scroll.take().unwrap();
+                            let header_rect = state.pending_expand_rect.take().unwrap();
                             let subtree_h = state.pending_expand_subtree_h;
                             state.pending_expand_subtree_h = 0.0;
                             let clip_h = ui.clip_rect().height();
@@ -2964,7 +2973,7 @@ let window = event_loop.create_window(
                                         header_rect.min,
                                         egui::vec2(header_rect.width(), 0.0),
                                     ),
-                                    None,
+                                    Some(egui::Align::Min),
                                 );
                             }
                             let _ = path; // suppress unused-warning
