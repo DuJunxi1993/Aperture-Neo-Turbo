@@ -2129,16 +2129,25 @@ let window = event_loop.create_window(
                 .resizable(false)
                 .collapsible(false)
                 .title_bar(false);
+            // Use an egui::Button (reliable click semantics) for each row so
+            // a click reliably sends a UiAction (the hand-painted
+            // allocate_exact_size row hit-testing was flaky here).
             let make_item = |ui: &mut egui::Ui, label: &str, checked: Option<bool>| -> bool {
                 let row_h = 28.0_f32;
-                let (rect, resp) = ui.allocate_exact_size(
+                let (rect, _) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), row_h),
-                    egui::Sense::click(),
+                    egui::Sense::hover(),
                 );
-                if resp.is_pointer_button_down_on() {
-                    // Pressed — strong accent fill for clear click feedback.
+                // Draw text + optional check manually on top of a full-row
+                // Button, so the hover/press look matches the theme while the
+                // click comes from a real Button.
+                let id = ui.id().with(("settings_item", label));
+                let btn_resp = ui
+                    .interact(rect, id, egui::Sense::click())
+                    .on_hover_cursor(egui::CursorIcon::PointingHand);
+                if btn_resp.is_pointer_button_down_on() {
                     ui.painter().rect_filled(rect, 6.0, pal.button_hover);
-                } else if resp.hovered() {
+                } else if btn_resp.hovered() {
                     ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
                 }
                 ui.painter().text(
@@ -2157,7 +2166,7 @@ let window = event_loop.create_window(
                         pal.accent,
                     );
                 }
-                resp.clicked()
+                btn_resp.clicked()
             };
             let settings_resp = settings_win.show(&egui_ctx, |ui| {
                 if make_item(ui, "Clear browse history", None) {
@@ -4214,26 +4223,42 @@ let window = event_loop.create_window(
                 self.show_settings_menu = !self.show_settings_menu;
             }
             UiAction::SettingsClearRecent => {
+                tracing::info!("settings: clear recent history");
                 self.settings.clear_recent();
                 self.file_tree.refresh_recent(&self.settings.recent_folders());
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
             UiAction::SettingsClearFavorites => {
+                tracing::info!("settings: clear favorites");
                 self.settings.clear_favorites();
                 self.file_tree.refresh_favorites(&self.settings.favorite_folders());
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
             UiAction::SettingsThemeSystem => {
+                // Toggle follow-system on/off. When switching TO System we
+                // pick the OS preference; when leaving System we go Dark.
                 let next = if self.settings.is_theme_system() {
                     Theme::Dark
                 } else {
                     Theme::System
                 };
+                tracing::info!("settings: theme -> {:?}", next);
                 self.settings.set_theme(next);
                 self.theme = next;
+                // Force the visuals to re-apply even if the resolved value
+                // happens to match what was already applied (avoids the 'no
+                // visible change' when the OS is already the target shade).
+                if let Some(es) = &self.egui_state {
+                    self.applied_visuals = None;
+                    es.ctx.request_repaint();
+                }
             }
             UiAction::SettingsSidebarOnLaunch => {
                 let show = !self.settings.show_tree_on_launch();
+                tracing::info!("settings: sidebar on launch -> {}", show);
                 self.settings.set_show_tree_on_launch(show);
                 self.show_tree = show;
+                if let Some(w) = &self.window { w.request_redraw(); }
             }
         }
     }
