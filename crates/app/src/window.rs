@@ -3012,6 +3012,14 @@ let window = event_loop.create_window(
                         ));
                     }
                     // Re-lock to restore the taken state for the next frame.
+                    // `recent_scroll` is a ONE-SHOT intent (scroll a Recent
+                    // entry into view after a This PC collapse): it is always
+                    // cleared here so a stale target can't keep firing
+                    // `scroll_to_rect` every frame, which would make the
+                    // scrollbar appear "stuck" (dragging fights the forced
+                    // offset). `reveal_state` may legitimately need several
+                    // frames while ancestors expand, so it is only kept when
+                    // not yet revealed.
                     {
                         let mut state = tree.state.lock();
                         state.roots = roots;
@@ -3019,7 +3027,9 @@ let window = event_loop.create_window(
                         if !revealed_node {
                             state.reveal_target = reveal;
                         }
-                        state.recent_scroll_target = recent_scroll;
+                        // Recent-scroll: clear unconditionally (one-shot).
+                        let _ = recent_scroll;
+                        state.recent_scroll_target = None;
                     }
                     max_w
                 });
