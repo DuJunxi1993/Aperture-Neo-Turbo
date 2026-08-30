@@ -3181,37 +3181,17 @@ let window = event_loop.create_window(
                 }
             }
         } else {
-            // Directory rows: lay down a full-width click + highlight strip
-            // UNDER the CollapsingHeader. The header's own click region only
-            // covers the label + triangle; the strip gives "click anywhere on
-            // the row" semantics (matching leaf entries and Recent/Favorites)
-            // and lets us draw the full-row background + left accent bar when
-            // the row is the current folder.
-            let dir_row_h: f32 = 26.0;
-            let (dir_row_rect, dir_row_resp) = ui.allocate_exact_size(
-                egui::vec2(ui.available_width(), dir_row_h),
-                egui::Sense::click(),
-            );
+            // Directory rows: draw the CollapsingHeader FIRST so it reserves
+            // exactly its own row height (no extra blank strip — the old
+            // `allocate_exact_size(26px)` before it injected ~32px of dead
+            // space between every directory/drive row, which looked like
+            // phantom blank items and shifted clicks to the node below).
+            // After the header resolves its own rect we paint the full-row
+            // highlight over THAT rect and make the whole row clickable.
             let dir_selected = is_current || is_reveal_target;
             // This PC expanded directories get only bold — no bg, no bar.
             // See root_idx==2 (This PC) + is_virtual_root=false below.
             let this_pc_expanded = root_idx == 2 && !is_virtual_root;
-            if dir_selected && !this_pc_expanded {
-                ui.painter().rect_filled(dir_row_rect, 6.0, pal.selected_card_fill);
-                let bar = egui::Rect::from_min_size(
-                    dir_row_rect.min,
-                    egui::vec2(3.0, dir_row_rect.height()),
-                );
-                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
-                crate::effects::paint_edge_shine(
-                    ui.painter(), dir_row_rect, pal.selected_card_stroke, 36,
-                );
-            } else if dir_row_resp.hovered() {
-                ui.painter().rect_filled(dir_row_rect, 6.0, pal.hover_fill);
-            }
-            // Grain on every directory row keeps the tree surface from being
-            // a flat block; matches the leaf-row grain.
-            crate::effects::paint_grain(ui.painter(), dir_row_rect, 3);
             let header = egui::CollapsingHeader::new(
                 egui::RichText::new(display).size(if dir_selected { 15.0 } else { 14.0 }).color(text_color)
             )
@@ -3238,6 +3218,36 @@ let window = event_loop.create_window(
                     }
                 }
             });
+            // The CollapsingHeader's own clickable rect only covers the
+            // label + triangle, not the full row width. Allocate the SAME
+            // rect (egui allows re-allocating an already-used rect without
+            // moving the cursor) to get a full-width click region, and paint
+            // the highlight over it. `allocate_rect` returns a response for
+            // the header's Y-range, so a click anywhere on the row (including
+            // the blank area to the right of the label) toggles THIS node.
+            let dir_row_rect = header.header_response.rect;
+            let dir_selected_rect = egui::Rect::from_min_size(
+                egui::pos2(dir_row_rect.min.x, dir_row_rect.min.y),
+                egui::vec2(ui.available_width(), dir_row_rect.height()),
+            );
+            let dir_row_resp = ui.allocate_rect(dir_selected_rect, egui::Sense::click());
+            // Paint the full-row highlight / hover / accent bar over the row
+            // (after the header, so it sits on top and is not clipped).
+            if dir_selected && !this_pc_expanded {
+                ui.painter().rect_filled(dir_selected_rect, 6.0, pal.selected_card_fill);
+                let bar = egui::Rect::from_min_size(
+                    dir_selected_rect.min,
+                    egui::vec2(3.0, dir_selected_rect.height()),
+                );
+                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+                crate::effects::paint_edge_shine(
+                    ui.painter(), dir_selected_rect, pal.selected_card_stroke, 36,
+                );
+            } else if dir_row_resp.hovered() {
+                ui.painter().rect_filled(dir_selected_rect, 6.0, pal.hover_fill);
+            }
+            // Grain breaks up the flat fill (Linear).
+            crate::effects::paint_grain(ui.painter(), dir_selected_rect, 3);
             // Capture this header's rect + subtree height if it's the
             // pending expand target, so the next frame can decide whether
             // to scroll to align the header with the viewport top.
@@ -3255,11 +3265,9 @@ let window = event_loop.create_window(
                 ui.scroll_to_rect(header.header_response.rect, Some(egui::Align::Center));
                 *revealed = true;
             }
-            // Click toggles expansion; non-root nodes also navigate. The
-            // "click anywhere on the row" full-row strip routes through
-            // `dir_row_resp`; the header label itself routes through
-            // `header.header_response`. We OR both so any click on the
-            // row triggers the same logic.
+            // Click toggles expansion; non-root nodes also navigate. Full-row
+            // click routes through `dir_row_resp`, and the header label via
+            // `header.header_response` — OR them so a click lands regardless.
             let header_clicked = header.header_response.clicked() || dir_row_resp.clicked();
             if header_clicked {
                 if is_open {
