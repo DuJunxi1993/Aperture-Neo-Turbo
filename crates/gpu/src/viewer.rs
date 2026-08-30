@@ -1,8 +1,8 @@
 //! Viewer state machine — image display with animations
 //!
 //! Holds fit/zoom/offset/rotation state and rect/slide animations.
-//! The actual rendering is done by the wgpu image-quad pipeline in
-//! `window.rs` — this module only computes transforms and uniform data.
+//! The actual rendering is done by the egui painter in `window.rs` —
+//! this module computes the image→screen transform that builds the mesh.
 
 use std::sync::Arc;
 use crate::texture::DecodedGpuImage;
@@ -57,6 +57,24 @@ pub enum SlideDir {
 pub struct Direct2DViewer {
     pub current_gpu: Option<Arc<DecodedGpuImage>>,
     pub previous_gpu: Option<Arc<DecodedGpuImage>>,
+    /// Images that have left the viewer but were still referenced by a
+    /// recently-submitted frame. Each entry is tagged with the render epoch
+    /// that was current when the image was last drawn. The app crate owns the
+    /// wgpu device: each submitted frame advances an epoch and is recorded as
+    /// a `SubmissionIndex`; once `device.poll(Maintain::WaitForSubmissionIndex)`
+    /// confirms everything through epoch E has completed, the app calls
+    /// [`Self::release_retired_through`] to drop the entries (which releases
+    /// their egui textures → free delta) safely past the in-flight window.
+    /// This replaces a frame-count heuristic, which is unreliable when the GPU
+    /// lags behind (e.g. a decode freeze) — the frame-based window can expire
+    /// while the texture is still being sampled.
+    retired: std::collections::VecDeque<(Arc<DecodedGpuImage>, u64)>,
+    /// Monotonic render epoch, set each frame by the app via [`Self::set_render_epoch`].
+    /// Used to tag retired images so the app knows which submission drew them.
+    render_epoch: u64,
+    /// Highest render epoch whose submission the app has confirmed completed.
+    /// Entries retired at an epoch ≤ this are safe to drop.
+    safe_release_epoch: u64,
     pub animator: Animator,
     pub slide_dir: SlideDir,
     pub viewport_w: u32,
@@ -73,6 +91,20 @@ pub struct Direct2DViewer {
     /// fragile float comparison that breaks after a rotation or a zoom
     /// that accidentally matches fit_scale.
     pub is_fit: bool,
+    /// Own view state of the OUTGOING image, captured just before
+    /// `compute_fit()` overwrites `offset_x/offset_y/zoom` for the next
+    /// image. The iOS slide draws the outgoing image from ITS OWN fit
+    /// (offset/zoom/rotation) rather than the incoming image's, so the
+    /// two images match their respective sizes during the slide.
+    prev_offset_x: f32,
+    prev_offset_y: f32,
+    prev_zoom: f32,
+    prev_rot_deg: f32,
+    /// Average luminance (0..1) of the CURRENT image, captured from
+    /// `DecodedGpuImage::average_luminance` on load. Stable across
+    /// zoom/pan; used by the edge-drawer handle to pick a contrasting
+    /// translucent color.
+    pub image_luminance: f32,
     pub bg: [f32; 3],
     rect_anim: Option<RectAnim>,
     pending_viewport_anim_from: Option<(f32, f32, f32, f32)>,
@@ -107,6 +139,7 @@ impl Direct2DViewer {
         Self {
             current_gpu: None,
             previous_gpu: None,
+            retired: std::collections::VecDeque::new(),
             animator: Animator::new(),
             slide_dir: SlideDir::None,
             viewport_w,
@@ -117,6 +150,11 @@ impl Direct2DViewer {
             offset_y: 0.0,
             fit_scale: 1.0,
             is_fit: true,
+            prev_offset_x: 0.0,
+            prev_offset_y: 0.0,
+            prev_zoom: 1.0,
+            prev_rot_deg: 0.0,
+            image_luminance: 0.5,
             bg: [0.059, 0.063, 0.067],
             rect_anim: None,
             pending_viewport_anim_from: None,
@@ -124,151 +162,178 @@ impl Direct2DViewer {
             rotation: 0,
             rotation_deg: 0.0,
             rot_anim: None,
+            render_epoch: 0,
+            safe_release_epoch: 0,
         }
     }
 
     pub fn set_image_gpu(&mut self, image: Arc<DecodedGpuImage>, direction: SlideDir) {
+        // Capture the OUTGOING image's own fit state BEFORE compute_fit
+        // (below) overwrites offset_x/offset_y/zoom for the next image.
+        // The iOS slide needs this so the outgoing image is drawn at its
+        // own size/rotation, not the incoming image's.
+        self.prev_offset_x = self.offset_x;
+        self.prev_offset_y = self.offset_y;
+        self.prev_zoom = self.zoom;
+        self.prev_rot_deg = self.rotation_deg;
         self.rotation = 0;
         self.rotation_deg = 0.0;
         self.rot_anim = None;
         self.slide_dir = direction;
-        let outgoing = self.current_gpu.take();
-        self.current_gpu = Some(image);
-        self.previous_gpu = outgoing;
         if direction != SlideDir::None {
+            // Directional load: keep the outgoing frame so the slide can
+            // composite both, and start the slide animation. If a previous
+            // image is still being slid out, retire it FIRST (never drop it
+            // directly — its texture may still be sampled by an in-flight
+            // submit), then adopt the new outgoing.
+            if let Some(old_prev) = self.previous_gpu.take() {
+                self.retired.push_back((old_prev, self.render_epoch));
+            }
+            let outgoing = self.current_gpu.take();
+            self.current_gpu = Some(image);
+            self.previous_gpu = outgoing;
             self.animator.start_slide(direction, self.viewport_w as f32);
         } else {
+            // Non-directional load (folder change / held-arrow fast paging /
+            // page jump): swap instantly — nothing to slide, so move the
+            // outgoing frame into the retire queue (it may still be sampled
+            // by a submit from the just-rendered frame).
+            let outgoing = self.current_gpu.take();
+            self.current_gpu = Some(image);
+            if let Some(img) = outgoing {
+                self.retired.push_back((img, self.render_epoch));
+            }
             self.animator.reset();
         }
+        // Track the image's overall brightness (computed at decode time) so
+        // the edge-drawer handle can pick a contrasting color that stays
+        // valid across zoom/pan.
+        self.image_luminance = self.current_gpu
+            .as_ref()
+            .map(|g| g.average_luminance)
+            .unwrap_or(0.5);
         self.compute_fit();
     }
 
-    /// Build the image-quad uniform for either the current image
+    /// The image→screen affine for either the current image
     /// (`for_previous = false`) or the outgoing previous image
-    /// (`for_previous = true`). When `previous_gpu` is None the call
-    /// still succeeds but `has_image = 0`, so the render pass can be
-    /// skipped in `submit_wgpu_frame`.
+    /// (`for_previous = true`), in viewport-local coordinates. The affine
+    /// maps a source-pixel position to a viewer-local screen position.
     ///
-    /// The affine comes from three sources, in priority order:
+    /// The transform comes from three sources, in priority order:
     /// 1. `current_rect_anim_transform` — fullscreen / fit-zoom /
-    ///    rotation target glide. Wins over the slide animation.
-    /// 2. `animator.current_transform` — only meaningful during a
-    ///    slide. For the current image this is the incoming slide
-    ///    (offset+shift); for the previous image we apply the same
-    ///    shift but anchored at the previous image's prior fit
-    ///    position so the two images move in opposite directions
-    ///    across the viewer rect.
-    /// 3. `display_transform(offset, offset_y, zoom)` — the static
-    ///    fit, including rotation.
-    ///
-    /// The shader samples with screen→image, so we invert the
-    /// image→screen affine returned by those helpers.
-    pub fn gpu_uniforms(
-        &self,
-        viewer_rect_min: (f32, f32),
-        viewer_rect_size: (f32, f32),
-        bg: [f32; 3],
-    ) -> crate::ImageQuadUniforms {
-        self.gpu_uniforms_for(viewer_rect_min, viewer_rect_size, bg, false)
-    }
-
-    pub fn gpu_uniforms_for(
-        &self,
-        viewer_rect_min: (f32, f32),
-        viewer_rect_size: (f32, f32),
-        bg: [f32; 3],
-        for_previous: bool,
-    ) -> crate::ImageQuadUniforms {
-        let img_ref = if for_previous {
-            self.previous_gpu.as_ref()
-        } else {
-            self.current_gpu.as_ref()
-        };
-        let (img_w, img_h) = match img_ref {
-            Some(img) => (img.width as f32, img.height as f32),
-            None => {
-                return crate::ImageQuadUniforms {
-                    col0: [1.0, 0.0, 0.0],
-                    _pad_col0: 0,
-                    col1: [0.0, 1.0, 0.0],
-                    _pad_col1: 0,
-                    col2: [0.0, 0.0, 1.0],
-                    _pad_col2: 0,
-                    viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
-                    viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
-                    texture_size: [0.0, 0.0],
-                    _pad_texture: [0; 2],
-                    bg: [bg[0], bg[1], bg[2], 1.0],
-                    has_image: 0,
-                    _pad: [0; 3],
-                };
+    ///    rotation target glide. Wins over the slide animation (current
+    ///    image only; the previous image is only ever drawn during a
+    ///    slide, and a slide and a rect-anim never run together).
+    /// 2. Slide animator — the current (incoming) image rides
+    ///    `offset + dir*VW*(1-t)`; the previous (outgoing) image slides
+    ///    from `prev_offset - dir*VW*t`. Each is anchored at ITS OWN
+    ///    captured fit (offset/zoom/rotation), so they move at their own
+    ///    sizes instead of being drawn at the other image's dimensions.
+    /// 3. Static fit (with rotation handled by display_transform).
+    fn screen_affine(&self, for_previous: bool) -> AffineTransform {
+        if !for_previous {
+            if let Some(t) = self.current_rect_anim_transform() {
+                return t;
             }
-        };
-
-        // 1. Rect-anim (fullscreen / fit-glide) wins outright.
-        // 2. Slide animator: current image uses slide-in (offset+shift);
-        //    previous image uses the same shift but anchored at its
-        //    own previous fit position so the two move in opposite
-        //    directions across the viewer rect.
-        // 3. Static fit (with rotation handled by display_transform).
-        let (m11, m12, m21, m22, dx, dy) = if let Some(t) = self.current_rect_anim_transform() {
-            (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
-        } else if self.animator.is_sliding() {
-            // iOS-style gallery slide. `offset_x/offset_y` is the IMAGE
-            // CENTRE (viewer-local). Build the affine via display_transform
-            // so the centre-to-affine conversion matches the static-fit
-            // path exactly — otherwise the image centre gets double-shifted
-            // (the slide used to be built from a top-left-anchored affine
-            // while offset_x is now a centre, sliding the image out of the
-            // viewport to the bottom-right and then snapping back).
+        }
+        if self.animator.is_sliding() {
             let t = self.animator.slide_progress();
             let vw = self.viewport_w as f32;
             let dir = match self.slide_dir {
-                crate::viewer::SlideDir::Next => 1.0,
-                crate::viewer::SlideDir::Previous => -1.0,
-                crate::viewer::SlideDir::None => 0.0,
+                SlideDir::Next => 1.0,
+                SlideDir::Previous => -1.0,
+                SlideDir::None => 0.0,
             };
-            let (cx, cy) = if for_previous {
-                // Outgoing image: centre starts at the middle and exits
-                // toward the OPPOSITE side of the incoming one.
-                (self.offset_x - dir * vw * t, self.offset_y)
+            if for_previous {
+                // Outgoing image anchored at ITS own previous fit, sliding
+                // out toward the opposite edge: centre(t) = prev_off -
+                // dir*VW*t. Use affine_for_size directly (not
+                // display_transform) because the latter reads the CURRENT
+                // image's dims, but this affine must use the PREVIOUS
+                // image's dims/zoom/rotation.
+                let (bw, bh) = match &self.previous_gpu {
+                    Some(img) => (img.width as f32, img.height as f32),
+                    None => (0.0, 0.0),
+                };
+                let cx = self.prev_offset_x - dir * vw * t;
+                let cy = self.prev_offset_y;
+                Self::affine_for_size(bw, bh, self.prev_rot_deg, cx, cy, self.prev_zoom)
             } else {
-                // Incoming image: centre enters from the direction side
-                // and settles at the middle.
-                (self.offset_x + dir * vw * (1.0 - t), self.offset_y)
-            };
-            let sl = self.display_transform(cx, cy, self.zoom);
-            (sl.m11, sl.m12, sl.m21, sl.m22, sl.dx, sl.dy)
+                // Incoming image: centre enters from the direction side and
+                // settles at its own fit: centre(t) = offset + dir*VW*(1-t).
+                let cx = self.offset_x + dir * vw * (1.0 - t);
+                let cy = self.offset_y;
+                self.display_transform(cx, cy, self.zoom)
+            }
         } else {
-            let t = self.display_transform(self.offset_x, self.offset_y, self.zoom);
-            (t.m11, t.m12, t.m21, t.m22, t.dx, t.dy)
-        };
+            self.display_transform(self.offset_x, self.offset_y, self.zoom)
+        }
+    }
 
-        // Invert the 2×2 affine in homogeneous coords. For rotation by
-        // multiples of 90° + uniform scale, det(m11*m22 - m12*m21) is
-        // `s*s` — always positive — so the inverse is well-behaved.
-        let det = m11 * m22 - m12 * m21;
-        let inv_det = if det.abs() > 1e-6 { 1.0 / det } else { 0.0 };
-        let im11 =  m22 * inv_det;
-        let im12 = -m12 * inv_det;
-        let im21 = -m21 * inv_det;
-        let im22 =  m11 * inv_det;
-        let idx = -(im11 * dx + im12 * dy);
-        let idy = -(im21 * dx + im22 * dy);
-        crate::ImageQuadUniforms {
-            col0: [im11, im21, 0.0],
-            _pad_col0: 0,
-            col1: [im12, im22, 0.0],
-            _pad_col1: 0,
-            col2: [idx, idy, 1.0],
-            _pad_col2: 0,
-            viewer_rect_min: [viewer_rect_min.0, viewer_rect_min.1],
-            viewer_rect_size: [viewer_rect_size.0, viewer_rect_size.1],
-            texture_size: [img_w, img_h],
-            _pad_texture: [0; 2],
-            bg: [bg[0], bg[1], bg[2], 1.0],
-            has_image: 1,
-            _pad: [0; 3],
+    /// Build an egui mesh for `image` at its current screen transform. The
+    /// four corners of the source image are mapped through `affine` then
+    /// translated by the viewport origin and converted to logical (point)
+    /// coordinates, so the textured quad lands exactly where the old
+    /// screen→image shader put it. Rotations (90° spins) are handled by the
+    /// affine's off-diagonal terms, so a single textured mesh covers
+    /// fit/zoom/pan/rotation/slide uniformly — no custom pipeline needed.
+    fn image_mesh(
+        &self,
+        painter: &egui::Painter,
+        image: &DecodedGpuImage,
+        affine: &AffineTransform,
+        ppp: f32,
+    ) {
+        let (w, h) = (image.width as f32, image.height as f32);
+        let (ox, oy) = (self.viewport_origin.0 / ppp, self.viewport_origin.1 / ppp);
+        let corners = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(w, 0.0),
+            egui::pos2(w, h),
+            egui::pos2(0.0, h),
+        ];
+        let uv_corners = [
+            egui::pos2(0.0, 0.0),
+            egui::pos2(1.0, 0.0),
+            egui::pos2(1.0, 1.0),
+            egui::pos2(0.0, 1.0),
+        ];
+        let mut mesh = egui::Mesh::with_texture(image.texture.id());
+        for i in 0..4 {
+            let c = corners[i];
+            let sx = affine.m11 * c.x + affine.m12 * c.y + affine.dx;
+            let sy = affine.m21 * c.x + affine.m22 * c.y + affine.dy;
+            mesh.vertices.push(egui::epaint::Vertex {
+                pos: egui::pos2(ox + sx / ppp, oy + sy / ppp),
+                uv: uv_corners[i],
+                color: egui::Color32::WHITE,
+            });
+        }
+        mesh.indices = vec![0, 1, 2, 0, 2, 3];
+        painter.add(egui::Shape::mesh(mesh));
+    }
+
+    /// Paint the currently-displayed image (and, during a slide, the
+    /// outgoing previous image) into the given egui painter.
+    ///
+    /// Both are drawn inside the viewer rect (the caller is expected to
+    /// have already sized/clipped the painter to the central panel). The
+    /// previous image is drawn first, then the current one composites on
+    /// top — matching the old two-pass order, but now handled by egui's
+    /// own vertex pipeline. `ppp` converts the viewer's physical
+    /// (px) coordinate space to egui logical points.
+    pub fn paint_viewer(&self, painter: &egui::Painter, ppp: f32) {
+        // Outgoing image first (behind), then the incoming over it.
+        if self.animator.is_sliding() {
+            if let Some(prev) = &self.previous_gpu {
+                let affine = self.screen_affine(true);
+                self.image_mesh(painter, prev, &affine, ppp);
+            }
+        }
+        if let Some(cur) = &self.current_gpu {
+            let affine = self.screen_affine(false);
+            self.image_mesh(painter, cur, &affine, ppp);
         }
     }
 
@@ -309,7 +374,7 @@ impl Direct2DViewer {
     /// Pure affine-builder: image(w×h) rotated by `rot_deg` about its
     /// centre, scaled by `s`, with the image centre mapped to `(dx, dy)`.
     /// Separate from [`Self::display_transform`] so unit tests can verify
-    /// the centre-anchor invariant without a wgpu DecodedGpuImage.
+    /// the centre-anchor invariant without a wgpu texture.
     ///
     /// Rotation is CLOCKWISE on screen (matching the rotate button). With a
     /// top-left-origin display (y grows downward) a clockwise visual
@@ -615,13 +680,54 @@ impl Direct2DViewer {
     /// keeps the image centred as the panel animates.
     #[inline]
     pub fn set_viewport_physical(&mut self, w: u32, h: u32, x: f32, y: f32) {
-        let size_changed = self.viewport_w != w || self.viewport_h != h;
-        let origin_changed =
-            (self.viewport_origin.0 - x).abs() > 0.5 || (self.viewport_origin.1 - y).abs() > 0.5;
+        // Track ANY per-frame change (not a 0.5px/1px hysteresis). During a
+        // tree/thumb panel collapse the LEFT edge (origin.x) moves while the
+        // width grows; a hysteresis only re-fits once the change crossed a
+        // threshold, so the image "pauses then jumps". The thumb panel (right)
+        // never changes origin, so the same pause was invisible there. By
+        // re-fitting on every real change, tree and thumb stay in lockstep:
+        // the image re-scales continuously against the moving edge — the
+        // "resize the window" smoothness. compute_fit is trivial (a few
+        // multiplies) and the panel animation is a few hundred ms, so this
+        // costs nothing.
+        let changed = self.viewport_w != w || self.viewport_h != h
+            || self.viewport_origin.0 != x || self.viewport_origin.1 != y;
         self.viewport_w = w;
         self.viewport_h = h;
         self.viewport_origin = (x, y);
-        if self.current_gpu.is_some() && self.is_fit && (size_changed || origin_changed) {
+        if self.current_gpu.is_some() && self.is_fit && changed {
+            self.compute_fit();
+        }
+    }
+
+    /// Continuous-precision viewport sync, used while a side panel animates.
+    ///
+    /// The egui CentralPanel rect is snapped to WHOLE physical pixels
+    /// (`central_rect_phys`), which during the panel-width easing produces a
+    /// staircase: on deceleration frames the width/origin quantize to the same
+    /// integer, so `set_viewport_physical` sees "no change" and the image
+    /// "pauses then jumps" — exactly the tree-collapse stall (and it drags the
+    /// bottom bar along because the whole layout shares the quantized width).
+    ///
+    /// This method instead accepts the CONTINUOUS (unrounded) panel widths so
+    /// the per-frame change is never lost: `compute_fit` re-centres the image
+    /// against the true animated viewport every frame, giving the smooth
+    /// "resize the window" tracking. `origin.x/y` and the size are physical
+    /// (ppp-scaled), like the image-quad scissor — the integer scissor is only
+    /// a rasterisation bound, so tracking a continuous origin here never
+    /// renders outside the panel.
+    #[inline]
+    pub fn set_viewport_continuous(&mut self, w: f32, h: f32, x: f32, y: f32) {
+        let changed = (self.viewport_w as f32 - w).abs() > f32::EPSILON
+            || (self.viewport_h as f32 - h).abs() > f32::EPSILON
+            || (self.viewport_origin.0 - x).abs() > f32::EPSILON
+            || (self.viewport_origin.1 - y).abs() > f32::EPSILON;
+        // Store physical as f32 is impossible (u32 field) → round, but keep
+        // origin at full f32 precision so sub-pixel edge motion still re-fits.
+        self.viewport_w = w.round() as u32;
+        self.viewport_h = h.round() as u32;
+        self.viewport_origin = (x, y);
+        if self.current_gpu.is_some() && self.is_fit && changed {
             self.compute_fit();
         }
     }
@@ -685,18 +791,72 @@ impl Direct2DViewer {
     /// once per frame from `render_frame` — without this, a rect-anim
     /// started by set_rotation / fit_to_screen stays resident forever, so
     /// `current_rect_anim_transform` keeps returning its (frozen) transform
-    /// and `gpu_uniforms_for` ignores pan/zoom/offset. That is the bug
-    /// behind "wheel zoom stops working after a rotation / fullscreen
-    /// doesn't fit until I drag" — dragging clears rect_anim via on_pan,
-    /// which accidentally unblocked the pipeline.
+    /// and the render ignores pan/zoom/offset. That is the bug behind
+    /// "wheel zoom stops working after a rotation / fullscreen doesn't fit
+    /// until I drag" — dragging clears rect_anim via on_pan, which
+    /// accidentally unblocked the pipeline.
     pub fn tick_rect_anim(&mut self) {
         if self.rect_anim_done() {
             self.commit_rect_anim();
         }
     }
 
+    /// Release the outgoing image once the slide has finished. `previous_gpu`
+    /// is only ever drawn while `animator.is_sliding()`; once the slide's
+    /// progress reaches 1.0 the old frame is no longer drawn, but it may
+    /// still be sampled by the submit from the just-rendered frame — so move
+    /// it into the retire queue instead of dropping it immediately. Called
+    /// once per frame from `render_frame`.
+    pub fn tick_slide(&mut self) {
+        if !self.animator.is_sliding() {
+            if let Some(prev) = self.previous_gpu.take() {
+                self.retired.push_back((prev, self.render_epoch));
+            }
+        }
+    }
+
+    /// Set the current render epoch (the app calls this once per frame, using
+    /// the epoch of the frame it is about to submit). Retired images are
+    /// tagged with the epoch current when they became dead; the app only
+    /// releases an entry once it has confirmed the corresponding submission
+    /// completed on the GPU.
+    pub fn set_render_epoch(&mut self, epoch: u64) {
+        self.render_epoch = epoch;
+    }
+
+    /// Drop any retired image whose tag epoch is at or below `confirmed_epoch`
+    /// — i.e. the GPU has finished every submission this image could have been
+    /// sampled in. Called by the app once it has fenced past `confirmed_epoch`.
+    pub fn release_retired_through(&mut self, confirmed_epoch: u64) {
+        self.safe_release_epoch = confirmed_epoch.max(self.safe_release_epoch);
+        let mut i = 0;
+        while i < self.retired.len() {
+            if self.retired[i].1 <= self.safe_release_epoch {
+                let (img, _) = self.retired.remove(i).unwrap();
+                drop(img);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
     pub fn is_transitioning(&self) -> bool {
         self.animator.is_animating() || self.rect_anim.is_some()
+    }
+
+    /// The viewer's viewport origin (physical px) — the coordinate anchor
+    /// that `offset_x/cx` are relative to. The image-quad shader computes
+    /// `screen_local = fb - viewer_rect_min`, so `viewer_rect_min` MUST be
+    /// this origin for the image (incl. the outgoing slide image) to land
+    /// on-screen. Passing egui's central-panel rect here instead (a
+    /// different, quantized value) shifts the image out of view.
+    pub fn viewport_origin(&self) -> (f32, f32) {
+        (self.viewport_origin.0, self.viewport_origin.1)
+    }
+
+    /// The viewer's viewport size in physical px.
+    pub fn viewport_size_f(&self) -> (f32, f32) {
+        (self.viewport_w as f32, self.viewport_h as f32)
     }
 
     pub fn viewport_size(&self) -> (u32, u32) { (self.viewport_w, self.viewport_h) }

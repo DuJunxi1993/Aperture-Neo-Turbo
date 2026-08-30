@@ -1,97 +1,101 @@
-//! GPU texture wrapper around a decoded image.
+//! egui texture wrapper around a decoded image.
 //!
-//! Holds a `wgpu::Texture` + view + dimensions. The texture is uploaded
-//! from `DecodedPixels` via `from_pixels`, which writes the BGRA
-//! premultiplied pixel buffer to a `TextureFormat::Bgra8UnormSrgb`
-//! texture (matching the WIC source layout — no channel swap needed).
+//! The image is rendered through egui's painter (`painter.image` / a
+//! textured mesh), so a decoded frame is uploaded as an
+//! [`egui::TextureHandle`] rather than a raw wgpu texture. This removes the
+//! custom image-quad pipeline: egui owns the texture lifecycle, the
+//! mesh/vertex pipeline, clipping, and alpha compositing.
 //!
-//! Phase 2: produced alongside `DecodedBitmap`; Phase 3 reads it.
-//! Phase 4: the D2D `DecodedBitmap` is deleted and this becomes the
-//! sole upload target.
+//! WIC decodes to straight BGRA; egui's `ColorImage::from_rgba_unmultiplied`
+//! wants RGBA, so we swap the R and B channels on upload. `average_luminance`
+//! is still computed from the BGRA buffer (it's a downsample over all
+//! channels, so channel order is irrelevant for the coarse signal).
 
-use std::sync::Arc;
 use anyhow::Result;
 use crate::DecodedPixels;
 
-/// A decoded image uploaded to a wgpu texture, ready to be sampled by
-/// the image-quad shader.
+/// A decoded image uploaded to an egui texture, ready to be painted.
 ///
-/// Wrapped in `Arc` so the bind group can hold a reference and the
-/// texture outlives any individual render pass. The texture is created
-/// with `TEXTURE_BINDING | COPY_DST`; `COPY_SRC` and `RENDER_ATTACHMENT`
-/// are intentionally omitted (this texture is never read back or used
-/// as a render target).
+/// Wrapped in `Arc` so the viewer can hold it long-lived and clone it cheaply
+/// (egui textures are reference-counted; the last handle frees the texture).
 pub struct DecodedGpuImage {
-    pub texture: Arc<wgpu::Texture>,
-    pub view: Arc<wgpu::TextureView>,
+    pub texture: egui::TextureHandle,
     pub width: u32,
     pub height: u32,
     /// Original (unclamped) image size from the source file, used for
     /// fit calculations in `crates/gpu/src/viewer.rs::compute_fit`.
     pub source_width: u32,
     pub source_height: u32,
+    /// Average luminance (0..1) of the decoded image, computed once on the
+    /// CPU side from the BGRA pixels before GPU upload. Used by the edge
+    /// drawer's handle to pick a contrasting translucent color (light image
+    /// → dark handle, dark image → light handle). Computed at decode time so
+    /// it's stable across zoom/pan — the handle color follows the IMAGE's
+    /// overall brightness, not the changing pixels under the cursor.
+    pub average_luminance: f32,
 }
 
 impl DecodedGpuImage {
-    /// Upload a decoded BGRA pixel buffer to a wgpu texture.
+    /// Upload a decoded BGRA pixel buffer to an egui texture.
     ///
-    /// The pixel buffer layout is assumed to be `Bgra8UnormSrgb` —
-    /// no channel reorder. Premultiplied alpha is preserved on the GPU
-    /// side; the image-quad shader unpremultiplies in fragment.
-    pub fn from_pixels(
-        device: &wgpu::Device,
-        queue: &wgpu::Queue,
-        pixels: &DecodedPixels,
-    ) -> Result<Self> {
-        let format = wgpu::TextureFormat::Bgra8UnormSrgb;
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("decoded_image_texture"),
-            size: wgpu::Extent3d {
-                width: pixels.width,
-                height: pixels.height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            view_formats: &[],
-        });
-
-        // Bytes per row. wgpu's ImageDataLayout takes `bytes_per_row`
-        // as `Option<NonZero<u32>>` — unwrap on the assumption that
-        // `width * 4` never overflows u32 (4K is ~16 MiB per row, well
-        // within u32 range).
-        let bytes_per_row = pixels.stride();
-        queue.write_texture(
-            wgpu::ImageCopyTexture {
-                texture: &texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &pixels.pixels,
-            wgpu::ImageDataLayout {
-                offset: 0,
-                bytes_per_row: Some(bytes_per_row),
-                rows_per_image: Some(pixels.height),
-            },
-            wgpu::Extent3d {
-                width: pixels.width,
-                height: pixels.height,
-                depth_or_array_layers: 1,
-            },
+    /// WIC produces straight BGRA; egui's `ColorImage` is RGBA, so we swap
+    /// the R and B channels (every 4 bytes), then hand it to egui's texture
+    /// manager. `name` is passed through to egui for debugging.
+    pub fn from_pixels(ctx: &egui::Context, pixels: &DecodedPixels) -> Result<Self> {
+        let width = pixels.width;
+        let height = pixels.height;
+        let mut rgba = pixels.pixels.clone();
+        for px in rgba.chunks_exact_mut(4) {
+            px.swap(0, 2);
+        }
+        let color_image = egui::ColorImage::from_rgba_unmultiplied(
+            [width as usize, height as usize],
+            &rgba,
         );
-
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let average_luminance = Self::average_luminance(&pixels.pixels);
+        let texture = ctx.load_texture(
+            "aperture_main",
+            color_image,
+            egui::TextureOptions::LINEAR,
+        );
         Ok(Self {
-            texture: Arc::new(texture),
-            view: Arc::new(view),
-            width: pixels.width,
-            height: pixels.height,
+            texture,
+            width,
+            height,
             source_width: pixels.source_width,
             source_height: pixels.source_height,
+            average_luminance,
         })
+    }
+
+    /// Downsampled average luminance (0..1) of a BGRA8 pixel buffer. Samples
+    /// roughly every 16th pixel in each axis so the cost is O(n/256) — the
+    /// actual average of a photo is well approximated by a sparse grid, and
+    /// the drawer handle only needs a coarse bright/dark signal.
+    fn average_luminance(pixels: &[u8]) -> f32 {
+        if pixels.is_empty() {
+            return 0.5;
+        }
+        // stride assumed 4 bytes/px (BGRA8). Count rows so we can skip
+        // every Nth row and column for the downsample.
+        let byte_len = pixels.len();
+        // Derive a rough row stride from the byte length is not possible
+        // without width here, so we just sample every 64th byte (≈ every
+        // 16th pixel) uniformly across the buffer.
+        let step = 64usize.max(1);
+        let mut sum = 0.0f64;
+        let mut count = 0u32;
+        let mut i = 0usize;
+        while i < byte_len {
+            // Sample the G channel (index 1) for a decent luminance proxy.
+            sum += pixels[i + 1] as f64;
+            count += 1;
+            i += step;
+        }
+        if count == 0 {
+            return 0.5;
+        }
+        let avg = sum / count as f64;
+        (avg / 255.0) as f32
     }
 }

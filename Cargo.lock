@@ -111,13 +111,11 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "aperture-core",
- "bytemuck",
- "naga",
+ "egui",
  "parking_lot",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
- "wgpu",
  "windows 0.58.0",
  "windows-core 0.58.0",
 ]

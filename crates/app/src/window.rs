@@ -31,7 +31,7 @@ use aperture_core::{
     NavigationService, NavigationDirection,
     SettingsStore, ThumbCache, ThumbCacheConfig, ThemeSetting as Theme,
 };
-use aperture_gpu::{Direct2DViewer, WicLoader, DecodeCoordinator, SlideDir};
+use aperture_gpu::{Direct2DViewer, DecodeCoordinator, SlideDir};
 use crate::event_router::{self, RouterState};
 
 /// Phase 16: custom winit event that pops a native right-click
@@ -71,6 +71,43 @@ const DEFAULT_W: u32 = 1280;
 const DEFAULT_H: u32 = 800;
 const MIN_W: u32 = 480;
 const MIN_H: u32 = 320;
+// Frames to hold a retired (replaced) image texture before releasing its
+// egui handle. With Fifo present + frame-latency-1, the GPU can be at most
+// one frame behind the CPU; holding for a few frames plus the non-blocking
+// `device.poll(Maintain::Poll)` reap each frame guarantees the texture is no
+// longer sampled by any in-flight submit before it is dropped. Must be ≥ 2.
+const RETIRE_FRAME_BUDGET: u64 = 4;
+// Edge-drawer trigger/handle constants. The drawer opens when the pointer
+// nears the handle (a thin vertical pill at the left edge); it stays open
+// while the pointer is on the handle, the drawer, or a slim left-edge strip,
+// and slides back after `TREE_LEAVE_MS` outside those. Handle is inset
+// `HANDLE_X` from the window edge so it's not flush against it.
+const TREE_LEAVE_MS: u64 = 1000;
+const TREE_DRAWER_ANIM_MS: f32 = 220.0;
+const HANDLE_X: f32 = 8.0;
+const HANDLE_ZONE_PAD: f32 = 10.0;
+// Drawer width bounds (logical px). The upper bound is deliberately loose —
+// the drawer is an overlay (never takes layout space, so it can't crowd the
+// viewer), and a wide row (long folder name) should show fully rather than
+// truncate. `drawer_user_width` (user drag) clamps here.
+const DRAWER_MIN_W: f32 = 170.0;
+const DRAWER_MAX_W: f32 = 560.0;
+// Handle contrast thresholds with hysteresis: luminance > 0.62 → dark
+// handle (light image), < 0.38 → light handle (dark image), between → keep
+// the previous choice (no flicker at a bright/dark boundary).
+const HANDLE_LIGHT_THRESHOLD: f32 = 0.62;
+const HANDLE_DARK_THRESHOLD: f32 = 0.38;
+const HANDLE_DEBOUNCE_MS: u64 = 200;
+/// Held-arrow-step interval (fixed-rate). Tuned near the decode ceiling so
+/// a fast hold "walks" the gallery at a steady, rideable pace: each step
+/// cuts instantly (pre-decode cache), no animation. Too slow feels laggy;
+/// too fast skips the eye's ability to track. ~90ms ≈ 11 img/s.
+const HOLD_NAV_INTERVAL: std::time::Duration = std::time::Duration::from_millis(90);
+/// How long the key must be held before the fixed-rate walk engages. A
+/// quick tap (< this) stays a single animated navigation; holding past it
+/// enters fast direct-cut paging. Prevents misfiring the walk on a normal
+/// tap or fighting with single-press navigation.
+const HOLD_NAV_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(220);
 
 #[allow(dead_code)]
 enum UiAction {
@@ -148,6 +185,10 @@ thread_local! {
     /// (logical px). Shared across the static draw_thumbs_panel_static
     /// helper and the window_event wheel branch.
     static THUMB_SCROLL_Y: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
+    /// Last-known sticky scroll offset of the thumbs panel, used to
+    /// prefetch thumbnails in the direction of scroll (below = larger
+    /// indices, above = smaller) so a fast scroll doesn't flash placeholders.
+    static THUMB_LAST_SCROLL_Y: std::cell::Cell<f32> = const { std::cell::Cell::new(0.0) };
 }
 
 /// What the process was launched with.
@@ -331,7 +372,6 @@ pub struct MainWindow {
 
     // ── GPU / decode / viewer state ──────────────────────────────
     viewer: Option<Arc<Mutex<Direct2DViewer>>>,
-    loader: Option<Arc<WicLoader>>,
     coordinator: Option<Arc<DecodeCoordinator>>,
 
     // ── Navigation / data state ──────────────────────────────────
@@ -379,11 +419,71 @@ pub struct MainWindow {
     applied_visuals: Option<Theme>,
     last_frame: Option<std::time::Instant>,
 
+    // ── GPU texture-lifetime fencing state ────────────────────────
+    // Each submitted frame is assigned a monotonically increasing render
+    // epoch. The viewer's retire queue tags each dead image with the epoch it
+    // was last drawn in. We release a texture only once we've committed
+    // `RETIRE_FRAME_BUDGET` frames past that epoch AND reaped the GPU's
+    // finished work with a non-blocking `device.poll(Maintain::Poll)`. This
+    // never blocks the render thread, and with Fifo + frame-latency-1 the GPU
+    // is guaranteed ≤1 frame behind, so a small frame budget is provably past
+    // any in-flight submit. (wgpu exposes no non-blocking "which submission
+    // completed" query, so a frame fence is the correct non-blocking tool.)
+    render_epoch: u64,
+    /// The newest epoch we KNOW the GPU has finished rendering (advanced each
+    /// frame by `RETIRE_FRAME_BUDGET` behind the current epoch).
+    safe_release_epoch: u64,
+
     // ── Panel drag state ─────────────────────────────────────────
     drag_panel: Option<u8>,
     panel_edge_hover: Option<u8>,
     tree_rect_phys: (f32, f32, f32, f32),
     thumb_rect_phys: (f32, f32, f32, f32),
+
+    // ── Edge drawer (left-edge auto-expand tree menu) ────────────
+    // A separate floating drawer that slides out from the left edge when
+    // the mouse approaches (docked), independent of the classic tree panel
+    // (`show_tree`). Disabled while the classic tree panel is open. Slides
+    // out on a left-edge hot zone or handle hover; slides back after the
+    // mouse leaves for `TREE_LEAVE_MS`, or on any click outside (when not
+    // pinned). Its handle is translucent and picks a contrasting color
+    // based on the current image's overall luminance.
+    drawer_open: bool,
+    /// Set when the drawer is pinned open (not auto-collapsing). Unused for
+    /// now — drawers are purely docked (auto), but kept for future pinning.
+    #[allow(dead_code)]
+    drawer_pinned: bool,
+    /// When the mouse last left the drawer+hot zone, for the collapse timer.
+    drawer_leave_at: Option<std::time::Instant>,
+    /// Slide-out progress 0..1 (eased, starts at 0 = fully retracted).
+    drawer_anim: f32,
+    /// Drawer width (user-draggable / initial, logical px). Re-messured
+    /// content width is kept SEPARATE (`drawer_content_min`) so a long row
+    /// widens the drawer, and shrinks back to this base when the content
+    /// collapses (mirrors the classic tree's `PanelWidth` content_min).
+    drawer_user_width: f32,
+    /// Content-driven minimum width (logical px), re-computed every frame from
+    /// the tree's widest row. Temporary — the drawer temporarily widens to
+    /// fit long folder names, then returns to `drawer_user_width`.
+    drawer_content_min: f32,
+    /// Animated effective width (logical px) that eases toward
+    /// `max(drawer_user_width, drawer_content_min)` each frame (~150ms). This
+    /// is the SINGLE width used for drawing, hit-testing, and wheel routing —
+    /// so the visible width, click z-order, and scroll target never diverge
+    /// (the old bug: render used content_min but hit-test used user_width,
+    /// leaving the right ~1/3 of the drawer click-through + wheel-zoom).
+    /// Also gives the widen/collapse a soft transition like the classic tree.
+    drawer_width_anim: f32,
+    /// Last-known average luminance of the current image (0..1), debounced.
+    drawer_luminance: f32,
+    /// Whether the handle should be a light (translucent-white) pill. True
+    /// when the image is dark (light handle pops on dark content).
+    drawer_handle_light: bool,
+    /// Timestamp of the last luminance change, for the 200ms debounce.
+    drawer_luminance_at: Option<std::time::Instant>,
+    /// Result of `tick_drawer` for the current frame: (open_frac, width,
+    /// viewer_top, viewer_h) in logical px, drawn by `build_egui_ui`.
+    drawer_draw: Option<(f32, f32, f32, f32)>,
 
     // ── Pan / zoom state ─────────────────────────────────────────
     pan_active: bool,
@@ -396,10 +496,21 @@ pub struct MainWindow {
     router: RouterState,
     last_double_click: Option<std::time::Instant>,
 
-    // ── Arrow-key brake state ────────────────────────────────────
-    arrow_held: Option<NavigationDirection>,
-    pending_nav: Option<NavigationDirection>,
-    pending_slide_dir: SlideDir,
+    // ── Arrow-key hold state ─────────────────────────────────────
+    // One direction per hold. KEYDOWN of a fresh press fires a single
+    // navigation immediately (tap advances on the down-stroke); the
+    // per-frame dispatcher then advances on a FIXED-TIME pulse while the
+    // key is held (matching a fast paced gallery "walk": each step cuts
+    // to the next image directly, no animation). Pre-decode cache makes
+    // these hits instant, so the interval is truly rideable.
+    nav_intent: Option<(NavigationDirection, SlideDir)>,
+    /// When the last hold-step fired, for fixed-rate pacing.
+    nav_last_step: Option<std::time::Instant>,
+    /// When the current hold started (first KEYDOWN). The fixed-rate
+    /// "walk the gallery" mode only engages after the key has been held
+    /// for `HOLD_NAV_THRESHOLD` — a quick tap stays a single animated
+    /// navigation, and holding long enough enters fast direct-cut paging.
+    nav_press_at: Option<std::time::Instant>,
 }
 
 pub struct WgpuState {
@@ -420,9 +531,6 @@ pub struct WgpuState {
     pub surface_is_srgb: bool,
     pub pixels_per_point: f32,
     pub _instance: Box<wgpu::Instance>,
-    /// Image-quad pipeline (Phase 1 scaffolding; replaces the D2D
-    /// child HWND in Phase 4). Created once per WgpuState.
-    pub image_quad: aperture_gpu::ImageQuadPipeline,
 }
 
 pub struct EguiState {
@@ -492,7 +600,6 @@ impl MainWindow {
             wgpu_state: None,
             egui_state: None,
             viewer: None,
-            loader: None,
             coordinator: None,
             nav,
             settings,
@@ -516,9 +623,9 @@ impl MainWindow {
             is_fullscreen: false,
             router: RouterState::new(),
             last_double_click: None,
-            arrow_held: None,
-            pending_nav: None,
-            pending_slide_dir: SlideDir::None,
+            nav_intent: None,
+            nav_last_step: None,
+            nav_press_at: None,
             initial_folder: folder,
             show_shortcut_help: false,
             chrome_visible: true,
@@ -531,12 +638,25 @@ impl MainWindow {
             panel_edge_hover: None,
             tree_rect_phys: (0.0, 0.0, 0.0, 0.0),
             thumb_rect_phys: (0.0, 0.0, 0.0, 0.0),
+            drawer_open: false,
+            drawer_pinned: false,
+            drawer_leave_at: None,
+            drawer_anim: 0.0,
+            drawer_user_width: TREE_WIDTH as f32,
+            drawer_content_min: 0.0,
+            drawer_width_anim: TREE_WIDTH as f32,
+            drawer_luminance: 0.5,
+            drawer_handle_light: false,
+            drawer_luminance_at: None,
+            drawer_draw: None,
             _pending_egui_output: None,
             pan_active: false,
             pan_last: (0.0, 0.0),
             theme: theme_setting,
             single_image_size,
             last_frame: None,
+            render_epoch: 0,
+            safe_release_epoch: 0,
         }
     }
 
@@ -546,6 +666,159 @@ impl MainWindow {
             Theme::Dark => dark_palette(),
             Theme::Light => light_palette(),
         }
+    }
+
+    /// Advance the edge-drawer state machine and return `Some((open_frac,
+    /// width_px, top_px, height_px))` when the drawer should be drawn
+    /// (logical px for egui). Call once per frame from `tick_pre_frame`.
+    ///
+    /// Trigger model — the handle is the ONLY trigger:
+    /// - Open: the pointer is near the handle (a thin vertical pill at the
+    ///   left edge, inset `HANDLE_X`). The handle sits vertically centered in
+    ///   the viewer, positioned from WINDOW GEOMETRY (toolbar→status) so it
+    ///   never depends on a stale `viewport_size` value.
+    /// - Keep open: pointer on the handle, the drawer body, or a slim
+    ///   left-edge strip (full viewer height).
+    /// - Close: pointer leaves all of those for `TREE_LEAVE_MS` (or an
+    ///   outside click). Pinned drawers ignore this.
+    ///
+    /// The handle color follows the current image's overall luminance with
+    /// hysteresis + debounce (stable across pan/zoom — re-measured per image
+    /// load, not per frame).
+    fn tick_drawer(&mut self, dt: f32) -> Option<(f32, f32, f32, f32)> {
+        let ppp = self.wgpu_state
+            .as_ref()
+            .map(|w| w.pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.1);
+
+        // Viewer vertical span in LOGICAL px, from window geometry (not a
+        // possibly-stale viewport field). These are current and stable.
+        let win_h_px = self.wgpu_state.as_ref().map(|w| w.config.height).unwrap_or(800);
+        let top_logical = TOOLBAR_HEIGHT as f32;
+        let bottom_logical = (win_h_px as f32 / ppp) - STATUS_BAR_HEIGHT as f32;
+        let vh_logical = (bottom_logical - top_logical).max(1.0);
+
+        // Handle rect (logical), inset from the window edge, vertically
+        // centered in the viewer. THIS is the single source for the handle
+        // geometry (also used by the draw pass) — keep its derivation in
+        // sync with the draw block so the trigger zone lines up exactly.
+        let handle_w = 5.0_f32;
+        let handle_h = 48.0_f32;
+        let handle_x = HANDLE_X;
+        let handle_y = top_logical + vh_logical * 0.5 - handle_h * 0.5;
+        let handle_rect = egui::Rect::from_min_size(
+            egui::pos2(handle_x, handle_y),
+            egui::vec2(handle_w, handle_h),
+        );
+        // Proximity zone = handle rect padded. This is the ONLY open trigger.
+        let zone = handle_rect.expand(HANDLE_ZONE_PAD);
+        let active = !self.is_fullscreen && !self.show_tree && self.viewer.is_some();
+        if active {
+            // `router.cursor_pos` is PHYSICAL px; the handle/zone/geometry are
+            // LOGICAL, so convert the cursor to logical before comparing.
+            let cursor = egui::pos2(
+                self.router.cursor_pos.x / ppp,
+                self.router.cursor_pos.y / ppp,
+            );
+            // Left-edge strip (full viewer height, ~10px): a KEEP-OPEN region
+            // only, NOT a first-open trigger (so the drawer pops only when the
+            // pointer nears the handle, not anywhere along the left edge).
+            let in_left_strip = cursor.x >= 0.0
+                && cursor.x <= 10.0
+                && cursor.y >= top_logical
+                && cursor.y <= bottom_logical;
+            let in_zone = zone.contains(cursor);
+            let in_drawer = self.drawer_open && {
+                // Use the ANIMATED width (what's actually drawn) so the
+                // keep-open region matches the visible drawer.
+                let dx = self.drawer_width_anim;
+                cursor.x >= 0.0
+                    && cursor.x <= dx
+                    && cursor.y >= top_logical
+                    && cursor.y <= bottom_logical
+            };
+
+            if in_zone {
+                // First open via handle proximity.
+                self.drawer_open = true;
+                self.drawer_leave_at = None;
+            } else if self.drawer_open {
+                // Once open, keep it while the pointer is on the handle, the
+                // left strip, or the drawer body; otherwise start the timer.
+                if in_left_strip || in_drawer {
+                    self.drawer_leave_at = None;
+                } else {
+                    let now = std::time::Instant::now();
+                    match self.drawer_leave_at {
+                        None => self.drawer_leave_at = Some(now),
+                        Some(t) if now.duration_since(t).as_millis() as u64 >= TREE_LEAVE_MS => {
+                            self.drawer_open = false;
+                            self.drawer_leave_at = None;
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        } else {
+            self.drawer_open = false;
+            self.drawer_leave_at = None;
+        }
+
+        // Ease the open fraction toward the target.
+        let target = if self.drawer_open { 1.0 } else { 0.0 };
+        let k = ((dt * 1000.0) / TREE_DRAWER_ANIM_MS).clamp(0.0, 1.0);
+        if self.drawer_anim < target {
+            self.drawer_anim = (self.drawer_anim + k).min(target);
+        } else if self.drawer_anim > target {
+            self.drawer_anim = (self.drawer_anim - k).max(target);
+        }
+        let a = self.drawer_anim;
+        let frac = if a < 0.5 { 2.0 * a * a } else { 1.0 - (-2.0 * a + 2.0).powi(2) / 2.0 };
+
+        // Luminance debounce + hysteresis for the handle contrast.
+        let lum = self.viewer.as_ref().map(|v| v.lock().image_luminance).unwrap_or(0.5);
+        let changed = (self.drawer_luminance - lum).abs() > 0.001;
+        if changed {
+            let now = std::time::Instant::now();
+            match self.drawer_luminance_at {
+                None => self.drawer_luminance_at = Some(now),
+                Some(t) if now.duration_since(t).as_millis() as u64 >= HANDLE_DEBOUNCE_MS => {
+                    self.drawer_luminance = lum;
+                    if lum > HANDLE_LIGHT_THRESHOLD {
+                        self.drawer_handle_light = false;
+                    } else if lum < HANDLE_DARK_THRESHOLD {
+                        self.drawer_handle_light = true;
+                    }
+                    self.drawer_luminance_at = None;
+                }
+                _ => {}
+            }
+        } else {
+            self.drawer_luminance_at = None;
+        }
+
+        // Ease the effective width toward the target (max of the user-dragged
+        // base and the content minimum) so widening for a long row and
+        // collapsing back are soft transitions (not an instant jump). This
+        // eased width is the single source for drawing + hit-test + wheel.
+        let width_target = self.drawer_user_width.max(self.drawer_content_min);
+        let wk = ((dt * 1000.0) / 150.0).clamp(0.0, 1.0); // ~150ms exponential
+        self.drawer_width_anim += (width_target - self.drawer_width_anim) * wk;
+        if (self.drawer_width_anim - width_target).abs() < 0.5 {
+            self.drawer_width_anim = width_target;
+        }
+
+        if !self.drawer_open && self.drawer_anim <= 0.001 {
+            // Fully retracted: body not drawn, but the handle must always
+            // render. Return Some so the caller draws the handle.
+            if active {
+                return Some((0.0, 0.0, top_logical, vh_logical));
+            }
+            return None;
+        }
+        let width = self.drawer_width_anim * frac;
+        Some((frac, width, top_logical, vh_logical))
     }
 
     /// Phase 8: pull the active palette's panel_bg. Used by the
@@ -749,15 +1022,14 @@ let window = event_loop.create_window(
         // call below sets the physical-pixel viewport.
         let viewer = Arc::new(Mutex::new(Direct2DViewer::new(1, 1)));
 
-        let loader = Arc::new(WicLoader::new());
-        // Phase 2: pass wgpu device + queue into the coordinator so
-        // it can upload the decoded image to a wgpu texture alongside
-        // the D2D upload. Phase 3 hands this texture to the image
-        // quad; Phase 4 deletes the D2D path entirely.
+        // egui-native rendering: the decoded frame is uploaded as an
+        // egui::TextureHandle (via the coordinator holding a clone of the
+        // egui Context), and painted through egui's mesh pipeline. No
+        // separate wgpu image-quad pipeline is needed.
         let coordinator = Arc::new(DecodeCoordinator::new(
-            self.nav.clone(), loader.clone(), viewer.clone(),
-            wgpu_state.device.clone(),
-            wgpu_state.queue.clone(),
+            self.nav.clone(), viewer.clone(),
+            egui_state.ctx.clone(),
+            wgpu_state.device.limits().max_texture_dimension_2d,
         ));
 
         // Extract HWND from the winit window
@@ -826,7 +1098,6 @@ let window = event_loop.create_window(
         self.wgpu_state = Some(wgpu_state);
         self.egui_state = Some(egui_state);
         self.viewer = Some(viewer);
-        self.loader = Some(loader);
         self.coordinator = Some(coordinator);
 
         // Load initial folder if present (already loaded in new()).
@@ -834,9 +1105,10 @@ let window = event_loop.create_window(
         let count = self.nav.lock().count();
         tracing::info!("init_renderer: nav count = {}", count);
         if count > 0 {
-            if let Some(coordinator) = &self.coordinator {
-                coordinator.request_current(SlideDir::None);
-            }
+        if let Some(coordinator) = &self.coordinator {
+            coordinator.clear_caches();
+            coordinator.request_current(SlideDir::None);
+        }
             if let Some(ref folder) = self.initial_folder {
                 tracing::info!("Initial folder loaded: {}", folder.display());
             }
@@ -889,8 +1161,21 @@ let window = event_loop.create_window(
     }
 
     fn compute_viewer_rect(&self, win_w: u32, win_h: u32) -> (i32, i32, u32, u32) {
-        let tree_w = if self.show_tree { self.tree_panel.anim.round() as u32 } else { 0 };
-        let thumb_w = if self.show_thumbs { self.thumb_panel.anim.round() as u32 } else { 0 };
+        // Snap panel widths to WHOLE physical pixels (round(anim*ppp)/ppp),
+        // matching the exact snap egui uses when drawing each panel
+        // (build_egui_ui line "phase 12"). Using a bare logical round()
+        // here would drift from the drawn tree edge by a fractional
+        // physical pixel during the panel animation, leaving a 1px seam
+        // between the tree edge and the viewer (and desyncing the
+        // in_viewer hit-test from where the image is actually drawn).
+        let ppp = self.wgpu_state
+            .as_ref()
+            .map(|w| w.pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.1);
+        let snap = |x: f32| (x * ppp).round() / ppp;
+        let tree_w = if self.show_tree { snap(self.tree_panel.anim).round() as u32 } else { 0 };
+        let thumb_w = if self.show_thumbs { snap(self.thumb_panel.anim).round() as u32 } else { 0 };
         self.viewer_rect_with_widths(win_w, win_h, tree_w, thumb_w)
     }
 
@@ -916,6 +1201,30 @@ let window = event_loop.create_window(
         (x, y, w, h)
     }
 
+    /// Continuous-precision viewer rect (f32 physical), derived from the
+    /// UNROUNDED panel animation widths. Used to drive the viewer's fit
+    /// re-centre during a panel collapse so the image tracks the smooth
+    /// animation instead of the quantized integer panel edge (the
+    /// "pause then jump" stall). The integer `central_rect_phys` is still
+    /// used for the image-quad scissor (rasterisation bound), so this
+    /// continuous origin never draws outside the panel.
+    fn viewer_rect_physical_continuous(&self, win_w: u32, win_h: u32) -> (f32, f32, f32, f32) {
+        let ppp = self.wgpu_state
+            .as_ref()
+            .map(|w| w.pixels_per_point)
+            .unwrap_or(1.0)
+            .max(0.1);
+        let tree_px = if self.show_tree { self.tree_panel.anim * ppp } else { 0.0 };
+        let thumb_px = if self.show_thumbs { self.thumb_panel.anim * ppp } else { 0.0 };
+        let toolbar_px = TOOLBAR_HEIGHT as f32 * ppp;
+        let status_px = STATUS_BAR_HEIGHT as f32 * ppp;
+        let x = tree_px;
+        let y = toolbar_px;
+        let w = (win_w as f32 - tree_px - thumb_px).max(0.0);
+        let h = (win_h as f32 - toolbar_px - status_px).max(0.0);
+        (x, y, w, h)
+    }
+
     fn handle_navigation(&mut self, direction: NavigationDirection, slide_dir: SlideDir) {
         self.nav.lock().move_to(direction);
         if let Some(coordinator) = &self.coordinator {
@@ -933,43 +1242,55 @@ let window = event_loop.create_window(
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
-    /// Arrow-key KEYDOWN handler. Fires navigation IMMEDIATELY on the
-    /// first press (so a single tap still jumps on the down-stroke),
-    /// then queues the direction so the per-frame dispatcher keeps
-    /// firing while the key is held. The KEYUP path clears
-    /// `arrow_held` + `pending_nav` to stop further advances — that's
-    /// the "brake".
+    /// Arrow-key KEYDOWN handler. A fresh press (no prior intent) fires
+    /// navigation IMMEDIATELY so a single tap still jumps on the
+    /// down-stroke (with the iOS slide). Every press then records the
+    /// direction so the fixed-rate dispatcher can keep advancing while the
+    /// key is held. Only the FIRST press triggers an immediate jump — OS
+    /// auto-repeat KEYDOWNs just re-assert the same intent.
     fn on_arrow_keydown(&mut self, direction: NavigationDirection, slide_dir: SlideDir) {
-        if self.arrow_held.is_none() {
-            // First press in a fresh hold — jump immediately.
+        if self.nav_intent.is_none() {
+            // First press in a fresh hold — jump immediately (animated).
+            let now = std::time::Instant::now();
+            self.nav_press_at = Some(now);
+            self.nav_last_step = Some(now);
             self.handle_navigation(direction, slide_dir);
         }
-        // Always mark the key as held + queue the direction so the
-        // per-frame dispatcher can keep advancing while the user
-        // keeps holding. Repeat KEYDOWNs (OS auto-repeat) just
-        // re-assert the same direction — they do NOT fire
-        // handle_navigation directly.
-        self.arrow_held = Some(direction);
-        self.pending_nav = Some(direction);
-        self.pending_slide_dir = slide_dir;
+        self.nav_intent = Some((direction, slide_dir));
     }
 
-    /// Per-frame dispatcher for held arrow keys. Called from
-    /// `render_frame` BEFORE the egui frame. If `pending_nav` is
-    /// set AND `arrow_held` matches the queued direction, fire one
-    /// navigation EVERY FRAME — no rate cap, so the fastest the system
-    /// can decode/prepare an image is how fast the user pages through.
-    /// KEYUP already cleared both, so a frame after release sees no
-    /// pending nav and this is a no-op — that's the immediate-stop
-    /// behavior the user wants. (Decode is cover-style: the coordinator
-    /// overwrites any in-flight request with the latest direction so a
-    /// fast hold "jumps to the newest" image rather than replaying a
-    /// backlog.)
+    /// Per-frame dispatcher for a held arrow key, called from
+    /// `render_frame` BEFORE the egui frame. Fires the next step on a
+    /// FIXED-TIME pulse (`HOLD_NAV_INTERVAL`) while the key is held — but
+    /// only after the key has been held for `HOLD_NAV_THRESHOLD`; a quick
+    /// tap stays a single animated navigation and never enters the walk.
+    /// Each held step uses `SlideDir::None` (direct cut, no slide) — this
+    /// is the fast "walk the gallery" mode: steady pace, no per-step
+    /// animation, no waiting on decode (the pre-decode cache makes it a
+    /// hit). KEYUP clears `nav_intent`, so a frame after release the next
+    /// step is a no-op — immediate stop.
     fn tick_arrow_nav(&mut self) {
-        let Some(dir) = self.pending_nav else { return; };
-        if self.arrow_held != Some(dir) { return; }
-        let slide_dir = self.pending_slide_dir;
-        self.handle_navigation(dir, slide_dir);
+        let Some((direction, _)) = self.nav_intent else { return; };
+        let now = std::time::Instant::now();
+        // The walk only engages once the hold has lasted the threshold.
+        let engaged = self
+            .nav_press_at
+            .map(|t| now.duration_since(t) >= HOLD_NAV_THRESHOLD)
+            .unwrap_or(false);
+        if !engaged {
+            return;
+        }
+        let due = self
+            .nav_last_step
+            .map(|t| now.duration_since(t) >= HOLD_NAV_INTERVAL)
+            .unwrap_or(true);
+        if !due {
+            return;
+        }
+        self.nav_last_step = Some(now);
+        // Held steps cut directly (no slide) — the iOS transition is for
+        // single taps / button clicks only.
+        self.handle_navigation(direction, SlideDir::None);
     }
 
     fn navigate_to_folder(&mut self, path: PathBuf) {
@@ -1071,6 +1392,13 @@ let window = event_loop.create_window(
 
     fn render_frame(&mut self) -> Result<()> {
         self.tick_pre_frame();
+        // Assign this frame's render epoch and stamp it into the viewer so
+        // retired images are tagged with the submission that drew them. The
+        // fence in submit_wgpu_frame confirms completion before releasing.
+        self.render_epoch += 1;
+        if let Some(viewer) = &self.viewer {
+            viewer.lock().set_render_epoch(self.render_epoch);
+        }
         let mut state = self.capture_frame_state();
         let central_rect_phys = self.build_egui_ui(&mut state);
         self.submit_wgpu_frame(central_rect_phys, &state)?;
@@ -1081,6 +1409,7 @@ let window = event_loop.create_window(
     /// Blocks A+B: coordinator poll, arrow-nav tick, slideshow tick, viewer bg sync.
     fn tick_pre_frame(&mut self) {
         let pal = self.pal();
+        let dt = self.last_frame.map(|t| t.elapsed().as_secs_f32()).unwrap_or(1.0 / 60.0);
         // 1. Poll decode coordinator
         if let Some(coordinator) = &self.coordinator {
             // coordinator.poll() applies any in-flight decoded
@@ -1091,6 +1420,10 @@ let window = event_loop.create_window(
             // automatically; we don't need an explicit
             // request_redraw() here.
             coordinator.poll();
+            // Warm the pre-decode cache for the current image's ±2
+            // neighbours so a fast navigation hits the cache (instant)
+            // instead of blocking on WIC.
+            coordinator.predecode_adjacent();
         }
 
         // Advance the rotation + rect animations. The rect-anim MUST be
@@ -1102,12 +1435,12 @@ let window = event_loop.create_window(
             let mut v = viewer.lock();
             v.tick_rotation();
             v.tick_rect_anim();
+            v.tick_slide();
         }
 
-        // Held-arrow-key dispatcher. Fires one navigation per
-        // ~200 ms while the user holds an arrow key, and stops
-        // immediately on KEYUP (the KEYUP handler clears
-        // `pending_nav`/`arrow_held` before this runs next frame).
+        // Held-arrow-key dispatcher. Advances one image per fixed-rate
+        // pulse while a key is held (direct cut, no slide). KEYUP clears
+        // `nav_intent`, so a frame after release this stops immediately.
         self.tick_arrow_nav();
 
         // Phase 3: slide-show 3-second tick. The user toggles via
@@ -1130,6 +1463,10 @@ let window = event_loop.create_window(
         if let Some(v) = &self.viewer {
             v.lock().bg = pal.d2d_clear;
         }
+
+        // Advance the edge-drawer state machine (left-edge auto-expand tree
+        // menu). Stored in `drawer_draw` for `build_egui_ui` to render.
+        self.drawer_draw = self.tick_drawer(dt);
     }
 
     /// Block C: pre-extract UI state so closures don't fight &mut self.
@@ -1254,6 +1591,10 @@ let window = event_loop.create_window(
                 wgpu_state.config.height as f32 / ppp,
             ),
         ));
+        // Report the device's max texture side so egui's `load_texture`
+        // debug-assert accepts our (clamped) images. Without this egui uses a
+        // stale/unknown limit and asserts on a legitimately-sized texture.
+        raw_input.max_texture_side = Some(wgpu_state.device.limits().max_texture_dimension_2d as usize);
         // Pass ppp to egui via ViewportInfo::native_pixels_per_point
         // instead of Context::set_pixels_per_point. Setting
         // native_pixels_per_point feeds directly into the
@@ -1490,14 +1831,10 @@ let window = event_loop.create_window(
         // twice would let the second SetWindowRgn overwrite the first).
         if self.show_shortcut_help {
             // Force a fixed-size popover at top-center, above the egui
-            // CentralPanel. The wgpu image-quad pass runs AFTER egui's
-            // paint in `submit_wgpu_frame`, so any popover that overlaps
-            // the viewer rect would be visually overwritten by the image
-            // pixels. Parking the popover in the top bar (y=TOOLBAR) —
-            // which is egui-only chrome with no wgpu layer underneath
-            // — sidesteps that. Using Order::Foreground (layer 3 in
-            // egui 0.29) plus a Position above the CentralPanel
-            // guarantees it draws on top of the other chrome.
+            // CentralPanel. The image is painted as egui meshes inside the
+            // CentralPanel, so an Order::Foreground popover (layer 3 in
+            // egui 0.29) plus a Position above the CentralPanel draws on
+            // top of both the image and the surrounding chrome.
             let screen = egui_state.ctx.input(|i| i.screen_rect);
             let popup_w = 360.0_f32.min(screen.width() - 16.0);
             let popup_h = 360.0_f32;
@@ -1699,6 +2036,35 @@ let window = event_loop.create_window(
         // We do NOT paint a background fill — that would cover the child.
         // We capture the CentralPanel's rect to position the D2D child
         // exactly underneath it (single source of truth = egui layout).
+        //
+        // Pre-extract the edge-drawer inputs into locals so the CentralPanel
+        // closure only captures these (never borrows *self) — otherwise the
+        // closure would need `&mut self` while `egui_state` (self.egui_state)
+        // is mutably borrowed, which the borrow checker rejects.
+        let drawer_state = self.drawer_draw;
+        // The drawer's effective width comes straight from `tick_drawer`'s
+        // returned `width` (the eased value = max(user_width, content_min) *
+        // frac). Using THAT (not a recomputation) keeps drawing, hit-test and
+        // wheel routing on the exact same width — the old bug rendered wider
+        // than the hit-test width, leaving the right portion click-through.
+        let drawer_eff_width = drawer_state.map(|(_f, w, _t, _h)| w).unwrap_or(0.0);
+        let drawer_anim = self.drawer_anim;
+        let drawer_handle_light = self.drawer_handle_light;
+        let cursor_physical = self.router.cursor_pos;
+        let drawer_pal = pal;
+        let drawer_file_tree = &self.file_tree;
+        let drawer_pending = &mut self.pending_tree_intent;
+        let drawer_nav_folder = self.nav.lock().folder().cloned();
+        let drawer_nav_count = state.nav_count;
+        // Accumulates the drawer content's widest row (for auto-widening).
+        // Written inside the closure (Cell, no self borrow); applied to
+        // `self.drawer_user_width` after `_center`.
+        let drawer_content_w = std::cell::Cell::new(0.0_f32);
+        // The image is painted as egui meshes inside the CentralPanel
+        // closure. Extract a clone of the viewer Arc so the closure doesn't
+        // borrow `self` (which is already mutably borrowed via egui_state).
+        let image_viewer = self.viewer.clone();
+
         let mut central_rect_phys: Option<(i32, i32, u32, u32)> = None;
         let _center = egui::CentralPanel::default()
             .frame(egui::Frame::none())
@@ -1711,6 +2077,31 @@ let window = event_loop.create_window(
                     (r.width() * ppp).round() as u32,
                     (r.height() * ppp).round() as u32,
                 ));
+
+                // Paint the viewer background behind the image. The surface
+                // is also cleared to `canvas_clear` before the egui pass,
+                // but the CentralPanel's `Frame::none()` leaves the central
+                // area un-painted, so fill it with the viewer letterbox to
+                // avoid the background showing the panel chrome color.
+                let dc = pal.d2d_clear;
+                ui.painter().rect_filled(
+                    r,
+                    0.0,
+                    egui::Color32::from_rgb(
+                        (dc[0] * 255.0) as u8,
+                        (dc[1] * 255.0) as u8,
+                        (dc[2] * 255.0) as u8,
+                    ),
+                );
+
+                // Paint the current image (and any outgoing slide frame) as
+                // egui meshes, clipped to the central panel rect. Clipping
+                // keeps the sliding-out image from leaking over the tree /
+                // thumb panels, matching the old scissor behavior.
+                if let Some(viewer) = &image_viewer {
+                    let painter = ui.painter().with_clip_rect(r);
+                    viewer.lock().paint_viewer(&painter, ppp);
+                }
 
                 // ----- Panel edge highlight -----
                 // A 2px accent line on the draggable edge when hovered
@@ -1746,9 +2137,96 @@ let window = event_loop.create_window(
                         );
                     }
                 }
-            });
 
-        // ----- egui → wgpu -----
+                // ----- EDGE DRAWER (left-edge auto-expand tree menu) -----
+                // Overlays the viewer (never affects layout). Drawn HERE,
+                // inside the CentralPanel frame (before `end_pass()`) so the
+                // widgets participate in egui hit-testing — drawing after
+                // `end_pass()` made them visible but non-interactive. Uses
+                // only pre-extracted locals (no `*self` capture) so the
+                // closure can co-exist with the `egui_state` borrow.
+                if let Some((frac, _width, top, height)) = drawer_state {
+                    let valid = top.is_finite() && height.is_finite()
+                        && drawer_eff_width.is_finite() && frac.is_finite();
+                    if valid {
+                        let nav_folder = drawer_nav_folder;
+                        let visible_body = frac > 0.001 || drawer_anim > 0.001;
+                        let fixed_rect = egui::Rect::from_min_size(
+                            egui::pos2(0.0, top),
+                            egui::vec2(drawer_eff_width, height),
+                        );
+                        if visible_body {
+                            let slide_x = -drawer_eff_width * (1.0 - frac);
+                            let body_rect = fixed_rect.translate(egui::vec2(slide_x, 0.0));
+                            if body_rect.max.x > 0.0 {
+                                let file_tree = drawer_file_tree;
+                                let pending = drawer_pending;
+                                let actions = &mut state.actions;
+                                let ctx = ui.ctx().clone();
+                                egui::Area::new(egui::Id::new("edge_drawer"))
+                                    .constrain(false)
+                                    .order(egui::Order::Foreground)
+                                    .default_size(fixed_rect.size())
+                                    .fixed_pos(body_rect.min)
+                                    .show(&ctx, |ui| {
+                                        ui.set_clip_rect(fixed_rect);
+                                        ui.set_max_size(fixed_rect.size());
+                                        let frame = egui::Frame::default()
+                                            .fill(drawer_pal.panel_bg)
+                                            .inner_margin(egui::Margin::same(0.0))
+                                            .stroke(egui::Stroke::new(1.0_f32, egui::Color32::from_black_alpha(90)));
+                                        frame.show(ui, |ui| {
+                                            let min_w = Self::draw_tree_panel_static(
+                                                ui,
+                                                file_tree,
+                                                nav_folder,
+                                                &state.folder,
+                                                drawer_nav_count,
+                                                actions,
+                                                pending,
+                                                &drawer_pal,
+                                            );
+                                            drawer_content_w.set(min_w.max(drawer_content_w.get()));
+                                        });
+                                    });
+                            }
+                        }
+                        // Handle: thin translucent pill at the left edge.
+                        {
+                            let handle_w = 5.0_f32;
+                            let handle_h = 48.0_f32;
+                            let handle_color = if drawer_handle_light {
+                                egui::Color32::from_rgba_unmultiplied(255, 255, 255, 0x33)
+                            } else {
+                                egui::Color32::from_rgba_unmultiplied(0, 0, 0, 0x33)
+                            };
+                            let hrect = egui::Rect::from_min_size(
+                                egui::pos2(HANDLE_X, top + height * 0.5 - handle_h * 0.5),
+                                egui::vec2(handle_w, handle_h),
+                            );
+                            let ppp = wgpu_state.pixels_per_point.max(0.1);
+                            let cur = egui::pos2(
+                                cursor_physical.x / ppp,
+                                cursor_physical.y / ppp,
+                            );
+                            let hovered = hrect.expand(6.0).contains(cur);
+                            let ctx = ui.ctx().clone();
+                            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("edge_handle_painter"));
+                            ctx.layer_painter(layer).rect_filled(
+                                hrect,
+                                2.5,
+                                if hovered { handle_color.gamma_multiply(1.6) } else { handle_color },
+                            );
+                        }
+                    }
+                }
+            });
+        // Apply the drawer's content-driven width now that the frame is
+        // built. This is `drawer_content_min`, a TEMPORARY content-minimum —
+        // it widens the drawer for long rows and shrinks back to
+        // `drawer_user_width` when they collapse (mirroring the classic
+        // tree's `PanelWidth.content_min`). The base never grows on its own.
+        self.drawer_content_min = drawer_content_w.get();        // ----- egui → wgpu -----
         let full_output = egui_state.ctx.end_pass();
         let textures_delta = full_output.textures_delta;
         let paint_jobs = egui_state.ctx.tessellate(full_output.shapes, full_output.pixels_per_point);
@@ -1786,18 +2264,31 @@ let window = event_loop.create_window(
         // mutates viewport fields — does NOT call compute_fit, so the
         // user's current pan/zoom/fit is preserved across panel
         // animation changes (tree/thumb width easing).
-        if let Some((cx, cy, cw, ch)) = central_rect_phys {
-            if let Some(viewer) = &self.viewer {
-                viewer.lock().set_viewport_physical(cw, ch, cx as f32, cy as f32);
-            }
+        //
+        // We feed CONTINUOUS panel widths (not the quantized
+        // `central_rect_phys` integers) so that during a panel collapse
+        // the image re-fits against the smooth animated edge every frame
+        // instead of "pausing then jumping" on the quantized integer the
+        // moment the easing decelerates below a pixel. The integer rect is
+        // still used for the image-quad scissor in submit_wgpu_frame.
+        if let Some(viewer) = &self.viewer {
+            let (vx, vy, vw, vh) = self.viewer_rect_physical_continuous(
+                wgpu_state.config.width,
+                wgpu_state.config.height,
+            );
+            viewer.lock().set_viewport_continuous(vw, vh, vx, vy);
         }
         // END SCOPE 2: egui_state borrow released.
 
         central_rect_phys
     }
 
-    /// Submit the wgpu frame: egui render pass, image-quad pass, submit, present,
-    /// thumbnail flush. All surface/encoder/renderpass work lives here.
+    /// Submit the wgpu frame: egui render pass, submit, present, thumbnail
+    /// flush. All surface/encoder/renderpass work lives here. The central
+    /// rect is applied to the viewport in `build_egui_ui` before this is
+    /// called; it is not needed by the render itself (the image is painted
+    /// as egui meshes).
+    #[allow(unused_variables)]
     fn submit_wgpu_frame(
         &mut self,
         central_rect_phys: Option<(i32, i32, u32, u32)>,
@@ -1866,165 +2357,23 @@ let window = event_loop.create_window(
                 a: 1.0,
             }
         };
-        // Phase 3: wgpu image-quad pass, now rendered FIRST with a
-        // background clear. The image-quad shader covers the WHOLE
-        // surface: pixels outside the viewer rect return `u.bg`
-        // (canvas background), pixels inside sample the texture. So
-        // this single pass both clears the canvas AND draws the image
-        // (and any outgoing slide frame), all in one LoadOp::Clear.
+        // The image is now painted as egui meshes (in `build_egui_ui`,
+        // inside the CentralPanel), so the surface is cleared and fully
+        // rendered by the single egui pass below. The egui background
+        // (`Frames` fill the panels) plus the image meshes together cover
+        // the whole surface — no separate image-quad pass is needed.
         //
-        // The egui pass then runs AFTER with LoadOp::Load (no clear) so
-        // the UI chrome (title bar, tree/thumbs panels, status bar) and
-        // any popovers (right-click menu, shortcut panel) paint ON TOP of
-        // the image. Previously egui ran first (Clear) and the image-quad
-        // ran after, so any egui window overlapping the viewer rect was
-        // visually overwritten by the image — the reason right-click
-        // menus and the shortcut popup appeared to not open at all.
-        //
-        // Capture everything we need from self before locking
-        // (Rust's borrow checker is conservative about reentrancy
-        // through self).
-        // 6-tuple = (uniforms, gpu_image, vx, vy, vw, vh)
-        type QuadArgs = (aperture_gpu::ImageQuadUniforms, std::sync::Arc<aperture_gpu::DecodedGpuImage>, i32, i32, u32, u32);
-        let image_quad_args: Option<(QuadArgs, Option<QuadArgs>)> = match (central_rect_phys, self.viewer.as_ref()) {
-            (Some(rect), Some(viewer)) => {
-                let viewer_locked = viewer.lock();
-                let cur = viewer_locked.current_gpu.as_ref().map(|img| {
-                    let uniforms = viewer_locked.gpu_uniforms(
-                        (rect.0 as f32, rect.1 as f32),
-                        (rect.2 as f32, rect.3 as f32),
-                        pal_bg,
-                    );
-                    (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
-                });
-                let prev = if viewer_locked.animator.is_sliding() {
-                    viewer_locked.previous_gpu.as_ref().map(|img| {
-                        let uniforms = viewer_locked.gpu_uniforms_for(
-                            (rect.0 as f32, rect.1 as f32),
-                            (rect.2 as f32, rect.3 as f32),
-                            pal_bg,
-                            true, // previous_gpu
-                        );
-                        (uniforms, img.clone(), rect.0, rect.1, rect.2.max(1), rect.3.max(1))
-                    })
-                } else {
-                    None
-                };
-                drop(viewer_locked);
-                cur.map(|c| (c, prev))
-            }
-            _ => None,
-        };
-        // Draw the previous (outgoing) image first, then the current
-        // (incoming) image. Both use `LoadOp::Load` so they composite
-        // over the egui chrome and each other via `ALPHA_BLENDING`.
-        // Drawing outgoing before incoming means the slide appears
-        // to glide: outgoing slides out, incoming slides in. When
-        // `previous` is None (no active slide) only the current
-        // pass runs and the layout is identical to the pre-Tier-1 path.
-        // Render the image-quad FIRST. The FIRST image draw of the frame
-        // uses LoadOp::Clear to reset the whole surface to the canvas
-        // background (the image-quad shader covers the full surface; the
-        // scissor just restricts rasterisation to the viewer rect). During
-        // a slide, the PREVIOUS (outgoing) frame is the first draw, so it
-        // Clears; otherwise the CURRENT image Clears. The subsequent draw
-        // uses LoadOp::Load to composite over the cleared surface.
-        let mut canvas_cleared = false;
-        if let Some(((p_uni, p_img, pvx, pvy, pvw, pvh), _cur)) = image_quad_args.as_ref() {
-            if p_uni.has_image == 1 {
-                let pvx = *pvx; let pvy = *pvy; let pvw = *pvw; let pvh = *pvh;
-                wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, p_uni);
-                let bg = wgpu_state.image_quad.create_bind_group(
-                    &wgpu_state.device,
-                    &p_img.view,
-                );
-                let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                    label: Some("image_quad_prev"),
-                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                        view: &view,
-                        resolve_target: None,
-                        ops: wgpu::Operations {
-                            load: wgpu::LoadOp::Clear(clear_color),
-                            store: wgpu::StoreOp::Store,
-                        },
-                    })],
-                    depth_stencil_attachment: None,
-                    timestamp_writes: None,
-                    occlusion_query_set: None,
-                });
-                rpass.set_scissor_rect(
-                    pvx.max(0) as u32,
-                    pvy.max(0) as u32,
-                    pvw,
-                    pvh,
-                );
-                rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
-                rpass.set_bind_group(0, &bg, &[]);
-                rpass.draw(0..3, 0..1);
-                drop(rpass);
-                canvas_cleared = true;
-            }
-        }
-        if let Some((cur, _prev)) = image_quad_args.as_ref() {
-            let (uniforms, gpu_image, vx, vy, vw, vh) = cur;
-            let vx = *vx; let vy = *vy; let vw = *vw; let vh = *vh;
-            // If the previous frame wasn't drawn (no slide), this is the
-            // first image draw → Clear. If it WAS drawn, Load to composite
-            // the incoming image over the outgoing one.
-            let second_pass_load = if canvas_cleared {
-                wgpu::LoadOp::Load
-            } else {
-                canvas_cleared = true;
-                wgpu::LoadOp::Clear(clear_color)
-            };
-            wgpu_state.image_quad.update_uniforms(&wgpu_state.queue, uniforms);
-            let bind_group = wgpu_state.image_quad.create_bind_group(
-                &wgpu_state.device,
-                &gpu_image.view,
-            );
-            let mut iq_rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("image_quad"),
-                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &view,
-                    resolve_target: None,
-                    ops: wgpu::Operations {
-                        load: second_pass_load,
-                        store: wgpu::StoreOp::Store,
-                    },
-                })],
-                depth_stencil_attachment: None,
-                timestamp_writes: None,
-                occlusion_query_set: None,
-            });
-            iq_rpass.set_scissor_rect(
-                vx.max(0) as u32,
-                vy.max(0) as u32,
-                vw,
-                vh,
-            );
-            iq_rpass.set_pipeline(&wgpu_state.image_quad.pipeline);
-            iq_rpass.set_bind_group(0, &bind_group, &[]);
-            iq_rpass.draw(0..3, 0..1);
-            drop(iq_rpass);
-        }
-
-        // Now the egui pass, renders AFTER the image-quad so the UI
-        // chrome and popovers paint on top of the image. If the
-        // image-quad pass already Cleared the surface, use LoadOp::Load
-        // (no clear) so the UI composits on top; otherwise Clear so the
-        // surface doesn't show stale pixels from the previous frame.
-        let egui_load = if canvas_cleared {
-            wgpu::LoadOp::Load
-        } else {
-            wgpu::LoadOp::Clear(clear_color)
-        };
+        // egui's fragment targets use `LoadOp::Clear(clear_color)` when
+        // this is the only pass: the clear color is `canvas_clear`, which
+        // fills the areas not covered by any panel frame (and the viewer
+        // background is painted as a rect_filled in the CentralPanel).
         let rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("egui"),
             color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                 view: &view,
                 resolve_target: None,
                 ops: wgpu::Operations {
-                    load: egui_load,
+                    load: wgpu::LoadOp::Clear(clear_color),
                     store: wgpu::StoreOp::Store,
                 },
             })],
@@ -2039,8 +2388,31 @@ let window = event_loop.create_window(
             &screen_descriptor,
         );
 
-        wgpu_state.queue.submit(std::iter::once(encoder.finish()));
+        let _ = wgpu_state.queue.submit(std::iter::once(encoder.finish()));
         surface_texture.present();
+
+        // Non-blocking reap: lets wgpu-core actually free resources that
+        // were marked destroyed in prior frames (the defer-to-maintain model).
+        // Without this, destroyed textures accumulate and — combined with a
+        // texture freed while its submit is in-flight — would surface as
+        // validation errors at the next Queue::submit. Poll is pure-poll: it
+        // never waits on the GPU, so it costs nothing.
+        wgpu_state.device.poll(wgpu::Maintain::Poll);
+
+        // Advance the "safe to release" watermark. A retired image (tagged
+        // with the epoch it was last drawn in) is only released after we have
+        // committed `RETIRE_FRAME_BUDGET` frames past it, by which point —
+        // given Fifo + frame-latency-1 caps the GPU at ~1 frame behind, plus
+        // the non-blocking poll above reaping every frame — the texture is
+        // guaranteed no longer sampled by any in-flight submit. This is purely
+        // frame-based and NEVER blocks the render thread (wgpu 22 offers no
+        // non-blocking "which submission completed" query).
+        self.safe_release_epoch = self.render_epoch.saturating_sub(RETIRE_FRAME_BUDGET);
+        if let Some(viewer) = &self.viewer {
+            // Scope the lock so the guard is dropped before any other work.
+            let safe = self.safe_release_epoch;
+            viewer.lock().release_retired_through(safe);
+        }
 
         // Drain any completed thumbnail decodes from background
         // threads and upload them as egui textures.
@@ -2549,7 +2921,7 @@ let window = event_loop.create_window(
             }
 
             let tree_scroll_y = tree.state.lock().scroll_offset_y;
-            egui::ScrollArea::vertical()
+            let tree_out = egui::ScrollArea::vertical()
                 .auto_shrink([false; 2])
                 .vertical_scroll_offset(tree_scroll_y)
                 .show(ui, |ui| {
@@ -2590,7 +2962,14 @@ let window = event_loop.create_window(
                     }
                     state.recent_scroll_target = recent_scroll;
                     max_w
-                }).inner
+                });
+            // Read back the ScrollArea's ACTUAL (clamped) offset so the
+            // sticky tree scroll stays bounded — fixes scrollbar drag,
+            // scroll_to_rect reveal/recent centering, and the unbounded
+            // "scroll into blank space then freeze" bug.
+            let off = tree_out.state.offset.y;
+            tree.state.lock().scroll_offset_y = off;
+            tree_out.inner
         });
         // + panel margins + scrollbar allowance.
         inner.inner + 20.0 + 10.0
@@ -2832,7 +3211,7 @@ let window = event_loop.create_window(
                 return;
             }
 
-            egui::ScrollArea::vertical()
+            let scroll_out = egui::ScrollArea::vertical()
                 .auto_shrink([false, false])
                 .vertical_scroll_offset(THUMB_SCROLL_Y.with(|c| c.get()))
                 .show(ui, |ui| {
@@ -2848,7 +3227,26 @@ let window = event_loop.create_window(
                         as usize
                         + 10)
                         .min(nav_items.len());
-                    for item in nav_items.get(i0..i1).unwrap_or(&[]) {
+                    // Prefetch in the direction of scroll: a fast scroll shows
+                    // placeholders for cards about to enter. We request decodes
+                    // for an extra screen of cards in the direction the user is
+                    // moving toward, so those land before they're visible
+                    // (the C# "predecode ahead" idea, for thumbs).
+                    let cur_scroll = THUMB_SCROLL_Y.with(|c| c.get());
+                    let last_scroll = THUMB_LAST_SCROLL_Y.with(|c| c.get());
+                    THUMB_LAST_SCROLL_Y.set(cur_scroll);
+                    let screen_cards = (clip.height() / est_card).ceil() as usize + 1;
+                    let (pf_lo, pf_hi) = if cur_scroll > last_scroll {
+                        // Scrolling down (to larger indices).
+                        (i0, (i1 + screen_cards).min(nav_items.len()))
+                    } else if cur_scroll < last_scroll {
+                        // Scrolling up (to smaller indices).
+                        (i0.saturating_sub(screen_cards), i1)
+                    } else {
+                        // No scroll direction — cover both a little.
+                        (i0.saturating_sub(screen_cards / 2), (i1 + screen_cards / 2).min(nav_items.len()))
+                    };
+                    for item in nav_items.get(pf_lo..pf_hi).unwrap_or(&[]) {
                         texture_cache.request_thumb(item.path.clone());
                     }
                     // Card width adapts to the (resizable) panel width.
@@ -2935,6 +3333,15 @@ let window = event_loop.create_window(
                         ui.add_space(6.0);
                     }
                 });
+            // Read back the ScrollArea's ACTUAL offset (egui clamps it to
+            // [0, max] before returning) so the sticky value stays bounded.
+            // This is the fix for: (a) scrollbar drag not working (the
+            // read/write now agree), (b) scroll_to_rect centering, (c) the
+            // "scroll into blank space then freeze" bug — the stale sticky
+            // value was unbounded, and `vertical_scroll_offset` forced it
+            // every frame, so egui fought to reach an unreachable offset.
+            let off = scroll_out.state.offset.y;
+            THUMB_SCROLL_Y.with(|c| c.set(off));
         });
     }
 
@@ -3116,12 +3523,10 @@ let window = event_loop.create_window(
             UiAction::ToggleTree => {
                 self.close_shortcut_help();
                 self.show_tree = !self.show_tree;
-                self.relayout_viewer();
             }
             UiAction::ToggleThumbs => {
                 self.close_shortcut_help();
                 self.show_thumbs = !self.show_thumbs;
-                self.relayout_viewer();
             }
             UiAction::ThumbClicked(i) => {
                 // Move nav index to the clicked thumb.
@@ -3403,12 +3808,42 @@ let window = event_loop.create_window(
             .unwrap_or(false)
     }
 
+    /// The logical width currently used to hit-test the edge drawer. This is
+    /// the width that's actually DRAWN on screen (`drawer_draw.1`, i.e.
+    /// `drawer_width_anim` scaled by the slide `frac`), so every consumer —
+    /// click-outside-close, viewer-exclusion, wheel-over-drawer — tests the
+    /// same boundary and they can never disagree about whether a point is on
+    /// the drawer. Falls back to the animated width during the brief
+    /// retracted/open frames where `drawer_draw` is `None` (the handle-only
+    /// case at `drawer_anim <= 0.001`), where the drawer body isn't hit-testable
+    /// anyway.
+    fn drawer_hit_width(&self) -> f32 {
+        self.drawer_draw.map(|(_, dw, _, _)| dw).unwrap_or(self.drawer_width_anim)
+    }
+
     /// Which panel edge (if any) is within the drag hit-zone at this
     /// physical cursor position. 0 = tree right edge, 1 = thumbs left edge.
     fn panel_edge_at(&self, cx: f32, cy: f32) -> Option<u8> {
+        // Classic tree panel edge (edge 0) — only when the panel is open.
         let (tx, ty, tw, th) = self.tree_rect_phys;
-        if tw > 0.0 && cx >= tx + tw - 6.0 && cx <= tx + tw + 4.0 && cy >= ty && cy <= ty + th {
+        if self.show_tree && tw > 0.0 && cx >= tx + tw - 6.0 && cx <= tx + tw + 4.0 && cy >= ty && cy <= ty + th {
             return Some(0);
+        }
+        // Edge drawer: when open (classic tree closed) and mostly slid out,
+        // its right edge is draggable to resize `drawer_user_width`. Uses the
+        // animated width (what's drawn) and converts the physical cursor to
+        // logical for the comparison.
+        if !self.show_tree && self.drawer_open && self.drawer_anim > 0.5 {
+            let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+            let win_h = self.wgpu_state.as_ref().map(|w| w.config.height).unwrap_or(800);
+            let top = TOOLBAR_HEIGHT as f32;
+            let bottom = (win_h as f32 / ppp) - STATUS_BAR_HEIGHT as f32;
+            let dcx = cx as f32 / ppp;
+            let dcy = cy as f32 / ppp;
+            let dw = self.drawer_width_anim;
+            if dw > 0.0 && dcx >= dw - 6.0 && dcx <= dw + 4.0 && dcy >= top && dcy <= bottom {
+                return Some(0);
+            }
         }
         let (hx, hy, hw, hh) = self.thumb_rect_phys;
         if hw > 0.0 && cx >= hx - 4.0 && cx <= hx + 6.0 && cy >= hy && cy <= hy + hh {
@@ -3539,17 +3974,6 @@ let window = event_loop.create_window(
         if let Some(window) = &self.window { window.request_redraw(); }
     }
 
-    fn relayout_viewer(&mut self) {
-        let Some(window) = &self.window else { return; };
-        let size = window.inner_size();
-        let (cx, _cy, cw, ch) = self.compute_viewer_rect(size.width, size.height);
-        self.viewport_w = cw;
-        self.viewport_h = ch;
-        if let Some(viewer) = &self.viewer {
-            viewer.lock().set_viewport_physical(cw, ch, cx as f32, 0.0);
-        }
-    }
-
     fn save_window_geometry(&mut self) {
         if let Some(window) = &self.window {
             let size = window.inner_size();
@@ -3650,32 +4074,24 @@ impl ApplicationHandler for MainWindow {
     ) {
         // ---- App-level keyboard shortcuts (handled directly) ----
         if let WindowEvent::KeyboardInput { event: key_event, .. } = &event {
-            // ---- Arrow-key "brake" via KEYUP ----
+            // ---- Arrow-key hold via KEYUP (the "brake") ----
             //
-            // Previously each KEYDOWN fired handle_navigation
-            // synchronously. OS auto-repeat floods the queue with
-            // ~30Hz KEYDOWNs, and the events queued BEFORE WM_KEYUP
-            // kept firing navigation after the user released — so
-            // holding an arrow key advanced several images past the
-            // release point ("inertia").
+            // Hold-to-page: a fresh KEYDOWN jumps on the down-stroke (with
+            // the iOS slide), records the direction into `nav_intent`. The
+            // fixed-rate dispatcher then advances on a steady `HOLD_NAV_INTERVAL`
+            // pulse while the key stays down, each step cutting directly
+            // (SlideDir::None, no slide) and hitting the pre-decode cache —
+            // the fast "walk the gallery" mode. Stops exactly on KEYUP.
             //
-            // New approach:
-            //   * KEYDOWN for an arrow: if it is the FIRST press
-            //     (arrow_held was None), fire handle_navigation
-            //     immediately so a single tap still jumps on the
-            //     down-stroke. Always record the direction into
-            //     pending_nav so the per-frame dispatcher keeps firing
-            //     while the key is held.
-            //   * KEYUP for an arrow: clear arrow_held AND
-            //     pending_nav. The next frame's dispatcher sees no
-            //     pending nav and stops advancing — the "brake".
-            //   * Per-frame dispatcher (in render_frame): if
-            //     pending_nav is Some AND arrow_held matches the
-            //     queued direction AND >= 200 ms has passed since
-            //     the last nav, fire one more handle_navigation.
-            //     This caps continuous hold at ~5 images/sec (= one
-            //     per slide-animation duration) without rate-limiting
-            //     KEYDOWN — only the EFFECTIVE navigation is paced.
+            //   * KEYDOWN for an arrow: fresh press (no intent) fires
+            //     handle_navigation immediately; always records the
+            //     direction. Auto-repeat KEYDOWNs re-assert the intent
+            //     (they do NOT fire handle_navigation directly).
+            //   * KEYUP for an arrow: clears `nav_intent` + `nav_last_step`.
+            //     The next frame's dispatcher sees no intent and stops.
+            //   * Per-frame dispatcher (in render_frame): if `nav_intent`
+            //     is Some AND the fixed-rate pulse is due, fire one more
+            //     handle_navigation (no slide).
             if matches!(key_event.state, ElementState::Released) {
                 if let PhysicalKey::Code(code) = key_event.physical_key {
                     let dir = match code {
@@ -3684,19 +4100,18 @@ impl ApplicationHandler for MainWindow {
                         _ => None,
                     };
                     if let Some(dir) = dir {
-                        if self.arrow_held == Some(dir) {
-                            self.arrow_held = None;
-                            self.pending_nav = None;
-                            self.pending_slide_dir = SlideDir::None;
-                            // Note: we do NOT call handle_navigation
-                            // here. The dispatcher in render_frame
-                            // will see no pending nav next frame and
-                            // skip. Already-fired navs are not
-                            // undone — that's the cost of the
-                            // immediate "tap-on-down" behavior, but
-                            // it's bounded by the 200 ms per-frame
-                            // rate.
-                            return;
+                        // Clear the held intent so the fixed-rate dispatcher
+                        // stops advancing. We do NOT call handle_navigation
+                        // here — the dispatcher next frame sees no intent
+                        // and stops. Also reset the step timer so a fresh
+                        // hold starts its own pulse.
+                        if let Some((held, _)) = self.nav_intent {
+                            if held == dir {
+                                self.nav_intent = None;
+                                self.nav_last_step = None;
+                                self.nav_press_at = None;
+                                return;
+                            }
                         }
                     }
                 }
@@ -3828,7 +4243,17 @@ impl ApplicationHandler for MainWindow {
                     let dx = x - lx;
                     let ppp = self.router.pixels_per_point.max(0.1);
                     match panel {
-                        0 => self.tree_panel.apply_drag(dx / ppp, 170.0, 420.0),
+                        0 => {
+                            if self.show_tree {
+                                self.tree_panel.apply_drag(dx / ppp, 170.0, 420.0);
+                            } else {
+                                // Drawer active: drag its right edge. Only the
+                                // BASE width is clamped; content can still widen
+                                // it past this via drawer_content_min.
+                                self.drawer_user_width =
+                                    (self.drawer_user_width + dx / ppp).clamp(DRAWER_MIN_W, DRAWER_MAX_W);
+                            }
+                        }
                         1 => self.thumb_panel.apply_drag(-dx / ppp, 180.0, 440.0),
                         _ => {}
                     }
@@ -3878,11 +4303,24 @@ impl ApplicationHandler for MainWindow {
                 && tw > 0.0 && th > 0.0
                 && cursor.x >= tx && cursor.x <= tx + tw
                 && cursor.y >= ty && cursor.y <= ty + th;
+            // Edge drawer: when it's open (classic tree closed), scrolling
+            // over it advances the tree's ScrollArea too. The drawer reuses
+            // the SAME FileTree state. Its coords are LOGICAL (drawer_draw),
+            // so convert the physical cursor to logical before testing.
+            let dp_ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+            let dcx = cursor.x as f32 / dp_ppp;
+            let dcy = cursor.y as f32 / dp_ppp;
+            let in_drawer = !self.show_tree
+                && self.drawer_open
+                && self.drawer_draw
+                    .map(|(_, dw, dt_, dh)| dcx >= 0.0 && dcx <= dw
+                        && dcy >= dt_ && dcy <= dt_ + dh)
+                    .unwrap_or(false);
             let in_thumbs = self.show_thumbs
                 && hw > 0.0 && hh > 0.0
                 && cursor.x >= hx && cursor.x <= hx + hw
                 && cursor.y >= hy && cursor.y <= hy + hh;
-            if in_tree || in_thumbs {
+            if in_tree || in_drawer || in_thumbs {
                 // Advance the panel's ScrollArea directly. The ScrollArea
                 // builder in build_egui_ui applies `vertical_scroll_offset`
                 // from these sticky fields each frame, so a wheel here
@@ -3892,13 +4330,23 @@ impl ApplicationHandler for MainWindow {
                     MouseScrollDelta::LineDelta(_, y) => *y * 48.0,
                     MouseScrollDelta::PixelDelta(p) => p.y as f32,
                 };
+                // A generous upper bound so a single huge wheel step can't
+                // push the sticky offset unbounded; the ScrollArea readback
+                // re-clamps to the real content range next frame anyway.
+                const MAX_STICKY: f32 = 1.0e7;
                 if in_tree {
-                    self.file_tree.state.lock().scroll_offset_y =
-                        (self.file_tree.state.lock().scroll_offset_y - dy).max(0.0);
+                    let mut s = self.file_tree.state.lock();
+                    s.scroll_offset_y = (s.scroll_offset_y - dy).clamp(0.0, MAX_STICKY);
+                }
+                if in_drawer {
+                    // The drawer shares the classic tree's FileTree/ScrollArea
+                    // state, so scrolling it advances the same offset.
+                    let mut s = self.file_tree.state.lock();
+                    s.scroll_offset_y = (s.scroll_offset_y - dy).clamp(0.0, MAX_STICKY);
                 }
                 if in_thumbs {
                     THUMB_SCROLL_Y.with(|c| {
-                        c.set((c.get() - dy).max(0.0));
+                        c.set((c.get() - dy).clamp(0.0, MAX_STICKY));
                     });
                 }
                 if let Some(es) = self.egui_state.as_ref() {
@@ -3936,6 +4384,33 @@ impl ApplicationHandler for MainWindow {
                         return;
                     }
                 }
+                // Click-outside-to-close the edge drawer: any left press
+                // outside the drawer body (when it's open, not pinned) slides
+                // it back. Pinned drawers and in-progress edge resizes ignore
+                // outside-clicks. Tests against the DRAWN width (the same
+                // `drawer_hit_width` the viewer-exclusion check below uses),
+                // so a point on the visible drawer is never treated as outside,
+                // and the two cannot disagree in the same click.
+                if matches!(state, ElementState::Pressed)
+                    && self.drawer_open
+                    && !self.drawer_pinned
+                    && self.drag_panel.is_none()
+                {
+                    let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+                    let win_h = self.wgpu_state.as_ref().map(|w| w.config.height).unwrap_or(800);
+                    let top = TOOLBAR_HEIGHT as f32;
+                    let bottom = (win_h as f32 / ppp) - STATUS_BAR_HEIGHT as f32;
+                    // Logical cursor (drawer geometry is logical).
+                    let clx = cursor.x as f32 / ppp;
+                    let cly = cursor.y as f32 / ppp;
+                    let inside = clx <= self.drawer_hit_width()
+                        && cly >= top
+                        && cly <= bottom;
+                    if !inside {
+                        self.drawer_open = false;
+                        self.drawer_leave_at = None;
+                    }
+                }
             }
 
             // Check if cursor is within the viewer area (central panel).
@@ -3944,7 +4419,23 @@ impl ApplicationHandler for MainWindow {
                 let (vx, vy, vw, vh) = self.compute_viewer_rect(size.width, size.height);
                 let cx = cursor.x as i32;
                 let cy = cursor.y as i32;
-                cx >= vx && cx < vx + vw as i32 && cy >= vy && cy < vy + vh as i32
+                let viewer_hit = cx >= vx && cx < vx + vw as i32 && cy >= vy && cy < vy + vh as i32;
+                // If the edge drawer is open and the click lands inside it,
+                // do NOT treat it as a viewer click (pan/double-click). The
+                // tree menu is an overlay on top of the viewer — its clicks
+                // must reach egui, not be consumed by the pan branch below.
+                let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+                let clx = cursor.x as f32 / ppp;
+                let cly = cursor.y as f32 / ppp;
+                let over_drawer = self.drawer_open && self.drawer_anim > 0.001 && {
+                    // Same DRAWN width as the click-close test above, so these
+                    // always agree; a click on the drawer body never reaches
+                    // the pan double-click branch below.
+                    let dw = self.drawer_hit_width();
+                    let (top, hh) = self.drawer_draw.map(|(_, _, t, h)| (t, h)).unwrap_or((TOOLBAR_HEIGHT as f32, (self.viewport_h as f32) - STATUS_BAR_HEIGHT as f32));
+                    clx <= dw && cly >= top && cly <= top + hh
+                };
+                viewer_hit && !over_drawer
             } else {
                 false
             };
@@ -3964,6 +4455,19 @@ impl ApplicationHandler for MainWindow {
 
             if in_viewer && matches!(button, MouseButton::Left) {
                 if matches!(state, ElementState::Pressed) {
+                    // A left-click in the viewer while a context menu or
+                    // the keyboard-shortcuts popover is open dismisses it.
+                    // Both rely on egui's outside-click detection
+                    // (`any_click()` / `clicked_elsewhere()`), which can't
+                    // see viewer clicks because the pan branch below
+                    // consumes them before they reach egui. Don't start a
+                    // drag on this click — it's a dismiss click, not a pan.
+                    if self.ctx_menu.is_some() || self.show_shortcut_help {
+                        self.ctx_menu = None;
+                        self.ctx_menu_open_at = None;
+                        self.show_shortcut_help = false;
+                        return;
+                    }
                     // Start image drag-pan (double-click detection still runs).
                     self.pan_active = true;
                     self.pan_last = (cursor.x, cursor.y);
@@ -4241,14 +4745,8 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
     // so the lifetime bound on Surface<'window> can be safely extended to 'static.
     let surface: wgpu::Surface<'static> = unsafe { std::mem::transmute(surface) };
 
-    // Phase 1: wgpu image-quad pipeline. Created once per WgpuState;
-    // currently rendered nowhere (the D2D child still owns the visible
-    // image). Phase 3 wires the encoded render pass; Phase 4 deletes
-    // the D2D path entirely.
-    let image_quad = aperture_gpu::ImageQuadPipeline::new(&device, format);
-
     // Phase 2: Arc-wrap device + queue so the decode coordinator can
-    // hold long-lived references for the image-quad texture upload.
+    // hold long-lived references for texture uploads.
     let device = Arc::new(device);
     let queue = Arc::new(queue);
 
@@ -4261,7 +4759,6 @@ fn init_wgpu_at_size(window: &Window, width: u32, height: u32) -> Result<WgpuSta
         surface_is_srgb: format.is_srgb(),
         pixels_per_point: window.scale_factor() as f32,
         _instance: instance,
-        image_quad,
     })
 }
 

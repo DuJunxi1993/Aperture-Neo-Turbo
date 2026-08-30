@@ -2,10 +2,11 @@
 name = "aperture-gpu"
 version = "0.1.0"
 edition = "2021"
-description = "wgpu/D3D11 GPU rendering engine for Aperture Neo Turbo"
+description = "Image decode + animation engine for Aperture Neo Turbo"
 
 [dependencies]
 aperture-core = { path = "../core" }
+egui = { workspace = true }
 windows = { version = "0.58", features = [
     "Win32_Graphics_Direct3D",
     "Win32_Graphics_Direct3D11",
@@ -16,13 +17,8 @@ windows = { version = "0.58", features = [
     "Win32_Foundation",
 ] }
 windows-core = "0.58"
-wgpu = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 parking_lot = { workspace = true }
-bytemuck = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
-
-[dev-dependencies]
-naga = "22"

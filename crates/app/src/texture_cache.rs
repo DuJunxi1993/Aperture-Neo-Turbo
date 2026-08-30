@@ -53,7 +53,48 @@ pub struct TextureCache {
     /// Channels from background decode threads; the main thread drains
     /// these each frame and uploads the results to egui textures.
     inbox: Mutex<Vec<std::sync::mpsc::Receiver<ThumbResult>>>,
+    /// Bounds how many thumbnail decodes run concurrently. On a folder of
+    /// large/high-res images, decoding e.g. 279 thumbs at once — each one
+    /// scaling an 8K source down to 200px via WIC — floods CPU/RAM and freezes
+    /// the app. Capping the concurrency lets the decode threads share the
+    /// cores without the main thread stalling on a texture upload or the
+    /// system thrashing.
+    slot: Arc<Semaphore>,
 }
+
+/// A tiny counting semaphore (used for decode-slot concurrency). `parking_lot`
+/// doesn't ship a semaphore, so this is a Mutex + Condvar pair. Shared across
+/// decode threads via `Arc` so they wait on the same permit pool.
+struct Semaphore {
+    count: parking_lot::Mutex<usize>,
+    waiters: parking_lot::Condvar,
+}
+
+impl Semaphore {
+    fn new(permits: usize) -> Self {
+        Self { count: parking_lot::Mutex::new(permits), waiters: parking_lot::Condvar::new() }
+    }
+
+    /// Acquire one permit, blocking if none are free.
+    fn acquire(&self) {
+        let mut c = self.count.lock();
+        while *c == 0 {
+            self.waiters.wait(&mut c);
+        }
+        *c -= 1;
+    }
+
+    /// Release one permit, waking a waiting acquire.
+    fn release(&self) {
+        *self.count.lock() += 1;
+        self.waiters.notify_one();
+    }
+}
+
+/// Maximum concurrent thumbnail decodes. Kept modest so a folder of ultra-high
+/// resolution images doesn't spawn a thread per card (each decoding the full
+/// source down to 200px) and thrash the machine.
+const THUMB_DECODE_PERMITS: usize = 4;
 
 impl TextureCache {
     pub fn new(thumb_db: Arc<ThumbCache>) -> Self {
@@ -61,6 +102,7 @@ impl TextureCache {
             state: Mutex::new(TextureCacheState::default()),
             thumb_db,
             inbox: Mutex::new(Vec::new()),
+            slot: Arc::new(Semaphore::new(THUMB_DECODE_PERMITS)),
         }
     }
 
@@ -68,6 +110,13 @@ impl TextureCache {
     /// ships the result back via a channel. The main thread drains the
     /// inbox each frame (see `flush_inbox`). Idempotent: if a decode
     /// is already in-flight, this is a no-op.
+    ///
+    /// Concurrency is bounded by `THUMB_DECODE_PERMITS`: the decode thread
+    /// acquires a slot first (blocking on the semaphore, off the main thread),
+    /// decodes, then releases. A folder of many large images therefore
+    /// decodes a handful at a time instead of spawning one WIC decode per
+    /// card and thrashing the machine. The main thread never blocks here —
+    /// only the background threads wait on a slot.
     pub fn request_thumb(&self, path: PathBuf) {
         if self.thumb_in_flight(&path) || self.get_thumb(&path).is_some() {
             return;
@@ -75,9 +124,12 @@ impl TextureCache {
         self.mark_thumb_pending(&path);
         let (tx, rx) = std::sync::mpsc::channel::<ThumbResult>();
         self.inbox.lock().push(rx);
+        let slot = self.slot.clone();
         let path_for_thread = path.clone();
         std::thread::spawn(move || {
+            slot.acquire();
             let result = decode_thumb_blocking(200, &path_for_thread);
+            slot.release();
             if let Some(r) = result {
                 let _ = tx.send(r);
             }
