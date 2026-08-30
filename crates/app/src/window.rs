@@ -448,6 +448,9 @@ pub struct MainWindow {
     show_shortcut_help: bool,
     /// Whether the title-bar ⚙ settings dropdown is open.
     show_settings_menu: bool,
+    /// Physical-pixel rect of the floating fullscreen toolbar (in logical
+    /// px via the pane), used by click-outside-to-hide in window_event.
+    fullscreen_bar_rect: Option<egui::Rect>,
     chrome_visible: bool,
     chrome_hide_at: Option<std::time::Instant>,
     chrome_move_accum: f32,
@@ -669,6 +672,7 @@ impl MainWindow {
             initial_folder: folder,
             show_shortcut_help: false,
             show_settings_menu: false,
+            fullscreen_bar_rect: None,
             chrome_visible: true,
             chrome_hide_at: None,
             chrome_move_accum: 0.0,
@@ -1236,8 +1240,16 @@ let window = event_loop.create_window(
             .max(0.1);
         let tree_w_phys = (tree_w as f32 * ppp).round() as u32;
         let thumb_w_phys = (thumb_w as f32 * ppp).round() as u32;
-        let toolbar = (TOOLBAR_HEIGHT as f32 * ppp).round() as i32;
-        let status = (STATUS_BAR_HEIGHT as f32 * ppp).round() as i32;
+        // Fullscreen hides the title/status bars; the bottom toolbar is a
+        // floating overlay, so no space is reserved.
+        let (toolbar, status) = if self.is_fullscreen {
+            (0, 0)
+        } else {
+            (
+                (TOOLBAR_HEIGHT as f32 * ppp).round() as i32,
+                (STATUS_BAR_HEIGHT as f32 * ppp).round() as i32,
+            )
+        };
         let x = tree_w_phys as i32;
         let y = toolbar;
         let w = win_w.saturating_sub(tree_w_phys + thumb_w_phys);
@@ -1258,10 +1270,17 @@ let window = event_loop.create_window(
             .map(|w| w.pixels_per_point)
             .unwrap_or(1.0)
             .max(0.1);
-        let tree_px = if self.show_tree { self.tree_panel.anim * ppp } else { 0.0 };
-        let thumb_px = if self.show_thumbs { self.thumb_panel.anim * ppp } else { 0.0 };
-        let toolbar_px = TOOLBAR_HEIGHT as f32 * ppp;
-        let status_px = STATUS_BAR_HEIGHT as f32 * ppp;
+        let tree_px = if self.show_tree && !self.is_fullscreen { self.tree_panel.anim * ppp } else { 0.0 };
+        let thumb_px = if self.show_thumbs && !self.is_fullscreen { self.thumb_panel.anim * ppp } else { 0.0 };
+        // In fullscreen the title bar and status bar are hidden, and the
+        // bottom toolbar is a FLOATING overlay (does not reserve layout
+        // space), so the image occupies the full client rect. The egui
+        // CentralPanel already spans the full window; the bar floats over it.
+        let (toolbar_px, status_px) = if self.is_fullscreen {
+            (0.0, 0.0)
+        } else {
+            (TOOLBAR_HEIGHT as f32 * ppp, STATUS_BAR_HEIGHT as f32 * ppp)
+        };
         let x = tree_px;
         let y = toolbar_px;
         let w = (win_w as f32 - tree_px - thumb_px).max(0.0);
@@ -1751,32 +1770,46 @@ let window = event_loop.create_window(
             }
         }
         if self.is_fullscreen && self.chrome_anim > 0.02 {
-            // ----- OVERLAY CONTROL BAR (slides up from bottom) -----
+            // ----- OVERLAY CONTROL BAR (floats over the image) -----
+            // Anchored to the window bottom as a Foreground Area so it does
+            // NOT reserve layout space (which would shrink the CentralPanel
+            // and leave the image with a bottom gap). It fades in/out with
+            // `chrome_anim`; the image already fills the whole window, so
+            // the bar overlays it semi-transparently.
             let a = self.chrome_anim;
             let bar_h = 48.0 * a;
-            let resp = egui::TopBottomPanel::bottom("overlay_toolbar")
-                .frame(
-                    egui::Frame::default()
-                        .fill(egui::Color32::from_rgba_unmultiplied(
+            let screen_h = egui_state.ctx.input(|i| i.screen_rect.height());
+            let bar_y = screen_h - bar_h;
+            let bar_rect_outer = egui::Rect::from_min_size(
+                egui::pos2(0.0, bar_y),
+                egui::vec2(egui_state.ctx.input(|i| i.screen_rect.width()), bar_h),
+            );
+            let bar_resp = egui::Area::new(egui::Id::new("overlay_toolbar"))
+                .order(egui::Order::Foreground)
+                .fixed_pos(bar_rect_outer.min)
+                .show(&egui_state.ctx, |ui| {
+                    let area_rect = ui.max_rect();
+                    ui.set_clip_rect(area_rect);
+                    // Semi-transparent surface behind the row, over the
+                    // area's own rect (local coords).
+                    ui.painter().rect_filled(
+                        area_rect,
+                        0.0,
+                        egui::Color32::from_rgba_unmultiplied(
                             pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
                             (235.0 * a) as u8,
-                        ))
-                        // Phase 9: zero margin — the bar draws its own
-                        // full-height centered rows; a vertical margin
-                        // here squeezed the interior to 32px for 30px
-                        // buttons (top-edge clipping).
-                        .inner_margin(egui::Margin::symmetric(0.0, 0.0)),
-                )
-                .exact_height(bar_h)
-                .show(&egui_state.ctx, |ui| {
-                    ui.set_clip_rect(ui.max_rect().intersect(ui.clip_rect()));
+                        ),
+                    );
                     Self::draw_fullscreen_bar(
                         ui, &mut state.actions, &state.current_path,
                         state.nav_idx, state.nav_count2, state.current_size, state.zoom_pct,
                         &pal, true, self.slide_show_running,
                     );
                 });
-            toolbar_rect = Some(resp.response.rect);
+            toolbar_rect = Some(bar_resp.response.rect);
+            self.fullscreen_bar_rect = Some(bar_resp.response.rect);
+        } else {
+            self.fullscreen_bar_rect = None;
         }
 
         // ----- SIDE PANELS (custom width controller) -----
@@ -4841,6 +4874,27 @@ impl ApplicationHandler for MainWindow {
         // ---- Mouse input: pan, panel-edge drag start/end, dbl-click ----
         if let WindowEvent::MouseInput { state, button, .. } = &event {
             let cursor = self.router.cursor_pos;
+
+            // Click-outside-to-hide the fullscreen toolbar: any left press
+            // outside the floating bar's rect immediately hides the toolbar.
+            // (Pressing the bar's own buttons is inside `toolbar_rect`, so
+            // the bar stays; pressing the image/elsewhere dismisses it.)
+            if self.is_fullscreen
+                && self.chrome_visible
+                && matches!(button, MouseButton::Left)
+                && matches!(state, ElementState::Pressed)
+            {
+                let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+                let clx = cursor.x as f32 / ppp;
+                let cly = cursor.y as f32 / ppp;
+                if let Some(bar) = self.fullscreen_bar_rect {
+                    let inside = bar.contains(egui::pos2(clx, cly));
+                    if !inside {
+                        self.chrome_visible = false;
+                        self.chrome_hide_at = None;
+                    }
+                }
+            }
 
             // Panel edge drag: press on an edge → start; release → end.
             if matches!(button, MouseButton::Left) {
