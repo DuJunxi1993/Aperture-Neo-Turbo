@@ -1927,8 +1927,10 @@ let window = event_loop.create_window(
                 let anchor = HELP_ANCHOR.with(|c| c.get());
                 let valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
                 if valid {
-                    #[allow(clippy::novec)]
-                    egui::pos2(anchor.max.x - popup_w, anchor.max.y + 6.0)
+                    // `pivot(RIGHT_TOP)` puts the window's RIGHT-TOP corner
+                    // at fixed_pos, so pass the button's right edge directly
+                    // (not minus popup_w — that double-shifted it left).
+                    egui::pos2(anchor.max.x, anchor.max.y + 6.0)
                 } else {
                     egui::pos2(
                         (screen.width() - popup_w) * 0.5,
@@ -2049,7 +2051,29 @@ let window = event_loop.create_window(
             let sidebar_on_launch = self.settings.show_tree_on_launch();
             let anchor = SETTINGS_ANCHOR.with(|c| c.get());
             let anchor_valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
-            let menu_w = 220.0_f32;
+            // Menu self-sizes to the longest label so it isn't a wide empty
+            // box: measure each item's text width (via the font's layout_job)
+            // and use (widest + padding) as the window's default width.
+            // Long labels never clip; short items don't stretch.
+            fn text_w(ctx: &egui::Context, t: &str) -> f32 {
+                let job = egui::text::LayoutJob::simple(
+                    t.into(),
+                    egui::FontId::proportional(12.5),
+                    egui::Color32::WHITE,
+                    200.0,
+                );
+                ctx.fonts(|f| f.layout_job(job).size().x)
+            }
+            let widest = [
+                "Clear browse history",
+                "Clear favorites",
+                "Follow system theme",
+                "Show sidebar on launch",
+            ]
+            .iter()
+            .map(|t| text_w(&egui_ctx, t))
+            .fold(0.0_f32, f32::max);
+            let menu_w = (widest + 44.0).max(160.0);
             let pos = if anchor_valid {
                 egui::pos2(anchor.max.x - menu_w, anchor.max.y + 4.0)
             } else {
@@ -2072,6 +2096,11 @@ let window = event_loop.create_window(
             let mut settings_action: Option<UiAction> = None;
             let mut settings_win = egui::Window::new("");
             settings_win = settings_win
+                // Unique Id — otherwise an empty title gives this window the
+                // same Id as the right-click context menu, and their item
+                // widget Ids collide (egui 'First/Second use of widget ID'
+                // warnings; clicks land on the wrong menu and never fire).
+                .id(egui::Id::new("settings_menu"))
                 .frame(menu_frame)
                 .order(egui::Order::Foreground)
                 .fixed_pos(pos)
@@ -2085,7 +2114,10 @@ let window = event_loop.create_window(
                     egui::vec2(ui.available_width(), row_h),
                     egui::Sense::click(),
                 );
-                if resp.hovered() {
+                if resp.is_pointer_button_down_on() {
+                    // Pressed — strong accent fill for clear click feedback.
+                    ui.painter().rect_filled(rect, 6.0, pal.button_hover);
+                } else if resp.hovered() {
                     ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
                 }
                 ui.painter().text(
@@ -2106,7 +2138,7 @@ let window = event_loop.create_window(
                 }
                 resp.clicked()
             };
-            settings_win.show(&egui_ctx, |ui| {
+            let settings_resp = settings_win.show(&egui_ctx, |ui| {
                 if make_item(ui, "Clear browse history", None) {
                     settings_action = Some(UiAction::SettingsClearRecent);
                     close_menu = true;
@@ -2125,6 +2157,13 @@ let window = event_loop.create_window(
                     close_menu = true;
                 }
             });
+            // Close on click-elsewhere (e.g. clicking the image / a menu
+            // outside), mirroring the shortcut-help and context menus. This
+            // also stops the settings menu lingering while a right-click
+            // context menu opens on top.
+            if settings_resp.map_or(false, |ir| ir.response.clicked_elsewhere()) {
+                self.show_settings_menu = false;
+            }
             if close_menu {
                 self.show_settings_menu = false;
             }
@@ -3852,14 +3891,22 @@ let window = event_loop.create_window(
         };
 
         let window = egui::Window::new("")
+            // Unique Id per variant so the image/tree context menus and the
+            // settings menu never collide on widget Ids (empty title would
+            // give all of them Id::new("") and break click hit-testing).
+            .id(egui::Id::new(match menu {
+                CtxMenu::Image { .. } => "ctx_menu_image",
+                CtxMenu::Tree { .. } => "ctx_menu_tree",
+            }))
             .frame(frame)
             .order(egui::Order::Foreground)
             .resizable(false)
             .collapsible(false)
             .title_bar(false)
             .fade_in(false)
-            .fade_out(false)
-            .default_width(180.0);
+            .fade_out(false);
+
+        let window = window.auto_sized();
 
         match menu {
             CtxMenu::Image { pos } => {
