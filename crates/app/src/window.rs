@@ -251,6 +251,8 @@ pub struct Palette {
     pub button_fill: egui::Color32,
     pub button_hover: egui::Color32,
     pub card_stroke: egui::Color32,
+    /// 1px divider line between menu item groups (theme-aware).
+    pub separator: egui::Color32,
     pub selected_card_fill: egui::Color32,
     pub selected_card_stroke: egui::Color32,
     pub thumb_placeholder: egui::Color32,
@@ -291,6 +293,7 @@ pub fn dark_palette() -> Palette { Palette {
     button_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
     button_hover: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+    separator: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38),
     selected_card_stroke: egui::Color32::from_rgb(95, 106, 210),
     thumb_placeholder: egui::Color32::from_rgb(28, 30, 36),
@@ -314,6 +317,7 @@ pub fn light_palette() -> Palette { Palette {
     button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 13),
     button_hover: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
     card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
+    separator: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
     selected_card_stroke: egui::Color32::from_rgb(94, 106, 210),
     thumb_placeholder: egui::Color32::from_rgb(226, 228, 231),
@@ -451,6 +455,9 @@ pub struct MainWindow {
     /// Physical-pixel rect of the floating fullscreen toolbar (in logical
     /// px via the pane), used by click-outside-to-hide in window_event.
     fullscreen_bar_rect: Option<egui::Rect>,
+    /// Logical-pixel rect of the open settings dropdown (in screen coords),
+    /// used by click-outside-to-close in window_event.
+    settings_menu_rect: Option<egui::Rect>,
     chrome_visible: bool,
     chrome_hide_at: Option<std::time::Instant>,
     chrome_move_accum: f32,
@@ -673,6 +680,7 @@ impl MainWindow {
             show_shortcut_help: false,
             show_settings_menu: false,
             fullscreen_bar_rect: None,
+            settings_menu_rect: None,
             chrome_visible: true,
             chrome_hide_at: None,
             chrome_move_accum: 0.0,
@@ -1800,25 +1808,31 @@ let window = event_loop.create_window(
                     let mut content = ui.new_child(
                         egui::UiBuilder::new()
                             .max_rect(egui::Rect::from_min_size(
-                                egui::Pos2::ZERO,
+                                bar_rect_outer.min,
                                 egui::vec2(bar_w, bar_h),
                             ))
                             .id_salt("overlay_bar_content"),
                     );
                     content.set_clip_rect(egui::Rect::from_min_size(
-                        egui::Pos2::ZERO,
+                        bar_rect_outer.min,
                         egui::vec2(bar_w, bar_h),
                     ));
                     content.allocate_rect(
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(bar_w, bar_h)),
+                        egui::Rect::from_min_size(
+                            bar_rect_outer.min,
+                            egui::vec2(bar_w, bar_h),
+                        ),
                         egui::Sense::hover(),
                     );
                     content.painter().rect_filled(
-                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(bar_w, bar_h)),
+                        egui::Rect::from_min_size(
+                            bar_rect_outer.min,
+                            egui::vec2(bar_w, bar_h),
+                        ),
                         0.0,
                         egui::Color32::from_rgba_unmultiplied(
                             pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
-                            (235.0 * a) as u8,
+                            235,
                         ),
                     );
                     Self::draw_fullscreen_bar(
@@ -1967,15 +1981,19 @@ let window = event_loop.create_window(
             // read as a stray background block on both themes.
             .frame(
                 egui::Frame::default()
-                    .fill(pal.panel_bg)
-                    // Phase 14: drop the 1px stroke (same reason as
-                    // the context menus) — it painted 0.5px inside
-                    // the frame rect and leaked past the hole.
-                    .stroke(egui::Stroke::NONE)
+                    .fill(egui::Color32::from_rgba_unmultiplied(
+                        pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
+                    ))
+                    .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                     .rounding(8.0)
                     .outer_margin(egui::Margin::same(2.0))
                     .inner_margin(egui::Margin::same(12.0))
-                    .shadow(egui::Shadow::NONE),
+                    .shadow(egui::Shadow {
+                        spread: 0.0,
+                        color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                        offset: egui::vec2(0.0, 4.0),
+                        blur: 24.0,
+                    }),
             )
             .fixed_pos(anchor_pos)
             .fixed_size(egui::vec2(popup_w, popup_h))
@@ -2134,22 +2152,19 @@ let window = event_loop.create_window(
             // allocate_exact_size row hit-testing was flaky here).
             let make_item = |ui: &mut egui::Ui, label: &str, checked: Option<bool>| -> bool {
                 let row_h = 28.0_f32;
-                let (rect, _) = ui.allocate_exact_size(
+                let (rect, resp) = ui.allocate_exact_size(
                     egui::vec2(ui.available_width(), row_h),
-                    egui::Sense::hover(),
+                    egui::Sense::click(),
                 );
-                // Draw text + optional check manually on top of a full-row
-                // Button, so the hover/press look matches the theme while the
-                // click comes from a real Button.
-                let id = ui.id().with(("settings_item", label));
-                let btn_resp = ui
-                    .interact(rect, id, egui::Sense::click())
-                    .on_hover_cursor(egui::CursorIcon::PointingHand);
-                if btn_resp.is_pointer_button_down_on() {
+                // Whole-row click via the allocated response (same reliable
+                // path as the context-menu `item`). Paint the highlight/press
+                // fill over the full row and the label/check on top.
+                if resp.is_pointer_button_down_on() {
                     ui.painter().rect_filled(rect, 6.0, pal.button_hover);
-                } else if btn_resp.hovered() {
+                } else if resp.hovered() {
                     ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
                 }
+                resp.clone().on_hover_cursor(egui::CursorIcon::PointingHand);
                 ui.painter().text(
                     egui::pos2(rect.left() + 8.0, rect.center().y),
                     egui::Align2::LEFT_CENTER,
@@ -2166,7 +2181,7 @@ let window = event_loop.create_window(
                         pal.accent,
                     );
                 }
-                btn_resp.clicked()
+                resp.clicked()
             };
             let settings_resp = settings_win.show(&egui_ctx, |ui| {
                 if make_item(ui, "Clear browse history", None) {
@@ -2177,7 +2192,17 @@ let window = event_loop.create_window(
                     settings_action = Some(UiAction::SettingsClearFavorites);
                     close_menu = true;
                 }
-                ui.separator();
+                ui.add_space(4.0);
+                let avail = ui.available_rect_before_wrap();
+                ui.painter().rect_filled(
+                    egui::Rect::from_min_max(
+                        egui::pos2(avail.left(), avail.center().y - 0.5),
+                        egui::pos2(avail.right(), avail.center().y + 0.5),
+                    ),
+                    0.0,
+                    pal.separator,
+                );
+                ui.add_space(4.0);
                 if make_item(ui, "Follow system theme", Some(theme_system)) {
                     settings_action = Some(UiAction::SettingsThemeSystem);
                     close_menu = true;
@@ -2187,19 +2212,21 @@ let window = event_loop.create_window(
                     close_menu = true;
                 }
             });
-            // Close on click-elsewhere (e.g. clicking the image / a menu
-            // outside), mirroring the shortcut-help and context menus. This
-            // also stops the settings menu lingering while a right-click
-            // context menu opens on top.
-            if settings_resp.map_or(false, |ir| ir.response.clicked_elsewhere()) {
-                self.show_settings_menu = false;
-            }
+            // Record the menu's screen rect so the window_event handler can
+            // close it on a left press anywhere outside (image/view included,
+            // whose clicks are otherwise consumed by the pan branch and never
+            // reach egui's `clicked_elsewhere`).
+            self.settings_menu_rect = settings_resp
+                .map(|ir| ir.response.rect)
+                .or(self.settings_menu_rect);
             if close_menu {
                 self.show_settings_menu = false;
             }
             if let Some(act) = settings_action {
                 self.apply_action(act);
             }
+        } else {
+            self.settings_menu_rect = None;
         }
 
         // ----- RIGHT-CLICK CONTEXT MENU (egui-drawn, Linear theme) -----
@@ -5028,6 +5055,31 @@ impl ApplicationHandler for MainWindow {
                         self.chrome_visible = false;
                         self.chrome_hide_at = None;
                     }
+                }
+            }
+
+            // Close the settings dropdown on any left press outside both the
+            // ⚙ button (which toggles it) and the menu's own rect. This
+            // runs before the pan/edge branches consume the click, so a
+            // press on the image/view or anywhere else dismisses the menu
+            // even though those clicks never reach egui.
+            if self.show_settings_menu
+                && matches!(button, MouseButton::Left)
+                && matches!(state, ElementState::Pressed)
+            {
+                let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
+                let clx = cursor.x as f32 / ppp;
+                let cly = cursor.y as f32 / ppp;
+                let pt = egui::pos2(clx, cly);
+                let on_gear = SETTINGS_ANCHOR.with(|c| {
+                    let a = c.get();
+                    !(a.any_nan() || a == egui::Rect::NOTHING)
+                        && egui::Rect::from_min_max(a.min - egui::Vec2::splat(2.0), a.max + egui::Vec2::splat(2.0))
+                            .contains(pt)
+                });
+                let on_menu = self.settings_menu_rect.map_or(false, |r| r.contains(pt));
+                if !on_gear && !on_menu {
+                    self.show_settings_menu = false;
                 }
             }
 
