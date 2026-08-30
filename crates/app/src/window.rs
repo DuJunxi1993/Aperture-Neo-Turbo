@@ -1844,10 +1844,22 @@ let window = event_loop.create_window(
             let screen = egui_state.ctx.input(|i| i.screen_rect);
             let popup_w = 360.0_f32.min(screen.width() - 16.0);
             let popup_h = 360.0_f32;
-            let anchor_pos = egui::pos2(
-                (screen.width() - popup_w) * 0.5,
-                (TOOLBAR_HEIGHT as f32) + 6.0,
-            );
+            // Anchor the popup to the "?" button: right-aligned to the
+            // button's right edge, appearing directly below it. Falls back
+            // to a centered-ish top position if the button hasn't been drawn.
+            let anchor_pos = {
+                let anchor = HELP_ANCHOR.with(|c| c.get());
+                let valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
+                if valid {
+                    #[allow(clippy::novec)]
+                    egui::pos2(anchor.max.x - popup_w, anchor.max.y + 6.0)
+                } else {
+                    egui::pos2(
+                        (screen.width() - popup_w) * 0.5,
+                        (TOOLBAR_HEIGHT as f32) + 6.0,
+                    )
+                }
+            };
             let help_resp = egui::Window::new(
                 egui::RichText::new("Keyboard Shortcuts").size(13.0).strong(),
             )
@@ -1868,7 +1880,7 @@ let window = event_loop.create_window(
             )
             .fixed_pos(anchor_pos)
             .fixed_size(egui::vec2(popup_w, popup_h))
-            .pivot(egui::Align2::CENTER_TOP)
+            .pivot(egui::Align2::RIGHT_TOP)
             .resizable(false)
             .collapsible(false)
             .fade_in(false)
@@ -2691,7 +2703,7 @@ let window = event_loop.create_window(
                     egui::Sense::click(),
                 );
                 if tresp.hovered() {
-                    ui.painter().rect_filled(trect, 0.0, pal.hover_fill);
+                    ui.painter().rect_filled(trect, 6.0, pal.hover_fill);
                 }
                 let tc = trect.center();
                 let p = ui.painter();
@@ -2716,7 +2728,7 @@ let window = event_loop.create_window(
                     egui::Sense::click(),
                 );
                 if hresp.hovered() {
-                    ui.painter().rect_filled(hrect, 0.0, pal.hover_fill);
+                    ui.painter().rect_filled(hrect, 6.0, pal.hover_fill);
                 }
                 ui.painter().text(
                     hrect.center(),
@@ -3610,19 +3622,29 @@ let window = event_loop.create_window(
 
         let mut item = |ui: &mut egui::Ui, label: &str, action: UiAction| -> bool {
             let mut clicked = false;
-            let resp = egui::Widget::ui(
-                egui::Button::new(egui::RichText::new(label).size(12.5))
-                    .frame(false)
-                    .fill(egui::Color32::TRANSPARENT),
-                ui,
+            // Allocate a FULL-WIDTH row first so the hover highlight spans
+            // the whole menu item, not just the text extents (the old
+            // Button::frame(false) made the highlight a variable-width box
+            // hugging the label).
+            let row_h: f32 = 28.0;
+            let (row_rect, resp) = ui.allocate_exact_size(
+                egui::vec2(ui.available_width(), row_h),
+                egui::Sense::click(),
             );
             if resp.hovered() {
                 ui.painter().rect_filled(
-                    resp.rect,
+                    row_rect,
                     6.0,
-                    egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
+                    pal.hover_fill,
                 );
             }
+            ui.painter().text(
+                egui::pos2(row_rect.left() + 8.0, row_rect.center().y),
+                egui::Align2::LEFT_CENTER,
+                label,
+                egui::FontId::proportional(12.5),
+                pal.text_secondary,
+            );
             if resp.clicked() {
                 clicked = true;
                 actions.push(action);
@@ -3637,7 +3659,8 @@ let window = event_loop.create_window(
             .collapsible(false)
             .title_bar(false)
             .fade_in(false)
-            .fade_out(false);
+            .fade_out(false)
+            .default_width(180.0);
 
         match menu {
             CtxMenu::Image { pos } => {
