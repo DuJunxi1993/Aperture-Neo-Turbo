@@ -98,16 +98,23 @@ const DRAWER_MAX_W: f32 = 560.0;
 const HANDLE_LIGHT_THRESHOLD: f32 = 0.62;
 const HANDLE_DARK_THRESHOLD: f32 = 0.38;
 const HANDLE_DEBOUNCE_MS: u64 = 200;
-/// Held-arrow-step interval (fixed-rate). Tuned near the decode ceiling so
-/// a fast hold "walks" the gallery at a steady, rideable pace: each step
-/// cuts instantly (pre-decode cache), no animation. Too slow feels laggy;
-/// too fast skips the eye's ability to track. ~90ms ≈ 11 img/s.
-const HOLD_NAV_INTERVAL: std::time::Duration = std::time::Duration::from_millis(90);
-/// How long the key must be held before the fixed-rate walk engages. A
-/// quick tap (< this) stays a single animated navigation; holding past it
-/// enters fast direct-cut paging. Prevents misfiring the walk on a normal
-/// tap or fighting with single-press navigation.
-const HOLD_NAV_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(220);
+/// Held-arrow step interval at its FASTEST steady pace. Tuned near the decode
+/// ceiling so a long hold "walks" the gallery at a rideable, trackable speed:
+/// each step cuts instantly (pre-decode cache), no animation. ~90ms ≈ 11 img/s.
+const HOLD_NAV_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_millis(90);
+/// Held-arrow step interval at the START of the acceleration ramp. A short
+/// pause before the first repeat keeps a quick tap a single navigation and
+/// makes the hold feel like it accelerates (slow → fast) instead of snapping
+/// straight into the fast walk, which was easy to trigger by accident.
+const HOLD_NAV_START_INTERVAL: std::time::Duration = std::time::Duration::from_millis(360);
+/// How long the key must be held before the accelerated walk begins at all.
+/// A quick tap (< this) stays a single animated navigation; holding past it
+/// ramps the repeat rate from `HOLD_NAV_START_INTERVAL` down to
+/// `HOLD_NAV_MIN_INTERVAL`.
+const HOLD_NAV_THRESHOLD: std::time::Duration = std::time::Duration::from_millis(260);
+/// Hold time (measured from the first press) at which the ramp reaches its
+/// fastest interval. Beyond this the walk runs at a steady `MIN_INTERVAL`.
+const HOLD_NAV_RAMP_FULL: std::time::Duration = std::time::Duration::from_millis(1400);
 
 #[allow(dead_code)]
 enum UiAction {
@@ -1344,9 +1351,12 @@ let window = event_loop.create_window(
 
     /// Per-frame dispatcher for a held arrow key, called from
     /// `render_frame` BEFORE the egui frame. Fires the next step on a
-    /// FIXED-TIME pulse (`HOLD_NAV_INTERVAL`) while the key is held — but
-    /// only after the key has been held for `HOLD_NAV_THRESHOLD`; a quick
-    /// tap stays a single animated navigation and never enters the walk.
+    /// RAMPTING pulse while the key is held — but only after the key has been
+    /// held for `HOLD_NAV_THRESHOLD`; a quick tap stays a single animated
+    /// navigation and never enters the walk. The repeat interval accelerates
+    /// from `HOLD_NAV_START_INTERVAL` down to `HOLD_NAV_MIN_INTERVAL` over
+    /// `HOLD_NAV_RAMP_FULL`, so holding feels like it speeds up naturally
+    /// instead of snapping straight into the fast walk (easy to misfire).
     /// Each held step uses `SlideDir::None` (direct cut, no slide) — this
     /// is the fast "walk the gallery" mode: steady pace, no per-step
     /// animation, no waiting on decode (the pre-decode cache makes it a
@@ -1356,16 +1366,23 @@ let window = event_loop.create_window(
         let Some((direction, _)) = self.nav_intent else { return; };
         let now = std::time::Instant::now();
         // The walk only engages once the hold has lasted the threshold.
-        let engaged = self
-            .nav_press_at
-            .map(|t| now.duration_since(t) >= HOLD_NAV_THRESHOLD)
-            .unwrap_or(false);
-        if !engaged {
+        let Some(press_at) = self.nav_press_at else { return; };
+        let held = now.duration_since(press_at);
+        if held < HOLD_NAV_THRESHOLD {
             return;
         }
+        // Accelerative ramp: the repeat interval starts slow and shortens
+        // linearly to the fast steady pace over HOLD_NAV_RAMP_FULL. So a hold
+        // feels like it accelerates naturally (slow → fast) instead of
+        // snapping into the fast walk the instant it crosses the threshold —
+        // the old fixed-rate behaviour was easy to trigger by accident.
+        let t = (held.as_secs_f32() / HOLD_NAV_RAMP_FULL.as_secs_f32()).clamp(0.0, 1.0);
+        let interval_ms = HOLD_NAV_START_INTERVAL.as_secs_f32()
+            + (HOLD_NAV_MIN_INTERVAL.as_secs_f32() - HOLD_NAV_START_INTERVAL.as_secs_f32()) * t;
+        let interval = std::time::Duration::from_secs_f32(interval_ms);
         let due = self
             .nav_last_step
-            .map(|t| now.duration_since(t) >= HOLD_NAV_INTERVAL)
+            .map(|t| now.duration_since(t) >= interval)
             .unwrap_or(true);
         if !due {
             return;
@@ -4758,10 +4775,11 @@ impl ApplicationHandler for MainWindow {
             //
             // Hold-to-page: a fresh KEYDOWN jumps on the down-stroke (with
             // the iOS slide), records the direction into `nav_intent`. The
-            // fixed-rate dispatcher then advances on a steady `HOLD_NAV_INTERVAL`
-            // pulse while the key stays down, each step cutting directly
-            // (SlideDir::None, no slide) and hitting the pre-decode cache —
-            // the fast "walk the gallery" mode. Stops exactly on KEYUP.
+            // per-frame dispatcher then advances on an ACCELERATING pulse
+            // while the key stays down (starts slow, ramps to a steady fast
+            // pace), each step cutting directly (SlideDir::None, no slide)
+            // and hitting the pre-decode cache — the fast "walk the gallery"
+            // mode. Stops exactly on KEYUP.
             //
             //   * KEYDOWN for an arrow: fresh press (no intent) fires
             //     handle_navigation immediately; always records the
@@ -4848,13 +4866,24 @@ impl ApplicationHandler for MainWindow {
                         }
                         KeyCode::Equal | KeyCode::NumpadAdd if ctrl_pressed => {
                             if let Some(v) = &self.viewer {
-                                v.lock().zoom_step(1.25);
+                                // Hold-repeat (long-press) uses the same
+                                // continuous linear zoom as the wheel; a fresh
+                                // press is a single stepped zoom.
+                                if key_event.repeat {
+                                    v.lock().zoom_continuous(1.03);
+                                } else {
+                                    v.lock().zoom_step(1.25);
+                                }
                             }
                             if let Some(window) = &self.window { window.request_redraw(); }
                         }
                         KeyCode::Minus | KeyCode::NumpadSubtract if ctrl_pressed => {
                             if let Some(v) = &self.viewer {
-                                v.lock().zoom_step(1.0 / 1.25);
+                                if key_event.repeat {
+                                    v.lock().zoom_continuous(1.0 / 1.03);
+                                } else {
+                                    v.lock().zoom_step(1.0 / 1.25);
+                                }
                             }
                             if let Some(window) = &self.window { window.request_redraw(); }
                         }

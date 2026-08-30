@@ -467,12 +467,13 @@ impl Direct2DViewer {
     }
 
     pub fn on_wheel(&mut self, delta: i32, cursor_x: f32, cursor_y: f32) {
-        // Continuous, delta-proportional zoom factor: one full scroll notch
-        // (~±2400 from the LineDelta→*100 pipeline) maps to roughly ×1.5 /
-        // ÷1.5, and sub-notch pixel scrolls scale proportionally, so a single
-        // wheel turn produces an obvious, smooth change instead of needing
-        // many turns for a fixed 1.1× step.
-        let clamped = (delta as f32).clamp(-6000.0, 6000.0) / 2400.0;
+        // LINEAR wheel zoom: the zoom factor maps continuously to the scroll
+        // delta. One physical notch reaches here as ~±100 (LineDelta±1 → *100
+        // in handle_wheel_in_viewer) and maps to roughly ×1.5 / ÷1.5; smaller
+        // pixel deltas scale proportionally, so a single wheel turn visibly
+        // zooms. Applied directly (no easing) so the wheel is fully linear and
+        // tracks the hand — "手停即停".
+        let clamped = (delta as f32).clamp(-1200.0, 1200.0) / 100.0;
         let zoom_factor = 1.5_f32.powf(clamped);
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if new_zoom == self.zoom { return; }
@@ -485,25 +486,34 @@ impl Direct2DViewer {
         let cy = cursor_y - self.viewport_origin.1;
         let cursor_rel_x = cx - self.offset_x;
         let cursor_rel_y = cy - self.offset_y;
-        let target_off_x = cx - cursor_rel_x * (new_zoom / self.zoom);
-        let target_off_y = cy - cursor_rel_y * (new_zoom / self.zoom);
+        self.offset_x = cx - cursor_rel_x * (new_zoom / self.zoom);
+        self.offset_y = cy - cursor_rel_y * (new_zoom / self.zoom);
+        self.zoom = new_zoom;
         self.is_fit = false;
-        // Animate the zoom (offset + size interpolated together) so wheel
-        // zoom is smooth like a pinch instead of stepping per notch.
-        if self.current_gpu.is_some() {
-            let (ew, eh) = self.effective_size();
-            self.start_rect_anim_eased_with(
-                self.anim_rect(),
-                (target_off_x, target_off_y, ew * new_zoom, eh * new_zoom),
-                0.14,
-                Easing::EaseOut,
-                false,
-            );
-        } else {
-            self.offset_x = target_off_x;
-            self.offset_y = target_off_y;
-            self.zoom = new_zoom;
-        }
+        // A wheel gesture is user-driven continuous zoom; any in-flight
+        // fit/rotation rect-anim is superseded by the new settled rect.
+        self.rect_anim = None;
+        self.clamp_pan();
+        self.animator.reset();
+    }
+
+    /// Continuous zoom driven by a held key (long-press Ctrl+/−) or a small
+    /// per-frame delta. Same linear semantics as `on_wheel`, but anchored to
+    /// the viewport centre (no cursor tracking) and applied directly so it
+    /// feels like the wheel — not a stepped keypress.
+    pub fn zoom_continuous(&mut self, step: f32) {
+        let new_zoom = (self.zoom * step).clamp(MIN_ZOOM, MAX_ZOOM);
+        if new_zoom == self.zoom { return; }
+        let cx = self.viewport_w as f32 * 0.5;
+        let cy = self.viewport_h as f32 * 0.5;
+        let rel_x = cx - self.offset_x;
+        let rel_y = cy - self.offset_y;
+        self.offset_x = cx - rel_x * (new_zoom / self.zoom);
+        self.offset_y = cy - rel_y * (new_zoom / self.zoom);
+        self.zoom = new_zoom;
+        self.is_fit = false;
+        self.rect_anim = None;
+        self.clamp_pan();
         self.animator.reset();
     }
 
@@ -521,10 +531,14 @@ impl Direct2DViewer {
         self.is_fit = false;
         if self.current_gpu.is_some() {
             let (ew, eh) = self.effective_size();
+            // Stepped keypress zoom: an ease-out glide to the new zoom. Using
+            // anim_rect() as `from` means a fast sequence of taps chains from
+            // the current on-screen position (never snapping back), so rapid
+            // tapping feels continuous rather than re-stepping from rest.
             self.start_rect_anim_eased_with(
                 self.anim_rect(),
                 (target_off_x, target_off_y, ew * new_zoom, eh * new_zoom),
-                0.14,
+                0.12,
                 Easing::EaseOut,
                 false,
             );

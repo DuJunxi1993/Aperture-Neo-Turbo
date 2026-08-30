@@ -11,8 +11,10 @@ use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 /// The side of the square box all icons live in. Buttons are non-square
 /// (e.g. 42×30), so scale by the SMALLER edge and centre the box — otherwise a
 /// width-based radius overflows the button height and clips into a stray line.
+/// The 0.70 factor leaves ~30% internal padding so the glyph sits compact and
+/// centred (Linear-style) instead of nearly filling the button.
 fn icon_side(rect: Rect) -> f32 {
-    rect.width().min(rect.height()) * 0.92
+    rect.width().min(rect.height()) * 0.70
 }
 
 /// Expand a normalized point (in `[-0.5, 0.5]`) into a centred square box of
@@ -93,40 +95,23 @@ pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
     painter.circle_stroke(cx, outer_r * 0.36, stroke);
 }
 
-/// Draw the help speech-bubble: a rounded-square outline with a tail at the
-/// bottom-left and a filled `?` glyph.
+/// Draw the help glyph: just a filled `?` (no speech-bubble outline).
 pub fn help(painter: &Painter, rect: Rect, color: Color32) {
     let u = icon_side(rect);
-    let stroke = Stroke::new(u / 15.0, color);
-    let left = -0.5;
-    let right = 0.5;
-    let top = -0.5;
-    let bottom = 0.5;
-    // Outline: rounded square with a tail pointing down-left (kept inside the
-    // box so it never clips past the button's height).
-    let verts = [
-        Vec2::new(left, top),
-        Vec2::new(right, top),
-        Vec2::new(right, bottom),
-        Vec2::new(-0.04, bottom),
-        Vec2::new(-0.30, bottom + 0.22),
-        Vec2::new(left, bottom),
-    ];
-    let pts: Vec<Pos2> = rounded_closed(&verts, 0.28, 7).iter().map(|p| map(*p, rect, u)).collect();
-    painter.add(Shape::closed_line(pts, stroke));
-
-    // Filled "?" — a horseshoe arc, a descending stem, and a dot.
-    let qw = u * 0.30;
-    let stroke_q = Stroke::new(qw * 0.48, color);
+    let c = rect.center();
+    let qw = u * 0.34;
+    let stroke_q = Stroke::new(qw * 0.46, color);
     let arc_r = qw * 0.62;
-    let arc_c = Pos2::new(rect.center().x, rect.center().y - u * 0.12);
+    // Horseshoe arc (the top curve of the "?"), open at the bottom.
+    let arc_c = Pos2::new(c.x, c.y - u * 0.14);
     let mut qpts = Vec::new();
-    arc_into(&mut qpts, arc_c, arc_r, std::f32::consts::PI * 0.90, std::f32::consts::PI * 2.10, 13);
+    arc_into(&mut qpts, arc_c, arc_r, std::f32::consts::PI * 0.92, std::f32::consts::PI * 2.08, 13);
     painter.add(Shape::line(qpts, stroke_q));
-    let stem_top = Pos2::new(arc_c.x, arc_c.y + arc_r * 0.40);
-    let stem_bot = Pos2::new(rect.center().x, rect.center().y + u * 0.14);
+    // Descending stem into the centre, then a dot.
+    let stem_top = Pos2::new(arc_c.x, arc_c.y + arc_r * 0.42);
+    let stem_bot = Pos2::new(c.x, c.y + u * 0.14);
     painter.line_segment([stem_top, stem_bot], stroke_q);
-    painter.circle_filled(Pos2::new(stem_bot.x, stem_bot.y + qw * 0.36), qw * 0.26, color);
+    painter.circle_filled(Pos2::new(stem_bot.x, stem_bot.y + qw * 0.38), qw * 0.27, color);
 }
 
 /// Draw the home glyph: a stroked house outline (pitched rounded roof, square
