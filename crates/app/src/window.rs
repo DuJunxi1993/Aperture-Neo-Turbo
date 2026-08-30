@@ -285,16 +285,16 @@ fn resolve_theme(theme: Theme) -> Theme {
 pub fn dark_palette() -> Palette { Palette {
     panel_bg: egui::Color32::from_rgb(15, 16, 17),
     text_primary: egui::Color32::from_rgb(247, 248, 248),
-    text_secondary: egui::Color32::from_rgb(200, 205, 214),
+    text_secondary: egui::Color32::from_rgb(210, 214, 221),
     text_tertiary: egui::Color32::from_rgb(138, 143, 152),
     text_dim: egui::Color32::from_rgb(98, 102, 109),
     accent: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
     accent_hover: egui::Color32::from_rgb(0x71, 0x70, 0xff),
     selection_text: egui::Color32::from_rgb(140, 148, 255),
-    hover_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-    button_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 14),
-    button_hover: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 22),
-    card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 10),
+    hover_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 16),
+    button_fill: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 18),
+    button_hover: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 30),
+    card_stroke: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
     separator: egui::Color32::from_rgba_unmultiplied(255, 255, 255, 26),
     toggle_on: egui::Color32::from_rgb(0x4c, 0xaf, 0x50),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(87, 93, 188, 38),
@@ -310,16 +310,16 @@ pub fn dark_palette() -> Palette { Palette {
 pub fn light_palette() -> Palette { Palette {
     panel_bg: egui::Color32::from_rgb(246, 246, 246),
     text_primary: egui::Color32::from_rgb(26, 27, 30),
-    text_secondary: egui::Color32::from_rgb(60, 63, 68),
+    text_secondary: egui::Color32::from_rgb(55, 58, 64),
     text_tertiary: egui::Color32::from_rgb(107, 112, 120),
     text_dim: egui::Color32::from_rgb(140, 145, 152),
     accent: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
     accent_hover: egui::Color32::from_rgb(0x71, 0x70, 0xff),
     selection_text: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
-    hover_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 10),
-    button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 13),
-    button_hover: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 22),
-    card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 18),
+    hover_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 12),
+    button_fill: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 14),
+    button_hover: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 24),
+    card_stroke: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 20),
     separator: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 30),
     toggle_on: egui::Color32::from_rgb(0x2e, 0x7d, 0x32),
     selected_card_fill: egui::Color32::from_rgba_unmultiplied(94, 106, 210, 30),
@@ -462,6 +462,12 @@ pub struct MainWindow {
     /// Logical-pixel rect of the open settings dropdown (in screen coords),
     /// used by click-outside-to-close in window_event.
     settings_menu_rect: Option<egui::Rect>,
+    /// Logical-pixel rect of the open right-click context menu (screen
+    /// coords), so a left-click over the viewer region isn't consumed by the
+    /// pan branch before egui can dispatch it to the menu item.
+    ctx_menu_rect: Option<egui::Rect>,
+    /// Logical-pixel rect of the open shortcuts popover (screen coords).
+    shortcut_help_rect: Option<egui::Rect>,
     chrome_visible: bool,
     chrome_hide_at: Option<std::time::Instant>,
     chrome_move_accum: f32,
@@ -685,6 +691,8 @@ impl MainWindow {
             show_settings_menu: false,
             fullscreen_bar_rect: None,
             settings_menu_rect: None,
+            ctx_menu_rect: None,
+            shortcut_help_rect: None,
             chrome_visible: true,
             chrome_hide_at: None,
             chrome_move_accum: 0.0,
@@ -1836,7 +1844,7 @@ let window = event_loop.create_window(
                         0.0,
                         egui::Color32::from_rgba_unmultiplied(
                             pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
-                            (235.0 * a) as u8,
+                            (180.0 * a) as u8,
                         ),
                     );
                     Self::draw_fullscreen_bar(
@@ -2072,6 +2080,9 @@ let window = event_loop.create_window(
                 if resp.response.clicked_elsewhere() && !clicked_on_help_btn {
                     self.show_shortcut_help = false;
                 }
+                self.shortcut_help_rect = Some(resp.response.rect);
+            } else {
+                self.shortcut_help_rect = None;
             }
         }
         // END SCOPE 1: the egui_state borrow on self.egui_state is
@@ -2258,6 +2269,7 @@ let window = event_loop.create_window(
         if let Some(menu) = self.ctx_menu.as_ref() {
             let pal = self.pal();
             let current_path = self.nav.lock().current().map(|i| i.path.clone());
+            let mut menu_rect = self.ctx_menu_rect;
             let keep_open = Self::draw_context_menu(
                 &egui_ctx,
                 menu,
@@ -2265,10 +2277,13 @@ let window = event_loop.create_window(
                 current_path.as_deref(),
                 &mut self.actions,
                 self.ctx_menu_open_at,
+                &mut menu_rect,
             );
+            self.ctx_menu_rect = menu_rect;
             if !keep_open {
                 self.ctx_menu = None;
                 self.ctx_menu_open_at = None;
+                self.ctx_menu_rect = None;
             }
         }
 
@@ -2781,6 +2796,7 @@ let window = event_loop.create_window(
                     egui::RichText::new(label).size(13.0).strong().color(egui::Color32::WHITE),
                 )
                 .fill(pal.accent)
+                .stroke(egui::Stroke::new(1.0_f32, pal.accent))
                 .min_size(egui::vec2(0.0, 30.0))
                 .rounding(6.0),
             )
@@ -2936,8 +2952,11 @@ let window = event_loop.create_window(
                 ).clicked()
             };
             if content.add(
-                egui::Button::new(egui::RichText::new("Open Folder").size(13.0).strong())
+                egui::Button::new(
+                    egui::RichText::new("Open Folder").size(13.0).strong().color(pal.text_secondary),
+                )
                     .fill(pal.button_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
                     .min_size(egui::vec2(0.0, 30.0))
                     .rounding(6.0),
             ).clicked() {
@@ -3063,40 +3082,55 @@ let window = event_loop.create_window(
 
     /// One caption button with a vector-drawn glyph (immune to font
     /// fallback issues). Returns true when clicked.
+    ///
+    /// Linear-style: a subtle hover fill (rounded) on neutral buttons; the
+    /// close button fills red (#c42b1c) on hover and its X glyph turns white.
+    /// Glyphs are rounded to feel modern (minimise = rounded bar, maximize =
+    /// rounded square outline, close = X).
     fn window_control(ui: &mut egui::Ui, _id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
         let (rect, resp) = ui.allocate_exact_size(
             egui::vec2(42.0, TOOLBAR_HEIGHT as f32),
             egui::Sense::click(),
         );
-        if resp.hovered() {
+        let hovered = resp.hovered();
+        if hovered {
             let bg = if danger {
                 egui::Color32::from_rgb(196, 43, 28)
             } else {
                 pal.hover_fill
             };
-            ui.painter().rect_filled(rect, 6.0, bg);
+            ui.painter().rect_filled(rect, 4.0, bg);
         }
         let p = ui.painter();
         let c = rect.center();
-        let stroke = egui::Stroke::new(1.3_f32, pal.text_secondary);
+        // On the red close hover the glyph inverts to white for contrast.
+        let stroke_color = if danger && hovered {
+            egui::Color32::WHITE
+        } else {
+            pal.text_secondary
+        };
+        let stroke = egui::Stroke::new(1.3_f32, stroke_color);
         match glyph {
             WindowGlyph::Minimize => {
-                p.line_segment([egui::pos2(c.x - 5.0, c.y), egui::pos2(c.x + 5.0, c.y)], stroke);
+                p.line_segment(
+                    [egui::pos2(c.x - 5.5, c.y), egui::pos2(c.x + 5.5, c.y)],
+                    stroke,
+                );
             }
             WindowGlyph::Maximize => {
                 p.rect_stroke(
-                    egui::Rect::from_center_size(c, egui::vec2(11.0, 11.0)),
-                    1.0,
+                    egui::Rect::from_center_size(c, egui::vec2(12.0, 12.0)),
+                    3.0,
                     stroke,
                 );
             }
             WindowGlyph::Close => {
                 p.line_segment(
-                    [c - egui::vec2(4.5, 4.5), c + egui::vec2(4.5, 4.5)],
+                    [c - egui::vec2(5.0, 5.0), c + egui::vec2(5.0, 5.0)],
                     stroke,
                 );
                 p.line_segment(
-                    [c + egui::vec2(4.5, -4.5), c - egui::vec2(4.5, -4.5)],
+                    [c + egui::vec2(5.0, -5.0), c - egui::vec2(5.0, -5.0)],
                     stroke,
                 );
             }
@@ -3908,6 +3942,7 @@ let window = event_loop.create_window(
         current_path: Option<&Path>,
         actions: &mut Vec<UiAction>,
         opened_at: Option<std::time::Instant>,
+        menu_rect_out: &mut Option<egui::Rect>,
     ) -> bool {
         let mut close = false;
 
@@ -4003,7 +4038,7 @@ let window = event_loop.create_window(
 
         match menu {
             CtxMenu::Image { pos } => {
-                window.fixed_pos(*pos).show(ctx, |ui| {
+                let resp = window.fixed_pos(*pos).show(ctx, |ui| {
                     if item(ui, "复制图片路径", UiAction::CopyPath) { close = true; }
                     if item(ui, "在资源管理器中打开", UiAction::OpenInExplorer) { close = true; }
                     if item(ui, "打印", UiAction::Print) { close = true; }
@@ -4014,9 +4049,10 @@ let window = event_loop.create_window(
                         }
                     }
                 });
+                *menu_rect_out = Some(resp.unwrap().response.rect);
             }
             CtxMenu::Tree { pos, path, root_idx, is_favorite } => {
-                window.fixed_pos(*pos).show(ctx, |ui| {
+                let resp = window.fixed_pos(*pos).show(ctx, |ui| {
                     if item(ui, "在资源管理器中打开", UiAction::RevealInExplorer(path.clone())) { close = true; }
                     if *is_favorite {
                         if item(ui, "取消收藏", UiAction::RemoveFavorite(path.clone())) { close = true; }
@@ -4030,6 +4066,7 @@ let window = event_loop.create_window(
                         if item(ui, "在目录树中定位", UiAction::RevealInTree(path.clone())) { close = true; }
                     }
                 });
+                *menu_rect_out = Some(resp.unwrap().response.rect);
             }
         }
 
@@ -5152,7 +5189,20 @@ impl ApplicationHandler for MainWindow {
                 let over_bar = self
                     .fullscreen_bar_rect
                     .map_or(false, |r| r.contains(egui::pos2(clx, cly)));
-                viewer_hit && !over_drawer && !over_bar
+                // Clicks on an open egui overlay that floats over the central
+                // (viewer) panel — settings dropdown, right-click menu, or the
+                // shortcuts popover — must also reach egui. Without this, a
+                // left-press over the viewer region is consumed by the pan
+                // branch below (which `return`s before the event reaches
+                // `forward_to_egui`), so menu items over the viewer were
+                // unclickable while the same items over the thumbs worked.
+                let pt = egui::pos2(clx, cly);
+                let over_settings = self.show_settings_menu
+                    && self.settings_menu_rect.map_or(false, |r| r.contains(pt));
+                let over_ctx = self.ctx_menu_rect.map_or(false, |r| r.contains(pt));
+                let over_help = self.show_shortcut_help
+                    && self.shortcut_help_rect.map_or(false, |r| r.contains(pt));
+                viewer_hit && !over_drawer && !over_bar && !over_settings && !over_ctx && !over_help
             } else {
                 false
             };
