@@ -3117,14 +3117,14 @@ let window = event_loop.create_window(
             );
             if selected {
                 ui.painter().rect_filled(rect, 6.0, pal.selected_card_fill);
-                // Left accent bar — a darker indigo strip on the leading
-                // edge to anchor the highlight. Same color as the border so
-                // the card reads as one shape, not two.
+                // Left accent bar — a slim darker indigo strip on the leading
+                // edge, inset vertically so it doesn't collide with the
+                // rounded corners of the card (matches Linear's row marker).
                 let bar = egui::Rect::from_min_size(
-                    rect.min,
-                    egui::vec2(3.0, rect.height()),
+                    egui::pos2(rect.left() + 2.0, rect.top() + 3.0),
+                    egui::vec2(2.0, rect.height() - 6.0),
                 );
-                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+                ui.painter().rect_filled(bar, 1.0, pal.selected_card_stroke);
                 // Linear-style edge shine: a faint accent glow along the
                 // leading edge to lift the selected row off the panel.
                 crate::effects::paint_edge_shine(
@@ -3236,10 +3236,10 @@ let window = event_loop.create_window(
             if dir_selected && !this_pc_expanded {
                 ui.painter().rect_filled(dir_selected_rect, 6.0, pal.selected_card_fill);
                 let bar = egui::Rect::from_min_size(
-                    dir_selected_rect.min,
-                    egui::vec2(3.0, dir_selected_rect.height()),
+                    egui::pos2(dir_selected_rect.left() + 2.0, dir_selected_rect.top() + 3.0),
+                    egui::vec2(2.0, dir_selected_rect.height() - 6.0),
                 );
-                ui.painter().rect_filled(bar, 0.0, pal.selected_card_stroke);
+                ui.painter().rect_filled(bar, 1.0, pal.selected_card_stroke);
                 crate::effects::paint_edge_shine(
                     ui.painter(), dir_selected_rect, pal.selected_card_stroke, 36,
                 );
