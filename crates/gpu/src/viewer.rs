@@ -444,6 +444,7 @@ impl Direct2DViewer {
     pub fn on_wheel(&mut self, delta: i32, cursor_x: f32, cursor_y: f32) {
         let zoom_factor = if delta > 0 { 1.1 } else { 1.0 / 1.1 };
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let new_zoom = if new_zoom == self.zoom { return; } else { new_zoom };
         // cursor is in WINDOW physical coords (router.cursor_pos); the
         // image centre offset is viewer-LOCAL, so shift by the viewport
         // origin first. Otherwise zoom-to-cursor lands off (e.g. with a
@@ -453,24 +454,42 @@ impl Direct2DViewer {
         let cy = cursor_y - self.viewport_origin.1;
         let cursor_rel_x = cx - self.offset_x;
         let cursor_rel_y = cy - self.offset_y;
-        self.offset_x = cx - cursor_rel_x * (new_zoom / self.zoom);
-        self.offset_y = cy - cursor_rel_y * (new_zoom / self.zoom);
-        self.zoom = new_zoom;
+        let target_off_x = cx - cursor_rel_x * (new_zoom / self.zoom);
+        let target_off_y = cy - cursor_rel_y * (new_zoom / self.zoom);
         self.is_fit = false;
-        self.clamp_pan();
+        // Animate the zoom (offset + size interpolated together) so wheel
+        // zoom is smooth like a pinch instead of stepping per notch.
+        if self.current_gpu.is_some() {
+            let (ew, eh) = self.effective_size();
+            self.start_rect_anim((target_off_x, target_off_y, ew * new_zoom, eh * new_zoom));
+        } else {
+            self.offset_x = target_off_x;
+            self.offset_y = target_off_y;
+            self.zoom = new_zoom;
+        }
         self.animator.reset();
     }
 
     pub fn zoom_step(&mut self, factor: f32) {
-        self.zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let new_zoom = (self.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        if new_zoom == self.zoom {
+            return;
+        }
         let cx = self.viewport_w as f32 * 0.5;
         let cy = self.viewport_h as f32 * 0.5;
         let rel_x = cx - self.offset_x;
         let rel_y = cy - self.offset_y;
-        self.offset_x = cx - rel_x * factor;
-        self.offset_y = cy - rel_y * factor;
+        let target_off_x = cx - rel_x * (new_zoom / self.zoom);
+        let target_off_y = cy - rel_y * (new_zoom / self.zoom);
         self.is_fit = false;
-        self.clamp_pan();
+        if self.current_gpu.is_some() {
+            let (ew, eh) = self.effective_size();
+            self.start_rect_anim((target_off_x, target_off_y, ew * new_zoom, eh * new_zoom));
+        } else {
+            self.offset_x = target_off_x;
+            self.offset_y = target_off_y;
+            self.zoom = new_zoom;
+        }
         self.animator.reset();
     }
 
@@ -551,8 +570,7 @@ impl Direct2DViewer {
         if self.current_gpu.is_none() {
             return;
         }
-        let (ew, eh) = self.effective_size();
-        let from = (self.offset_x, self.offset_y, ew * self.zoom, eh * self.zoom);
+        let from = self.anim_rect();
         if (from.2 - target.2).abs() < 0.5 && (from.0 - target.0).abs() < 0.5 {
             return;
         }
@@ -563,6 +581,29 @@ impl Direct2DViewer {
             dur: 0.28,
             window_space: false,
         });
+    }
+
+    /// The current image rect (offset_x, offset_y, ew·zoom, eh·zoom). If a
+    /// rect-anim is mid-flight this returns the INTERPOLATED rect so a new
+    /// zoom (e.g. another wheel notch during the animation) chains from the
+    /// on-screen position instead of snapping back to the settled value.
+    fn anim_rect(&self) -> (f32, f32, f32, f32) {
+        if let Some(anim) = &self.rect_anim {
+            let raw = (anim.start.elapsed().as_secs_f32() / anim.dur).min(1.0);
+            let t = if raw < 0.5 {
+                4.0 * raw * raw * raw
+            } else {
+                1.0 - (-2.0 * raw + 2.0).powi(3) / 2.0
+            };
+            return (
+                anim.from.0 + (anim.to.0 - anim.from.0) * t,
+                anim.from.1 + (anim.to.1 - anim.from.1) * t,
+                anim.from.2 + (anim.to.2 - anim.from.2) * t,
+                anim.from.3 + (anim.to.3 - anim.from.3) * t,
+            );
+        }
+        let (ew, eh) = self.effective_size();
+        (self.offset_x, self.offset_y, ew * self.zoom, eh * self.zoom)
     }
 
     pub fn mark_viewport_transition(&mut self) {
@@ -737,21 +778,9 @@ impl Direct2DViewer {
     /// image-quad uniform each frame.
     pub fn current_rect_anim_transform(&self) -> Option<AffineTransform> {
         let anim = self.rect_anim.as_ref()?;
-        let raw = (anim.start.elapsed().as_secs_f32() / anim.dur).min(1.0);
-        let t = if raw < 0.5 {
-            4.0 * raw * raw * raw
-        } else {
-            1.0 - (-2.0 * raw + 2.0).powi(3) / 2.0
-        };
         let (ew, _eh) = self.effective_size();
-        let disp_w = ew;
-        let r = (
-            anim.from.0 + (anim.to.0 - anim.from.0) * t,
-            anim.from.1 + (anim.to.1 - anim.from.1) * t,
-            anim.from.2 + (anim.to.2 - anim.from.2) * t,
-            anim.from.3 + (anim.to.3 - anim.from.3) * t,
-        );
-        let s = if disp_w > 0.0 { r.2 / disp_w } else { 1.0 };
+        let r = self.anim_rect();
+        let s = if ew > 0.0 { r.2 / ew } else { 1.0 };
         if anim.window_space {
             Some(self.display_transform(
                 r.0 - self.viewport_origin.0,

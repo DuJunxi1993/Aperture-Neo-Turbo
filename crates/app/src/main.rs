@@ -12,6 +12,7 @@ mod file_tree;
 mod texture_cache;
 mod path_shorten;
 mod effects;
+mod icons;
 mod theme;
 
 fn main() -> Result<()> {

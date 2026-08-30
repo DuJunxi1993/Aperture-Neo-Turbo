@@ -327,8 +327,8 @@ pub fn light_palette() -> Palette { Palette {
     thumb_placeholder: egui::Color32::from_rgb(226, 228, 231),
     key_hint: egui::Color32::from_rgb(0x5e, 0x6a, 0xd2),
     help_desc: egui::Color32::from_rgb(60, 63, 68),
-    canvas_clear: (0.953, 0.957, 0.961),
-    d2d_clear: [0.953, 0.957, 0.961],
+    canvas_clear: (0.965, 0.965, 0.965),
+    d2d_clear: [0.965, 0.965, 0.965],
     }
 }
 
@@ -1466,9 +1466,16 @@ let window = event_loop.create_window(
     }
 
     fn handle_double_click(&mut self) {
+        // Toggle fit ↔ 1:1 (mirrors the Fit button / FitOrOriginal action):
+        // double-clicking a fitted image zooms to 100%, double-clicking a
+        // zoomed image re-fits.
         if let Some(v_arc) = self.viewer.as_ref() {
-            let mut v = v_arc.lock();
-            v.fit_to_screen();
+            let mut g = v_arc.lock();
+            if g.is_fit_scale() {
+                g.zoom_1_to_1();
+            } else {
+                g.fit_to_screen();
+            }
         }
         if let Some(window) = &self.window { window.request_redraw(); }
     }
@@ -2831,12 +2838,12 @@ let window = event_loop.create_window(
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         left_row.add_space(14.0);
-        if nav_btn(&mut left_row, "后退") { actions.push(UiAction::Prev); }
-        if nav_btn(&mut left_row, "前进") { actions.push(UiAction::Next); }
+        if nav_btn(&mut left_row, "Back") { actions.push(UiAction::Prev); }
+        if nav_btn(&mut left_row, "Forward") { actions.push(UiAction::Next); }
         left_row.add_space(8.0);
         left_row.add(egui::Separator::default().vertical().spacing(8.0));
         left_row.add_space(8.0);
-        if neutral_btn(&mut left_row, "适应/1:1") { actions.push(UiAction::FitOrOriginal); }
+        if neutral_btn(&mut left_row, "Fit") { actions.push(UiAction::FitOrOriginal); }
         left_row.add_space(4.0);
         let slide_glyph = if slide_show_running { "⏸" } else { "⏵" };
         if neutral_btn(&mut left_row, slide_glyph) { actions.push(UiAction::ToggleSlideShow); }
@@ -2971,45 +2978,41 @@ let window = event_loop.create_window(
                 actions.push(UiAction::ToggleThumbs);
             }
 
-            // Window controls, right-aligned, vertically centered.
+            // Window controls + utility buttons, right-aligned, unified 30px
+            // height (benchmark = the Tree/Thumbs buttons). Even spacing
+            // within each group; a slightly larger gap separates the window
+            // controls (close/max/min) from the utility buttons (gear/theme/help).
             content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.add_space(2.0);
+                ui.add_space(10.0);
                 if Self::window_control(ui, "close-btn", WindowGlyph::Close, true, pal) {
                     actions.push(UiAction::ExitApp);
                 }
+                ui.add_space(2.0);
                 if Self::window_control(ui, "max-btn", WindowGlyph::Maximize, false, pal) {
                     actions.push(UiAction::ToggleMaximize);
                 }
+                ui.add_space(2.0);
                 if Self::window_control(ui, "min-btn", WindowGlyph::Minimize, false, pal) {
                     actions.push(UiAction::MinimizeWindow);
                 }
+                ui.add_space(10.0);
                 // Settings dropdown button (⚙). Opens a Linear-style
                 // menu anchored below it for global prefs: clear recents,
                 // clear favorites, follow-system theme, and sidebar-on-
                 // launch toggle.
                 let (srect, sresp) = ui.allocate_exact_size(
-                    egui::vec2(32.0, 30.0),
+                    egui::vec2(42.0, 30.0),
                     egui::Sense::click(),
                 );
                 if sresp.hovered() {
-                    ui.painter().rect_filled(srect, 6.0, pal.hover_fill);
+                    ui.painter().rect_filled(srect, 4.0, pal.hover_fill);
                 }
                 SETTINGS_ANCHOR.with(|c| c.set(srect));
                 if sresp.clicked() {
                     actions.push(UiAction::ToggleSettings);
                 }
-                let sc = srect.center();
-                let p = ui.painter();
-                // Simple gear: three short radial spokes around a hub.
-                let stroke = egui::Stroke::new(1.3_f32, pal.text_secondary);
-                for ang in [0.0_f32, std::f32::consts::FRAC_PI_3, 2.0 * std::f32::consts::FRAC_PI_3] {
-                    let dir = egui::vec2(ang.cos(), ang.sin());
-                    p.line_segment(
-                        [sc - dir * 6.0, sc + dir * 6.0],
-                        stroke,
-                    );
-                }
-                p.circle_stroke(sc, 4.2, stroke);
+                crate::icons::gear(ui.painter(), srect, pal.text_secondary);
+                ui.add_space(2.0);
                 // Phase 4: theme toggle — modernised "circle + offset
                 // dot" glyph (was the half-moon painter-drawn in
                 // earlier commits). Renders as a small filled disc
@@ -3018,11 +3021,11 @@ let window = event_loop.create_window(
                 // heavy outline of the previous half-moon, fitting
                 // the Linear minimal language. Behaviour unchanged.
                 let (trect, tresp) = ui.allocate_exact_size(
-                    egui::vec2(32.0, 30.0),
+                    egui::vec2(42.0, 30.0),
                     egui::Sense::click(),
                 );
                 if tresp.hovered() {
-                    ui.painter().rect_filled(trect, 6.0, pal.hover_fill);
+                    ui.painter().rect_filled(trect, 4.0, pal.hover_fill);
                 }
                 let tc = trect.center();
                 let p = ui.painter();
@@ -3035,27 +3038,21 @@ let window = event_loop.create_window(
                 if tresp.clicked() {
                     actions.push(UiAction::ToggleTheme);
                 }
+                ui.add_space(2.0);
                 // Phase 4: `?` keyboard-shortcuts button. Lives in
                 // the title bar (next to the theme toggle) per the
                 // spec — always reachable regardless of whether
-                // the bottom bar is collapsed. Renders as a 32x30
-                // chip with a `?` glyph. Click → UiAction::
+                // the bottom bar is collapsed. Click → UiAction::
                 // ToggleShortcutHelp, which the same handler as
                 // the bottom-bar `?` button dispatches.
                 let (hrect, hresp) = ui.allocate_exact_size(
-                    egui::vec2(32.0, 30.0),
+                    egui::vec2(42.0, 30.0),
                     egui::Sense::click(),
                 );
                 if hresp.hovered() {
-                    ui.painter().rect_filled(hrect, 6.0, pal.hover_fill);
+                    ui.painter().rect_filled(hrect, 4.0, pal.hover_fill);
                 }
-                ui.painter().text(
-                    hrect.center(),
-                    egui::Align2::CENTER_CENTER,
-                    "?",
-                    egui::FontId::proportional(15.0),
-                    pal.text_secondary,
-                );
+                crate::icons::help(ui.painter(), hrect, pal.text_secondary);
                 // Phase 8: write HELP_ANCHOR here so the shortcut
                 // help popover anchors to the TOP-BAR `?` button
                 // (its current home). Without this, the popover
@@ -3084,18 +3081,19 @@ let window = event_loop.create_window(
     /// fallback issues). Returns true when clicked.
     ///
     /// Linear-style: a subtle hover fill (rounded) on neutral buttons; the
-    /// close button fills red (#c42b1c) on hover and its X glyph turns white.
-    /// Glyphs are rounded to feel modern (minimise = rounded bar, maximize =
-    /// rounded square outline, close = X).
+    /// close button fills Linear red (#e5484d) on hover and its X glyph turns
+    /// white. Glyphs are rounded to feel modern (minimise = rounded bar,
+    /// maximize = rounded square outline, close = X). Unified 30px height to
+    /// match the Tree/Thumbs benchmark.
     fn window_control(ui: &mut egui::Ui, _id: &str, glyph: WindowGlyph, danger: bool, pal: &Palette) -> bool {
         let (rect, resp) = ui.allocate_exact_size(
-            egui::vec2(42.0, TOOLBAR_HEIGHT as f32),
+            egui::vec2(42.0, 30.0),
             egui::Sense::click(),
         );
         let hovered = resp.hovered();
         if hovered {
             let bg = if danger {
-                egui::Color32::from_rgb(196, 43, 28)
+                egui::Color32::from_rgb(0xe5, 0x48, 0x4d)
             } else {
                 pal.hover_fill
             };
@@ -3210,38 +3208,18 @@ let window = event_loop.create_window(
                     // window controls' 1.5px round-cap style. Reads as
                     // "back home / top of list" more naturally than a
                     // bare triangle.
-                    // Phase 13: stroked two-piece house → FILLED house
-                    // pentagon (apex → right eave → right floor → left
-                    // floor → left eave). A solid silhouette reads
-                    // unmistakably as "home" at 20px, unlike the stroked
-                    // roof+rect which rendered as a triangle perched on
-                    // an unrelated box. The pentagon is convex, so a
-                    // single convex_polygon shape suffices.
+                    // Current: stroked rounded house outline (+ interior
+                    // door bar), matching the supplied Linear-style home
+                    // glyph. Drawn as vector points (rounded corners baked
+                    // in) so colour follows the theme.
                     let (rect, btn_resp) = ui.allocate_exact_size(
-                        egui::vec2(20.0, 20.0),
+                        egui::vec2(22.0, 22.0),
                         egui::Sense::click(),
                     );
                     if btn_resp.hovered() {
                         ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
                     }
-                    let cx = rect.center().x;
-                    let apex_y = rect.top() + 3.0;
-                    let eave_y = rect.center().y - 0.5;
-                    let floor_y = rect.bottom() - 4.0;
-                    let body_l = rect.left() + 4.0;
-                    let body_r = rect.right() - 4.0;
-                    let house = [
-                        egui::pos2(cx, apex_y),
-                        egui::pos2(body_r, eave_y),
-                        egui::pos2(body_r, floor_y),
-                        egui::pos2(body_l, floor_y),
-                        egui::pos2(body_l, eave_y),
-                    ];
-                    ui.painter().add(egui::Shape::convex_polygon(
-                        house.to_vec(),
-                        pal.text_secondary,
-                        egui::Stroke::NONE,
-                    ));
+                    crate::icons::home(ui.painter(), rect, pal.text_secondary);
                     let btn_resp = btn_resp.on_hover_cursor(egui::CursorIcon::PointingHand)
                         .on_hover_text("Back to top");
                     if btn_resp.clicked() {
