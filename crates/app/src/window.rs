@@ -1785,21 +1785,36 @@ let window = event_loop.create_window(
                 egui::vec2(egui_state.ctx.input(|i| i.screen_rect.width()), bar_h),
             );
             let bar_w = egui_state.ctx.input(|i| i.screen_rect.width());
+            // egui 0.29 TopBottomPanel has no `.order()`, so it would reserve
+            // layout space from the CentralPanel (the original D1 bottom-gap
+            // bug). A Foreground Area is the right "floating" primitive, but
+            // its content ui starts with a degenerate max_rect (draw_fullscreen_bar
+            // reads ui.max_rect() for the bar height -> it collapsed to a thin
+            // strip). We fix that by sizing the content ui explicitly with a
+            // child UiBuilder whose max_rect is the full bar rect in AREA-LOCAL
+            // coords (the Area's origin is fixed_pos, so local top-left = ZERO).
             let bar_resp = egui::Area::new(egui::Id::new("overlay_toolbar"))
                 .order(egui::Order::Foreground)
                 .fixed_pos(bar_rect_outer.min)
-                // Give the Area its actual size so ui.max_rect() (which
-                // draw_fullscreen_bar reads for the bar height) is correct
-                // instead of degenerating to ~0 and clipping every button.
-                .default_size(egui::vec2(bar_w, bar_h))
                 .show(&egui_state.ctx, |ui| {
-                    let area_rect = ui.max_rect();
-                    ui.set_clip_rect(area_rect);
-                    ui.allocate_rect(area_rect, egui::Sense::hover());
-                    // Semi-transparent surface behind the row, over the
-                    // area's own rect (local coords).
-                    ui.painter().rect_filled(
-                        area_rect,
+                    let mut content = ui.new_child(
+                        egui::UiBuilder::new()
+                            .max_rect(egui::Rect::from_min_size(
+                                egui::Pos2::ZERO,
+                                egui::vec2(bar_w, bar_h),
+                            ))
+                            .id_salt("overlay_bar_content"),
+                    );
+                    content.set_clip_rect(egui::Rect::from_min_size(
+                        egui::Pos2::ZERO,
+                        egui::vec2(bar_w, bar_h),
+                    ));
+                    content.allocate_rect(
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(bar_w, bar_h)),
+                        egui::Sense::hover(),
+                    );
+                    content.painter().rect_filled(
+                        egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(bar_w, bar_h)),
                         0.0,
                         egui::Color32::from_rgba_unmultiplied(
                             pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(),
@@ -1807,7 +1822,7 @@ let window = event_loop.create_window(
                         ),
                     );
                     Self::draw_fullscreen_bar(
-                        ui, &mut state.actions, &state.current_path,
+                        &mut content, &mut state.actions, &state.current_path,
                         state.nav_idx, state.nav_count2, state.current_size, state.zoom_pct,
                         &pal, true, self.slide_show_running,
                     );
