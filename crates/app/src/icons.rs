@@ -11,10 +11,11 @@ use egui::{Color32, Painter, Pos2, Rect, Shape, Stroke, Vec2};
 /// The side of the square box all icons live in. Buttons are non-square
 /// (e.g. 42×30), so scale by the SMALLER edge and centre the box — otherwise a
 /// width-based radius overflows the button height and clips into a stray line.
-/// The 0.70 factor leaves ~30% internal padding so the glyph sits compact and
-/// centred (Linear-style) instead of nearly filling the button.
+/// The 0.56 factor keeps the glyph compact and centred (Linear-style), sized
+/// to match the theme-toggle moon (a 7px-radius disc) for a consistent visual
+/// weight across the titlebar.
 fn icon_side(rect: Rect) -> f32 {
-    rect.width().min(rect.height()) * 0.70
+    rect.width().min(rect.height()) * 0.56
 }
 
 /// Expand a normalized point (in `[-0.5, 0.5]`) into a centred square box of
@@ -91,6 +92,11 @@ pub fn gear(painter: &Painter, rect: Rect, color: Color32) {
         arc_into(&mut pts, cx, outer_r, a_mid - 0.05, a_mid + 0.05, 3);
         arc_into(&mut pts, cx, outer_r - tooth_h, a_mid + 0.05, a1, 5);
     }
+    // Drop the final sample at angle TAU: in f32 it numerically equals the
+    // first point (angle 0), so `closed_line` would close with a zero-length
+    // degenerate edge whose miter join spikes into a stray line on the gear's
+    // right side. Removing it lets the auto-close bridge the remaining arc.
+    pts.pop();
     painter.add(Shape::closed_line(pts, stroke));
     painter.circle_stroke(cx, outer_r * 0.36, stroke);
 }

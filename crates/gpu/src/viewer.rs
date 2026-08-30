@@ -474,7 +474,7 @@ impl Direct2DViewer {
         // zooms. Applied directly (no easing) so the wheel is fully linear and
         // tracks the hand — "手停即停".
         let clamped = (delta as f32).clamp(-1200.0, 1200.0) / 100.0;
-        let zoom_factor = 1.5_f32.powf(clamped);
+        let zoom_factor = 1.25_f32.powf(clamped);
         let new_zoom = (self.zoom * zoom_factor).clamp(MIN_ZOOM, MAX_ZOOM);
         if new_zoom == self.zoom { return; }
         // cursor is in WINDOW physical coords (router.cursor_pos); the

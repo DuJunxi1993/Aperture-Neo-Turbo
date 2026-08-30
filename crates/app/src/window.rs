@@ -3230,7 +3230,7 @@ let window = event_loop.create_window(
                     // glyph. Drawn as vector points (rounded corners baked
                     // in) so colour follows the theme.
                     let (rect, btn_resp) = ui.allocate_exact_size(
-                        egui::vec2(22.0, 22.0),
+                        egui::vec2(30.0, 30.0),
                         egui::Sense::click(),
                     );
                     if btn_resp.hovered() {
@@ -4870,7 +4870,7 @@ impl ApplicationHandler for MainWindow {
                                 // continuous linear zoom as the wheel; a fresh
                                 // press is a single stepped zoom.
                                 if key_event.repeat {
-                                    v.lock().zoom_continuous(1.03);
+                                    v.lock().zoom_continuous(1.05);
                                 } else {
                                     v.lock().zoom_step(1.25);
                                 }
@@ -4880,7 +4880,7 @@ impl ApplicationHandler for MainWindow {
                         KeyCode::Minus | KeyCode::NumpadSubtract if ctrl_pressed => {
                             if let Some(v) = &self.viewer {
                                 if key_event.repeat {
-                                    v.lock().zoom_continuous(1.0 / 1.03);
+                                    v.lock().zoom_continuous(1.0 / 1.05);
                                 } else {
                                     v.lock().zoom_step(1.0 / 1.25);
                                 }
