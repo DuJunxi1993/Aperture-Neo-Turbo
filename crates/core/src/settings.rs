@@ -26,15 +26,21 @@ pub struct SettingsData {
     /// Favorite folders (for quick access in tree)
     #[serde(default)]
     pub favorite_folders: Vec<PathBuf>,
-    /// UI theme: "dark" | "light" (None = dark). "system" reserved.
+    /// UI theme: "dark" | "light" | "system" | None (defaults to dark).
     #[serde(default)]
     pub theme: Option<String>,
+    /// Show the tree/folder sidebar on launch (default true). Used to give
+    /// the user a choice of a minimal single-image view on startup.
+    #[serde(default)]
+    pub show_tree_on_launch: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ThemeSetting {
     Dark,
     Light,
+    /// Follow the OS light/dark preference.
+    System,
 }
 
 impl ThemeSetting {
@@ -42,6 +48,7 @@ impl ThemeSetting {
         match self {
             Self::Dark => Self::Light,
             Self::Light => Self::Dark,
+            Self::System => Self::Dark, // cycle System -> Dark for the toggle
         }
     }
 }
@@ -111,11 +118,11 @@ impl SettingsStore {
         self.data.lock().favorite_folders.clone()
     }
 
-    /// UI theme — defaults to dark. "system" is reserved for future
-    /// follow-the-OS support.
+    /// UI theme — defaults to dark. "system" follows the OS preference.
     pub fn theme(&self) -> crate::settings::ThemeSetting {
         match self.data.lock().theme.as_deref() {
             Some("light") => ThemeSetting::Light,
+            Some("system") => ThemeSetting::System,
             _ => ThemeSetting::Dark,
         }
     }
@@ -124,7 +131,40 @@ impl SettingsStore {
         self.data.lock().theme = Some(match theme {
             ThemeSetting::Dark => "dark".into(),
             ThemeSetting::Light => "light".into(),
+            ThemeSetting::System => "system".into(),
         });
+        let _ = self.save();
+    }
+
+    /// Wildcard "the OS should decide" theme — the resolved dark/light is
+    /// applied separately based on the system preference.
+    pub fn is_theme_system(&self) -> bool {
+        self.theme() == ThemeSetting::System
+    }
+
+    /// Clear all recent-folder history.
+    pub fn clear_recent(&self) {
+        let mut d = self.data.lock();
+        d.recent_folders.clear();
+        drop(d);
+        let _ = self.save();
+    }
+
+    /// Clear all favorite folders.
+    pub fn clear_favorites(&self) {
+        let mut d = self.data.lock();
+        d.favorite_folders.clear();
+        drop(d);
+        let _ = self.save();
+    }
+
+    /// Whether to show the tree sidebar on launch (defaults to true).
+    pub fn show_tree_on_launch(&self) -> bool {
+        self.data.lock().show_tree_on_launch.unwrap_or(true)
+    }
+
+    pub fn set_show_tree_on_launch(&self, show: bool) {
+        self.data.lock().show_tree_on_launch = Some(show);
         let _ = self.save();
     }
 

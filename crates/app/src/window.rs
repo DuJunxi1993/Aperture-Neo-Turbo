@@ -176,6 +176,16 @@ enum UiAction {
     /// Copy a folder path to the clipboard (used by the tree header's
     /// double-click path label).
     CopyFolderPath(PathBuf),
+    /// Settings dropdown: open/close the ⚙ settings menu.
+    ToggleSettings,
+    /// Settings dropdown: clear all recently-opened folders.
+    SettingsClearRecent,
+    /// Settings dropdown: clear all favorite folders.
+    SettingsClearFavorites,
+    /// Settings dropdown: enable/disable follow-system theme.
+    SettingsThemeSystem,
+    /// Settings dropdown: toggle showing the tree sidebar on launch.
+    SettingsSidebarOnLaunch,
     /// Phase 8: open the print dialog for the current image.
     Print,
 }
@@ -184,6 +194,9 @@ enum UiAction {
 // anchors directly above it.
 thread_local! {
     static HELP_ANCHOR: std::cell::Cell<egui::Rect> = const { std::cell::Cell::new(egui::Rect::NOTHING) };
+    /// Rect of the title-bar ⚙ settings button, used to anchor the
+    /// settings dropdown below it (right-aligned).
+    static SETTINGS_ANCHOR: std::cell::Cell<egui::Rect> = const { std::cell::Cell::new(egui::Rect::NOTHING) };
     /// Sticky vertical scroll offset of the thumbnail ScrollArea
     /// (logical px). Shared across the static draw_thumbs_panel_static
     /// helper and the window_event wheel branch.
@@ -247,6 +260,22 @@ pub struct Palette {
     pub canvas_clear: (f64, f64, f64),
     /// D2D viewer letterbox color.
     pub d2d_clear: [f32; 3],
+}
+
+/// Resolve a theme into an effective Light/Dark (follows the OS preference
+/// when `System`). Free fn (no `&self`) so the egui frame build can call it
+/// while `self.egui_state` is mutably borrowed.
+fn resolve_theme(theme: Theme) -> Theme {
+    match theme {
+        Theme::System => {
+            if crate::theme::system_theme_is_light() {
+                Theme::Light
+            } else {
+                Theme::Dark
+            }
+        }
+        other => other,
+    }
 }
 
 pub fn dark_palette() -> Palette { Palette {
@@ -417,6 +446,8 @@ pub struct MainWindow {
 
     // ── UI chrome / animation state ──────────────────────────────
     show_shortcut_help: bool,
+    /// Whether the title-bar ⚙ settings dropdown is open.
+    show_settings_menu: bool,
     chrome_visible: bool,
     chrome_hide_at: Option<std::time::Instant>,
     chrome_move_accum: f32,
@@ -560,7 +591,10 @@ impl MainWindow {
 
         // Single-image launch: hide chrome, navigate to the parent folder
         // and select the dropped/opened file.
-        let mut show_tree = true;
+        // Sidebar visibility on launch respects the persisted setting
+        // (default true); single-image launch forces both off below.
+        let show_tree_init = settings.show_tree_on_launch();
+        let mut show_tree = show_tree_init;
         let mut show_thumbs = true;
         let mut single_image_size: Option<(u32, u32)> = None;
         let folder = match target {
@@ -634,6 +668,7 @@ impl MainWindow {
             nav_press_at: None,
             initial_folder: folder,
             show_shortcut_help: false,
+            show_settings_menu: false,
             chrome_visible: true,
             chrome_hide_at: None,
             chrome_move_accum: 0.0,
@@ -668,9 +703,12 @@ impl MainWindow {
 
     /// Active color palette for the current theme.
     fn pal(&self) -> Palette {
-        match self.theme {
+        match resolve_theme(self.theme) {
             Theme::Dark => dark_palette(),
             Theme::Light => light_palette(),
+            // resolve_theme never returns System, but the compiler needs
+            // the arm.
+            Theme::System => dark_palette(),
         }
     }
 
@@ -1641,9 +1679,14 @@ let window = event_loop.create_window(
         egui_state.ctx.begin_pass(raw_input);
 
         // Apply egui visuals when the theme changes (toggle or startup).
-        if self.applied_visuals != Some(self.theme) {
-            self.applied_visuals = Some(self.theme);
-            let mut visuals = match self.theme {
+        // `System` resolves to the OS preference, so we compare the resolved
+        // value to avoid re-applying identical visuals every frame.
+        // `resolve_theme` is a free fn (no &self) so it can run while
+        // `self.egui_state` is mutably borrowed.
+        let resolved = resolve_theme(self.theme);
+        if self.applied_visuals != Some(resolved) {
+            self.applied_visuals = Some(resolved);
+            let mut visuals = match resolved {
                 Theme::Light => {
                     let mut v = egui::Visuals::light();
                     v.panel_fill = egui::Color32::from_rgb(246, 246, 246);
@@ -1651,7 +1694,7 @@ let window = event_loop.create_window(
                     v.override_text_color = Some(egui::Color32::from_rgb(26, 27, 30));
                     v
                 }
-                Theme::Dark => {
+                Theme::Dark | Theme::System => {
                     let mut v = egui::Visuals::dark();
                     v.panel_fill = egui::Color32::from_rgb(15, 16, 17);
                     v.window_fill = v.panel_fill;
@@ -1670,7 +1713,7 @@ let window = event_loop.create_window(
             visuals.widgets.noninteractive.bg_fill = egui::Color32::TRANSPARENT;
             visuals.window_shadow = egui::epaint::Shadow::NONE;
             visuals.popup_shadow = egui::epaint::Shadow::NONE;
-            egui_state.ctx.set_visuals(visuals);
+            egui_ctx.set_visuals(visuals);
         }
 
         // Frame delta for UI animations (panel widths, chrome fade).
@@ -1959,6 +2002,102 @@ let window = event_loop.create_window(
         // released here so draw_context_menu can take &mut self.actions
         // and self.pal()/self.nav.lock() can take &self without
         // conflicting.
+        }
+
+        // ----- SETTINGS DROPDOWN (Linear-style) -----
+        // Opens from the ⚙ title-bar button, anchored below/right-aligned
+        // to it. Offers global prefs: clear recents, clear favorites,
+        // follow-system theme, and sidebar-on-launch. Uses `egui_ctx` (a
+        // clone) so we can dispatch actions via &mut self without the
+        // egui_state borrow.
+        if self.show_settings_menu {
+            let pal = self.pal();
+            let theme_system = self.settings.is_theme_system();
+            let sidebar_on_launch = self.settings.show_tree_on_launch();
+            let anchor = SETTINGS_ANCHOR.with(|c| c.get());
+            let anchor_valid = !(anchor.any_nan() || anchor == egui::Rect::NOTHING);
+            let menu_w = 220.0_f32;
+            let pos = if anchor_valid {
+                egui::pos2(anchor.max.x - menu_w, anchor.max.y + 4.0)
+            } else {
+                egui::pos2(16.0, (TOOLBAR_HEIGHT as f32) + 4.0)
+            };
+            let menu_frame = egui::Frame::default()
+                .fill(egui::Color32::from_rgba_unmultiplied(
+                    pal.panel_bg.r(), pal.panel_bg.g(), pal.panel_bg.b(), 235,
+                ))
+                .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
+                .rounding(egui::Rounding::same(8.0))
+                .inner_margin(egui::Margin::same(6.0))
+                .shadow(egui::Shadow {
+                    spread: 0.0,
+                    color: egui::Color32::from_rgba_unmultiplied(0, 0, 0, 120),
+                    offset: egui::vec2(0.0, 4.0),
+                    blur: 24.0,
+                });
+            let mut close_menu = false;
+            let mut settings_action: Option<UiAction> = None;
+            let mut settings_win = egui::Window::new("");
+            settings_win = settings_win
+                .frame(menu_frame)
+                .order(egui::Order::Foreground)
+                .fixed_pos(pos)
+                .default_width(menu_w)
+                .resizable(false)
+                .collapsible(false)
+                .title_bar(false);
+            let make_item = |ui: &mut egui::Ui, label: &str, checked: Option<bool>| -> bool {
+                let row_h = 28.0_f32;
+                let (rect, resp) = ui.allocate_exact_size(
+                    egui::vec2(ui.available_width(), row_h),
+                    egui::Sense::click(),
+                );
+                if resp.hovered() {
+                    ui.painter().rect_filled(rect, 6.0, pal.hover_fill);
+                }
+                ui.painter().text(
+                    egui::pos2(rect.left() + 8.0, rect.center().y),
+                    egui::Align2::LEFT_CENTER,
+                    label,
+                    egui::FontId::proportional(12.5),
+                    pal.text_secondary,
+                );
+                if let Some(chk) = checked {
+                    ui.painter().text(
+                        egui::pos2(rect.right() - 8.0, rect.center().y),
+                        egui::Align2::RIGHT_CENTER,
+                        if chk { "✓" } else { "" },
+                        egui::FontId::proportional(12.5),
+                        pal.accent,
+                    );
+                }
+                resp.clicked()
+            };
+            settings_win.show(&egui_ctx, |ui| {
+                if make_item(ui, "Clear browse history", None) {
+                    settings_action = Some(UiAction::SettingsClearRecent);
+                    close_menu = true;
+                }
+                if make_item(ui, "Clear favorites", None) {
+                    settings_action = Some(UiAction::SettingsClearFavorites);
+                    close_menu = true;
+                }
+                ui.separator();
+                if make_item(ui, "Follow system theme", Some(theme_system)) {
+                    settings_action = Some(UiAction::SettingsThemeSystem);
+                    close_menu = true;
+                }
+                if make_item(ui, "Show sidebar on launch", Some(sidebar_on_launch)) {
+                    settings_action = Some(UiAction::SettingsSidebarOnLaunch);
+                    close_menu = true;
+                }
+            });
+            if close_menu {
+                self.show_settings_menu = false;
+            }
+            if let Some(act) = settings_action {
+                self.apply_action(act);
+            }
         }
 
         // ----- RIGHT-CLICK CONTEXT MENU (egui-drawn, Linear theme) -----
@@ -2691,6 +2830,33 @@ let window = event_loop.create_window(
                 if Self::window_control(ui, "min-btn", WindowGlyph::Minimize, false, pal) {
                     actions.push(UiAction::MinimizeWindow);
                 }
+                // Settings dropdown button (⚙). Opens a Linear-style
+                // menu anchored below it for global prefs: clear recents,
+                // clear favorites, follow-system theme, and sidebar-on-
+                // launch toggle.
+                let (srect, sresp) = ui.allocate_exact_size(
+                    egui::vec2(32.0, 30.0),
+                    egui::Sense::click(),
+                );
+                if sresp.hovered() {
+                    ui.painter().rect_filled(srect, 6.0, pal.hover_fill);
+                }
+                SETTINGS_ANCHOR.with(|c| c.set(srect));
+                if sresp.clicked() {
+                    actions.push(UiAction::ToggleSettings);
+                }
+                let sc = srect.center();
+                let p = ui.painter();
+                // Simple gear: three short radial spokes around a hub.
+                let stroke = egui::Stroke::new(1.3_f32, pal.text_secondary);
+                for ang in [0.0_f32, std::f32::consts::FRAC_PI_3, 2.0 * std::f32::consts::FRAC_PI_3] {
+                    let dir = egui::vec2(ang.cos(), ang.sin());
+                    p.line_segment(
+                        [sc - dir * 6.0, sc + dir * 6.0],
+                        stroke,
+                    );
+                }
+                p.circle_stroke(sc, 4.2, stroke);
                 // Phase 4: theme toggle — modernised "circle + offset
                 // dot" glyph (was the half-moon painter-drawn in
                 // earlier commits). Renders as a small filled disc
@@ -3872,11 +4038,16 @@ let window = event_loop.create_window(
                 }
             }
             UiAction::ToggleTheme => {
-                self.theme = self.theme.toggle();
-                self.settings.set_theme(match self.theme {
-                    Theme::Dark => aperture_core::ThemeSetting::Dark,
-                    Theme::Light => aperture_core::ThemeSetting::Light,
-                });
+                // Cycle Dark -> Light -> (System is opted into via settings
+                // menu, not the header toggle). `toggle()` on Dark/Light
+                // flips; to keep the header toggle predictable we map System
+                // to a plain flip.
+                self.theme = match self.theme {
+                    Theme::Dark => Theme::Light,
+                    Theme::Light => Theme::Dark,
+                    Theme::System => Theme::Dark,
+                };
+                self.settings.set_theme(self.theme);
                 // The D2D child bg follows via render_frame's palette sync.
             }
             UiAction::SetWallpaper => {
@@ -3909,6 +4080,31 @@ let window = event_loop.create_window(
                     let path = current.path.clone();
                     self.print_image(path);
                 }
+            }
+            UiAction::ToggleSettings => {
+                self.show_settings_menu = !self.show_settings_menu;
+            }
+            UiAction::SettingsClearRecent => {
+                self.settings.clear_recent();
+                self.file_tree.refresh_recent(&self.settings.recent_folders());
+            }
+            UiAction::SettingsClearFavorites => {
+                self.settings.clear_favorites();
+                self.file_tree.refresh_favorites(&self.settings.favorite_folders());
+            }
+            UiAction::SettingsThemeSystem => {
+                let next = if self.settings.is_theme_system() {
+                    Theme::Dark
+                } else {
+                    Theme::System
+                };
+                self.settings.set_theme(next);
+                self.theme = next;
+            }
+            UiAction::SettingsSidebarOnLaunch => {
+                let show = !self.settings.show_tree_on_launch();
+                self.settings.set_show_tree_on_launch(show);
+                self.show_tree = show;
             }
         }
     }
