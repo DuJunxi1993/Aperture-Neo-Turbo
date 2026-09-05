@@ -71,6 +71,23 @@ const DEFAULT_W: u32 = 1280;
 const DEFAULT_H: u32 = 800;
 const MIN_W: u32 = 480;
 const MIN_H: u32 = 320;
+/// Minimum logical-px width that the titlebar + statusbar combo
+/// needs to lay out its buttons without overlap. Used as the
+/// lower bound for the single-image launch (which otherwise would
+/// shrink the window to fit the image — and a small icon would
+/// then squeeze the chrome to the point of unreadable buttons).
+///
+/// Layout budget breakdown:
+/// - titlebar left group: Open Folder (~90) + 6 + Tree (56) + 4 +
+///   Thumbs (56) ≈ 212 px
+/// - titlebar right group: close (42) + max (42) + min (42) + gear
+///   (42) + theme (42) + help (42) + 12 padding ≈ 252 px
+/// - titlebar total ≈ 480 px
+/// - statusbar right: filename + zoom% area ≈ 200 px minimum
+/// - statusbar left: Back (70) + Forward (80) + Fit (50) + ⏵ (30) +
+///   ↻ (30) + ⛶ (30) + separators ≈ 320 px
+// => ~560 px is the conservative floor (statusbar is the wider one).
+const CHROME_MIN_W: f64 = 560.0;
 // Frames to hold a retired (replaced) image texture before releasing its
 // egui handle. With Fifo present + frame-latency-1, the GPU can be at most
 // one frame behind the CPU; holding for a few frames plus the non-blocking
@@ -1029,10 +1046,11 @@ impl MainWindow {
 
         let (init_w, init_h, min_w, min_h) = if let Some((iw, ih)) = self.single_image_size {
             // Immersive single-image launch. Goal: image occupies the
-            // viewer rect with NO letterbox (win_w / (win_h - chrome_h)
-            // == iw / ih). Chrome is fixed (titlebar + status bar) and
-            // sits outside the image area, so the window is image
-            // dimensions plus chrome while keeping image aspect.
+            // viewer rect with NO letterbox when the image is wider
+            // than the chrome-min; for small images we expand the
+            // window to CHROME_MIN_W so the titlebar + statusbar have
+            // room for their buttons (a 200x200 icon used to clamp the
+            // window to MIN_W=480, which overlapped the chrome).
             //
             // Previous bug: only TOOLBAR_HEIGHT (40) was added; the
             // 48px status bar was forgotten, which compressed the
@@ -1052,15 +1070,20 @@ impl MainWindow {
             let img_h = ih as f64 / scale;
             let img_aspect = img_w / img_h;
 
-            // Width target: if image is wider than 90% of monitor width,
-            // shrink so it fits; otherwise show at native size.
-            let target_w = img_w.min(max_w).max(MIN_W as f64);
+            // Width target: chrome-min wins for small images (so the
+            // titlebar/statusbar buttons aren't squeezed); image-size
+            // wins for normal ones. min_w (`CHROME_MIN_W`) is also
+            // re-applied after the height-from-aspect derivation so
+            // squarer-than-chrome images still get a chrome-friendly
+            // window (the image is then centered inside the viewer
+            // with letterbox bands on either side).
+            let target_w = img_w.min(max_w).max(CHROME_MIN_W);
             // Derive height from aspect; chrome_h lives outside the
             // image area so win_h - chrome_h matches image aspect.
             let mut lh = (target_w - chrome_w) / img_aspect + chrome_h;
             lh = lh.min(max_h).max(MIN_H as f64);
             let lw = ((lh - chrome_h) * img_aspect + chrome_w)
-                .max(MIN_W as f64).min(max_w);
+                .max(CHROME_MIN_W).min(max_w);
 
             tracing::debug!(
                 "single_image window: image={}x{} scale={:.2} -> init_w={:.0} init_h={:.0} (image aspect={:.3}, viewer aspect={:.3})",
@@ -1068,10 +1091,13 @@ impl MainWindow {
                 img_aspect, (lw - chrome_w) / (lh - chrome_h)
             );
 
-            // Min window size: unified with the multi-image modes so
-            // winit's min_inner_size constraint does not conflict with
-            // Borderless fullscreen on monitors smaller than the image.
-            (lw, lh, MIN_W as f64, MIN_H as f64)
+            // Min window size: single-image mode uses CHROME_MIN_W so
+            // the user can never shrink the window smaller than the
+            // chrome can accommodate. Multi-image modes (below) keep
+            // MIN_W because their chrome has the same buttons but the
+            // image already provides additional "weight" that makes
+            // the panel content feel less empty at 480 px.
+            (lw, lh, CHROME_MIN_W, MIN_H as f64)
         } else if self.settings.window_size().is_some() {
             // Restored session size. `stored` is *intended* to be in
             // LOGICAL pixels (save_window_geometry now saves logical
