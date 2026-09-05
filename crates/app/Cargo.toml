@@ -1,6 +1,6 @@
 [package]
 name = "aperture-neo-turbo"
-version = "1.0.8"
+version = "1.1.0"
 edition = "2021"
 description = "Aperture Neo Turbo"
 license = "MIT"
