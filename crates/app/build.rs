@@ -3,7 +3,7 @@ fn main() {
         let mut res = winresource::WindowsResource::new();
         res.set_icon("../../assets/apertureneo_turbo.ico");
         res.set("ProductName", "Aperture Neo Turbo");
-        res.set("FileDescription", "Aperture Neo Turbo - High-performance GPU image viewer");
+        res.set("FileDescription", "Aperture Neo Turbo");
         res.set("FileVersion", "1.0.8");
         res.set("ProductVersion", "1.0.8");
         res.set("LegalCopyright", "DuJunxi1993");

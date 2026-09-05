@@ -2,7 +2,7 @@
 name = "aperture-neo-turbo"
 version = "1.0.8"
 edition = "2021"
-description = "Aperture Neo Turbo - High-performance GPU image viewer"
+description = "Aperture Neo Turbo"
 license = "MIT"
 repository = "https://github.com/DuJunxi1993/Aperture-Neo-Turbo"
 authors = ["DuJunxi1993"]
