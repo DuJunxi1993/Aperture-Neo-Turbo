@@ -126,16 +126,6 @@ const TREE_MIN_NAME_PX: f32 = 60.0;
 /// almost nothing for the viewer. 1/3 keeps the viewer dominant
 /// without being so narrow that deep paths lose readability.
 const TREE_PANEL_MAX_FRAC: f32 = 1.0 / 3.0;
-/// Fraction of the tree panel's *visible* width that the active
-/// branch (the chain from a root down to `current_folder`) gets to
-/// use as indent territory for its longest ancestor. 1/3 means the
-/// chain's indent collectively consumes at most 1/3 of the panel's
-/// width, leaving the other 2/3 for actual node-name display. With
-/// the panel itself capped at `TREE_PANEL_MAX_FRAC` (1/3) of the
-/// main window, this means the active chain's indent can claim at
-/// most (1/3) × (1/3) = 1/9 of the main window — well below the
-/// viewer's budget on any reasonable monitor.
-const TREE_MAIN_CHAIN_INDENT_FRAC: f32 = 1.0 / 3.0;
 // Drawer's hard lower bound (logical px) — anything narrower than
 // this can't show a chevron + a few characters of folder name, so
 // the cap helper (`cap_tree_width`) also floors the drawer's width
@@ -3420,27 +3410,6 @@ let window = event_loop.create_window(
 
             let tree_scroll_y = tree.state.lock().scroll_offset_y;
             let tree_scroll_x = tree.state.lock().scroll_offset_x;
-            // Compute the active chain length (root → current_folder,
-            // inclusive) for the depth-aware main-chain indent. 0 when
-            // there's no current folder OR it lives in a different root
-            // (the chain only matters when the active root matches the
-            // root we're currently drawing).
-            let active_root = ACTIVE_ROOT.load(std::sync::atomic::Ordering::Relaxed);
-            let chain_total: usize = match current_folder.as_ref() {
-                Some(c) => {
-                    // Path::ancestors() counts the empty root as the
-                    // last entry — that's the chain's position 0, so
-                    // no +1 needed here.
-                    c.ancestors().count()
-                }
-                None => 0,
-            };
-            // Same tree draws the classic panel and the edge drawer,
-            // which is why `active_root` is read once here and passed
-            // implicitly through the `chain_total > 0` check inside
-            // draw_tree_node (root_idx == active_root gates
-            // chain_depth, so off-active roots get original indent).
-            let _ = active_root;
             let tree_out = egui::ScrollArea::both()
                 .auto_shrink([false; 2])
                 .vertical_scroll_offset(tree_scroll_y)
@@ -3514,7 +3483,7 @@ let window = event_loop.create_window(
                     // the recursion; the outer guard is already dropped.
                     for (root_idx, root) in roots.iter_mut().enumerate() {
                         max_w = max_w.max(Self::draw_tree_node(
-                            ui, tree, root, 0, &current_folder, chain_total, &mut expanded, actions, root_idx,
+                            ui, tree, root, 0, &current_folder, &mut expanded, actions, root_idx,
                             &reveal, &mut revealed_node, pending_ctx,
                             &mut recent_scroll, &pal,
                         ));
@@ -3737,12 +3706,6 @@ let window = event_loop.create_window(
         // (`ImageItem.path` via `nav.current()`) which never matched
         // a tree node's folder path — is_current() never fired.
         current_folder: &Option<PathBuf>,
-        // Total length of the active chain from this panel's root
-        // down to `current_folder` (root included). 0 when there's
-        // no current folder or it lives in a different root. Used
-        // for the depth-aware indent remapping on chain nodes —
-        // `chain_depth / chain_total * (panel_w * TREE_MAIN_CHAIN_INDENT_FRAC)`.
-        chain_total: usize,
         expanded: &mut [std::collections::HashSet<std::path::PathBuf>; 3],
         actions: &mut Vec<UiAction>,
         root_idx: usize,
@@ -3780,30 +3743,6 @@ let window = event_loop.create_window(
             .as_ref()
             .map(|c| c == &node.path && root_idx == active_root)
             .unwrap_or(false);
-        // Depth-aware main-chain indent. Compute `chain_depth` =
-        // position of this node along the chain from the panel root
-        // down to `current_folder`. The chain only exists when this
-        // row's root matches the active root AND the node's path is
-        // on the way to current_folder; otherwise we fall back to
-        // the old per-depth indent so sibling branches don't lose
-        // their visual hierarchy.
-        //
-        // For `C:\Users\Foo`, `ancestors()` yields
-        // `[C:\Users\Foo, C:\Users, C:\, C:, ""]` (longest first).
-        // Reversing the index gives 0 for the empty root, growing up
-        // to 4 for the current_folder itself — exactly the depth
-        // along the chain.
-        let chain_depth: Option<usize> = if chain_total == 0
-            || root_idx != active_root
-        {
-            None
-        } else {
-            current_folder.as_ref().and_then(|cur| {
-                let ancestors: Vec<&std::path::Path> = cur.ancestors().collect();
-                let pos_rev = ancestors.iter().position(|a| a == &node.path);
-                pos_rev.map(|i| ancestors.len() - 1 - i)
-            })
-        };
         let display = node.display_name.clone();
         let path_clone = node.path.clone();
         let is_reveal_target = reveal.as_ref() == Some(&node.path) && root_idx == 2;
@@ -3926,36 +3865,19 @@ let window = event_loop.create_window(
             let dir_selected = is_current || is_reveal_target;
             // This PC expanded directories get only bold — no bg, no bar.
             let this_pc_expanded = root_idx == 2 && !is_virtual_root;
-            // Main-chain indent remapping. The active chain gets a
-            // budget of TREE_MAIN_CHAIN_INDENT_FRAC (1/3) of the
-            // panel's visible width for its collective indent, so a
-            // deep chain can't crowd the name area below the
-            // 2/3 the user wants for the current expanded folder.
-            //
-            // The remap is budget-driven: when the chain's natural
-            // indent (sum of depth*14 over its nodes) fits in the
-            // budget, we use the per-depth indents unchanged so
-            // depth-1 siblings (C:, D:, E:, or any favorites /
-            // recent entries) line up at the same X. Only when the
-            // natural indent overflows the budget do we scale
-            // uniformly — and the horizontal scrollbar (added in
-            // the same commit as this remap) carries whatever tail
-            // overflows.
-            let original_indent = depth as f32 * 14.0;
-            let indent = match chain_depth {
-                Some(_) if chain_total > 0 => {
-                    let natural_total =
-                        14.0 * chain_total as f32 * (chain_total + 1) as f32 * 0.5;
-                    let budget = ui.available_width() * TREE_MAIN_CHAIN_INDENT_FRAC;
-                    let scale = if natural_total > budget && natural_total > 0.0 {
-                        budget / natural_total
-                    } else {
-                        1.0
-                    };
-                    original_indent * scale
-                }
-                _ => original_indent,
-            };
+            // Indent policy: siblings at the same depth always share
+            // the same indent — regardless of whether they're on the
+            // active chain or not. The active-chain compression
+            // (added in an earlier commit, kept simple here) used to
+            // give depth-1 chain nodes a different indent from their
+            // off-chain siblings on narrow panels, which broke visual
+            // alignment for shallow chains (N=2 on a small panel was
+            // the worst case). The clean rule is: indent = depth *
+            // 14 px, full stop. A deep chain still extends past the
+            // visible panel — but the horizontal ScrollArea (added in
+            // the same chain feature) lets the user pan left to see
+            // the deepest ancestor or its truncated name.
+            let indent = depth as f32 * 14.0;
             let row_h = 26.0_f32;
             // Right gutter so the directory row doesn't touch the scrollbar.
             let row_w = (ui.available_width() - 10.0).max(20.0);
@@ -4073,7 +3995,7 @@ let window = event_loop.create_window(
                 if let Some(children) = node.children.as_mut() {
                     for child in children.iter_mut() {
                         let w = Self::draw_tree_node(
-                            ui, tree, child, depth + 1, current_folder, chain_total, expanded, actions, root_idx,
+                            ui, tree, child, depth + 1, current_folder, expanded, actions, root_idx,
                             reveal, revealed, pending, recent_scroll, pal,
                         );
                         max_w = max_w.max(w);
