@@ -3926,21 +3926,33 @@ let window = event_loop.create_window(
             let dir_selected = is_current || is_reveal_target;
             // This PC expanded directories get only bold — no bg, no bar.
             let this_pc_expanded = root_idx == 2 && !is_virtual_root;
-            // Main-chain indent remapping: when this node is on the
-            // active branch (chain_depth is Some), spread its
-            // horizontal position linearly across the panel's
-            // reserved indent budget. The budget is
-            // TREE_MAIN_CHAIN_INDENT_FRAC of the panel's visible
-            // width, so a deep chain doesn't crowd the name area.
-            // We MIN with the per-depth indent so this only ever
-            // SHRINKS the indent (never widens it beyond the
-            // original behavior on a shallow tree / wide panel).
+            // Main-chain indent remapping. The active chain gets a
+            // budget of TREE_MAIN_CHAIN_INDENT_FRAC (1/3) of the
+            // panel's visible width for its collective indent, so a
+            // deep chain can't crowd the name area below the
+            // 2/3 the user wants for the current expanded folder.
+            //
+            // The remap is budget-driven: when the chain's natural
+            // indent (sum of depth*14 over its nodes) fits in the
+            // budget, we use the per-depth indents unchanged so
+            // depth-1 siblings (C:, D:, E:, or any favorites /
+            // recent entries) line up at the same X. Only when the
+            // natural indent overflows the budget do we scale
+            // uniformly — and the horizontal scrollbar (added in
+            // the same commit as this remap) carries whatever tail
+            // overflows.
             let original_indent = depth as f32 * 14.0;
             let indent = match chain_depth {
-                Some(d) if chain_total > 0 => {
+                Some(_) if chain_total > 0 => {
+                    let natural_total =
+                        14.0 * chain_total as f32 * (chain_total + 1) as f32 * 0.5;
                     let budget = ui.available_width() * TREE_MAIN_CHAIN_INDENT_FRAC;
-                    let linear = (d as f32 / chain_total as f32) * budget;
-                    linear.min(original_indent).max(0.0)
+                    let scale = if natural_total > budget && natural_total > 0.0 {
+                        budget / natural_total
+                    } else {
+                        1.0
+                    };
+                    original_indent * scale
                 }
                 _ => original_indent,
             };
