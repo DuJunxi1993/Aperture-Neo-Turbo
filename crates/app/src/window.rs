@@ -3486,13 +3486,62 @@ let window = event_loop.create_window(
         inner.inner + 20.0 + 10.0
     }
 
+    /// Build a middle-ellipsised copy of `full` that fits within
+    /// `available_px` in the given font. Keeps the head and tail of
+    /// the name (so file extensions, drive letters, and project
+    /// prefixes all stay visible) and inserts a single `…` in the
+    /// middle. Used as the static fallback when the row's text is
+    /// wider than its allotted slot.
+    ///
+    /// The char-width estimate is conservative for a 13 px proportional
+    /// font (mostly Latin / punctuation, ~7.5 px/char); for CJK or emoji
+    /// paths it may under-estimate and the resulting string could still
+    /// overflow by a pixel or three — that's clipped harmlessly by the
+    /// caller's `with_clip_rect`. We deliberately don't loop / refine
+    /// because a tight loop here would show up in profiles on big trees
+    /// and a sub-pixel overflow is invisible at typical DPI.
+    fn middle_ellipsise(full: &str, available_px: f32, font: &egui::FontId) -> String {
+        if full.is_empty() {
+            return String::new();
+        }
+        let char_w = match font.size {
+            s if s <= 13.0 => 7.5_f32,
+            s if s <= 15.0 => 8.5,
+            _ => 9.5,
+        };
+        // Reserve room for the `…` (~char_w) so the result actually fits.
+        let budget = (available_px - char_w).max(0.0);
+        let total_chars = full.chars().count();
+        let max_chars = ((budget / char_w).floor() as usize).max(2);
+        if max_chars >= total_chars {
+            return full.to_owned();
+        }
+        // Split budget ~50/50 between head and tail; floor both ends so
+        // we never drop a char to gain nothing.
+        let half = (max_chars / 2).max(1);
+        let head_count = half;
+        let tail_count = max_chars - head_count;
+        let head: String = full.chars().take(head_count).collect();
+        let tail: String = full
+            .chars()
+            .rev()
+            .take(tail_count)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        format!("{head}…{tail}")
+    }
+
     /// Render the row's name text with clip + hover-scroll.
     ///
     /// Long folder names used to widen the panel via `max_w` (which fed
     /// `content_min`); now the text is clipped at the row's right edge
-    /// with an inline `…` and the panel only reserves `TREE_MIN_NAME_PX`
-    /// for the name area. On hover the clipped text gently scrolls left
-    /// so the user can read the full name without the panel having to
+    /// with a **middle** ellipsis (keeping the head and tail visible —
+    /// useful for things like drive letters, project prefixes, and file
+    /// extensions) and the panel only reserves `TREE_MIN_NAME_PX` for
+    /// the name area. On hover the clipped text gently scrolls left so
+    /// the user can read the full name without the panel having to
     /// widen. `hover_started_at` is the per-node timestamp that drives
     /// the scroll animation (frame-rate independent).
     ///
@@ -3539,30 +3588,35 @@ let window = event_loop.create_window(
             return;
         }
 
-        // Overflow: clipped draw with an ellipsis marker.
-        // Use `with_clip_rect` so anything past `text_x_max` is hidden;
-        // append a `…` glyph just before the right edge as the truncation
-        // signal. The `…` is drawn outside the clip rect so it's always
-        // visible regardless of the scrolled offset.
+        // Overflow path. The static state shows a MIDDLE-ellipsised
+        // version of the name (`Long…Folder.png`), keeping both the
+        // head (drive letter, project prefix) and the tail (file
+        // extension, suffix) visible — strictly more informative than
+        // a tail-only ellipsis for paths.
+        let static_text = Self::middle_ellipsise(display, available, &font);
+        // Clip anything past the row's right edge so the static and
+        // scrolled states can never bleed into the next row / scrollbar.
         let clip_rect = egui::Rect::from_min_max(
             egui::pos2(text_x_left, rect.top()),
-            egui::pos2(text_x_max - 8.0, rect.bottom()),
+            egui::pos2(text_x_max, rect.bottom()),
         );
         if !hovered {
-            // Static (clipped) state. Also reset the hover timer.
+            // Static (clipped) state. Reset the hover timer so a fresh
+            // hover starts from offset 0 (static text).
             node.hover_started_at = None;
             let clipped = painter.with_clip_rect(clip_rect);
             clipped.text(
                 egui::pos2(text_x_left, text_y),
                 egui::Align2::LEFT_CENTER,
-                display,
+                &static_text,
                 font.clone(),
                 color,
             );
         } else {
-            // Hover + overflow: scroll the full text left over time.
-            // Initialize the timer on the first hovered frame so the
-            // animation has a stable elapsed reference.
+            // Hover + overflow: scroll the FULL name (not the
+            // ellipsised one) left so the middle that was eaten by
+            // `…` becomes readable. The end state pins at the very
+            // tail so the user actually sees the hidden middle.
             let now = std::time::Instant::now();
             if node.hover_started_at.is_none() {
                 node.hover_started_at = Some(now);
@@ -3578,9 +3632,10 @@ let window = event_loop.create_window(
                 let t = (elapsed_ms - scroll_active_after) as f32 / 1000.0;
                 (t * TREE_SCROLL_SPEED_PX_PER_S).min(overflow)
             } else {
-                // Past scroll + hold: stay at the end of the text so the
-                // tail is visible; release on hover-end (handled by the
-                // !hovered branch above which clears the timer).
+                // Past scroll + hold: stay at the end of the text so
+                // the middle / tail are visible. Release on
+                // hover-end (handled by the !hovered branch above
+                // which clears the timer).
                 overflow
             };
             let clipped = painter.with_clip_rect(clip_rect);
@@ -3588,20 +3643,6 @@ let window = event_loop.create_window(
                 egui::pos2(text_x_left - scroll_offset, text_y),
                 egui::Align2::LEFT_CENTER,
                 display,
-                font.clone(),
-                color,
-            );
-        }
-        // Always paint the `…` marker just past the clip rect so the
-        // user knows there's more text (and so the right edge of the
-        // row never looks like an arbitrary cut). It overlays anything
-        // the clipped draw may have left near the right edge.
-        let dots_x = text_x_max - 6.0;
-        if dots_x > text_x_left {
-            painter.text(
-                egui::pos2(dots_x, text_y),
-                egui::Align2::RIGHT_CENTER,
-                "…",
                 font,
                 color,
             );
