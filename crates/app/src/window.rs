@@ -3250,8 +3250,10 @@ let window = event_loop.create_window(
                 let path_short = crate::path_shorten::shorten(p);
                 // Truncate so a long path can't force the panel wider
                 // than the user set it. Double-click anywhere on the
-                // label emits a CopyFolderPath action so the actual
-                // clipboard write happens after the egui borrow ends.
+                // label emits a CopyFolderPath action; right-click pops
+                // the same tree-context menu (via pending_ctx) so the
+                // user can copy the path or open it in Explorer without
+                // the awkward double-click gesture.
                 let path_label = ui.add(
                     egui::Label::new(
                         egui::RichText::new(path_short)
@@ -3261,9 +3263,25 @@ let window = event_loop.create_window(
                     .truncate()
                     .sense(egui::Sense::click()),
                 );
-                let path_resp = path_label.on_hover_text("Double click to copy folder path");
+                let path_resp = path_label
+                    .on_hover_text("Double click to copy folder path · Right click for more");
                 if path_resp.double_clicked() {
                     actions.push(UiAction::CopyFolderPath(p.clone()));
+                }
+                // Right-click on the path label opens the same tree
+                // context menu as a node right-click (root_idx = 2 =
+                // This PC, since the current folder is a real disk
+                // path). Reuses the deferred popup mechanism so the
+                // actual `ctx_menu` swap happens after the egui frame
+                // ends — same pattern as draw_tree_node below.
+                if path_resp.secondary_clicked() {
+                    if let Some(pos) = ui.ctx().input(|i| i.pointer.latest_pos()) {
+                        *pending_ctx = Some(TreeCtxIntent {
+                            pos_phys: (pos.x as i32, pos.y as i32),
+                            path: p.clone(),
+                            root_idx: 2,
+                        });
+                    }
                 }
                 ui.add_space(2.0);
                 ui.label(
@@ -3970,6 +3988,7 @@ let window = event_loop.create_window(
         // drawn; the width is the widest of all possibilities + padding.
         let all_labels = [
             "复制图片路径",
+            "复制文件夹路径",
             "在资源管理器中打开",
             "打印",
             "设为桌面壁纸",
@@ -4048,6 +4067,12 @@ let window = event_loop.create_window(
             }
             CtxMenu::Tree { pos, path, root_idx, is_favorite } => {
                 let resp = window.fixed_pos(*pos).show(ctx, |ui| {
+                    // 复制路径 first — same convention as the image
+                    // menu's "复制图片路径", so the muscle memory is
+                    // consistent across both menus. Pairs with the new
+                    // right-click on the "current folder" path label
+                    // (see draw_tree_panel_static).
+                    if item(ui, "复制文件夹路径", UiAction::CopyFolderPath(path.clone())) { close = true; }
                     if item(ui, "在资源管理器中打开", UiAction::RevealInExplorer(path.clone())) { close = true; }
                     if *is_favorite {
                         if item(ui, "取消收藏", UiAction::RemoveFavorite(path.clone())) { close = true; }
