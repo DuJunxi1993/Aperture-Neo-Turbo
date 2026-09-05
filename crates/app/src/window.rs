@@ -86,6 +86,21 @@ const TREE_LEAVE_MS: u64 = 1000;
 const TREE_DRAWER_ANIM_MS: f32 = 220.0;
 const HANDLE_X: f32 = 8.0;
 const HANDLE_ZONE_PAD: f32 = 10.0;
+// Tree row text rendering: long folder names no longer drive the panel
+// width — they are clipped at the row's right edge with an inline `…`.
+// On hover the clipped text gently scrolls left so the user can read
+// the full name without the panel having to widen. Values are tuned
+// for a "you can read it if you want, but it doesn't push the panel
+// around" feel — slow scroll, long enough pause after the scroll ends
+// before it resets so the tail is actually visible.
+const TREE_SCROLL_DELAY_MS: u64 = 350;
+const TREE_SCROLL_SPEED_PX_PER_S: f32 = 28.0;
+const TREE_SCROLL_END_HOLD_MS: u64 = 900;
+// Minimum name area (logical px) reserved for any tree row's text —
+// rows narrower than this can't even show "C:" plus a chevron. Used
+// as the new content-driven `content_min` baseline (the actual content
+// never adds to this; names are clipped instead).
+const TREE_MIN_NAME_PX: f32 = 60.0;
 // Drawer width bounds (logical px). The upper bound is deliberately loose —
 // the drawer is an overlay (never takes layout space, so it can't crowd the
 // viewer), and a wide row (long folder name) should show fully rather than
@@ -3404,6 +3419,128 @@ let window = event_loop.create_window(
         inner.inner + 20.0 + 10.0
     }
 
+    /// Render the row's name text with clip + hover-scroll.
+    ///
+    /// Long folder names used to widen the panel via `max_w` (which fed
+    /// `content_min`); now the text is clipped at the row's right edge
+    /// with an inline `…` and the panel only reserves `TREE_MIN_NAME_PX`
+    /// for the name area. On hover the clipped text gently scrolls left
+    /// so the user can read the full name without the panel having to
+    /// widen. `hover_started_at` is the per-node timestamp that drives
+    /// the scroll animation (frame-rate independent).
+    ///
+    /// `text_x_max` is the right edge of the name area in logical px
+    /// (the row's right edge minus a small gutter so names don't kiss
+    /// the scrollbar / panel edge). `text_y` is the vertical center
+    /// line for `LEFT_CENTER` alignment.
+    fn render_tree_row_name(
+        ui: &egui::Ui,
+        rect: egui::Rect,
+        text_y: f32,
+        text_x_left: f32,
+        text_x_max: f32,
+        display: &str,
+        font: egui::FontId,
+        color: egui::Color32,
+        node: &mut crate::file_tree::TreeNode,
+        hovered: bool,
+    ) {
+        let painter = ui.painter();
+        // Measure once and cache the un-clipped width on the node (debug
+        // only; the panel width is no longer driven by it).
+        if node.text_w <= 0.0 {
+            let galley = painter.layout_no_wrap(
+                display.to_owned(),
+                font.clone(),
+                color,
+            );
+            node.text_w = galley.size().x;
+        }
+        let available = (text_x_max - text_x_left).max(0.0);
+        let overflow = (node.text_w - available).max(0.0);
+        // No overflow → just draw the label normally. Also reset any
+        // stale hover timestamp so the next overflow-hover starts fresh.
+        if overflow <= 0.5 {
+            node.hover_started_at = None;
+            painter.text(
+                egui::pos2(text_x_left, text_y),
+                egui::Align2::LEFT_CENTER,
+                display,
+                font,
+                color,
+            );
+            return;
+        }
+
+        // Overflow: clipped draw with an ellipsis marker.
+        // Use `with_clip_rect` so anything past `text_x_max` is hidden;
+        // append a `…` glyph just before the right edge as the truncation
+        // signal. The `…` is drawn outside the clip rect so it's always
+        // visible regardless of the scrolled offset.
+        let clip_rect = egui::Rect::from_min_max(
+            egui::pos2(text_x_left, rect.top()),
+            egui::pos2(text_x_max - 8.0, rect.bottom()),
+        );
+        if !hovered {
+            // Static (clipped) state. Also reset the hover timer.
+            node.hover_started_at = None;
+            let clipped = painter.with_clip_rect(clip_rect);
+            clipped.text(
+                egui::pos2(text_x_left, text_y),
+                egui::Align2::LEFT_CENTER,
+                display,
+                font.clone(),
+                color,
+            );
+        } else {
+            // Hover + overflow: scroll the full text left over time.
+            // Initialize the timer on the first hovered frame so the
+            // animation has a stable elapsed reference.
+            let now = std::time::Instant::now();
+            if node.hover_started_at.is_none() {
+                node.hover_started_at = Some(now);
+            }
+            let elapsed = now.saturating_duration_since(node.hover_started_at.unwrap());
+            let elapsed_ms = elapsed.as_millis() as u64;
+            let scroll_active_after = TREE_SCROLL_DELAY_MS;
+            let scroll_active_until =
+                TREE_SCROLL_DELAY_MS + ((overflow / TREE_SCROLL_SPEED_PX_PER_S) * 1000.0) as u64;
+            let scroll_offset = if elapsed_ms < scroll_active_after {
+                0.0
+            } else if elapsed_ms < scroll_active_until + TREE_SCROLL_END_HOLD_MS {
+                let t = (elapsed_ms - scroll_active_after) as f32 / 1000.0;
+                (t * TREE_SCROLL_SPEED_PX_PER_S).min(overflow)
+            } else {
+                // Past scroll + hold: stay at the end of the text so the
+                // tail is visible; release on hover-end (handled by the
+                // !hovered branch above which clears the timer).
+                overflow
+            };
+            let clipped = painter.with_clip_rect(clip_rect);
+            clipped.text(
+                egui::pos2(text_x_left - scroll_offset, text_y),
+                egui::Align2::LEFT_CENTER,
+                display,
+                font.clone(),
+                color,
+            );
+        }
+        // Always paint the `…` marker just past the clip rect so the
+        // user knows there's more text (and so the right edge of the
+        // row never looks like an arbitrary cut). It overlays anything
+        // the clipped draw may have left near the right edge.
+        let dots_x = text_x_max - 6.0;
+        if dots_x > text_x_left {
+            painter.text(
+                egui::pos2(dots_x, text_y),
+                egui::Align2::RIGHT_CENTER,
+                "…",
+                font,
+                color,
+            );
+        }
+    }
+
     /// Draw one tree node. Returns the widest content row (logical px) in
     /// its subtree for the panel's content-driven minimum width.
     #[allow(clippy::too_many_arguments)]
@@ -3462,7 +3599,11 @@ let window = event_loop.create_window(
         } else {
             pal.text_secondary
         };
-        // Cached text width → content-driven panel minimum.
+        // Cache the un-clipped text width on the node for debugging /
+// trace. This used to drive the panel's content-driven minimum
+// (`max_w`); now the row's text is clipped at `TREE_MIN_NAME_PX` +
+// indent + chevron instead, so a long folder name can't force the
+// panel wider. We still compute and store it as a diagnostic.
         if node.text_w <= 0.0 {
             let galley = ui.painter().layout_no_wrap(
                 display.clone(),
@@ -3471,7 +3612,7 @@ let window = event_loop.create_window(
             );
             node.text_w = galley.size().x;
         }
-        let row_w = depth as f32 * 14.0 + 24.0 + node.text_w;
+        let row_w = depth as f32 * 14.0 + 24.0 + TREE_MIN_NAME_PX;
         let mut max_w = row_w;
 
         // Leaf entries (Favorites / Recent): custom-painted rounded
@@ -3513,18 +3654,27 @@ let window = event_loop.create_window(
             // Faint grain over the whole card breaks up the flat fill so it
             // reads as a surface rather than a solid block (Linear's Grain).
             crate::effects::paint_grain(ui.painter(), rect, 4);
-            ui.painter().text(
-                egui::pos2(rect.left() + 10.0, rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                display,
+            // Long names are clipped at the right edge with an inline `…`;
+            // hover scrolls the full name left without widening the panel.
+            Self::render_tree_row_name(
+                ui,
+                rect,
+                rect.center().y,
+                rect.left() + 10.0,
+                rect.right() - 4.0,
+                &display,
                 if selected {
                     egui::FontId::proportional(15.0)
                 } else {
                     egui::FontId::proportional(14.0)
                 },
                 if selected { pal.selection_text } else { pal.text_secondary },
+                node,
+                resp.hovered(),
             );
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            let resp = resp
+                .on_hover_cursor(egui::CursorIcon::PointingHand)
+                .on_hover_text(display.clone());
             if is_reveal_target && !*revealed {
                 ui.scroll_to_rect(resp.rect, Some(egui::Align::Center));
                 *revealed = true;
@@ -3611,19 +3761,29 @@ let window = event_loop.create_window(
                 ));
             }
             // Label (bold when selected). Text is drawn at fixed x so long
-            // names never wrap and never overlap the next row.
+            // names never wrap and never overlap the next row; long names
+            // are clipped with `…` and scroll on hover (see
+            // `render_tree_row_name`). `text_x_max` keeps the right gutter
+            // so the text never touches the scrollbar.
             let text_x = row_rect.left() + indent + 18.0;
-            ui.painter().text(
-                egui::pos2(text_x, row_rect.center().y),
-                egui::Align2::LEFT_CENTER,
-                display,
+            let text_x_max = row_rect.right() - 4.0;
+            Self::render_tree_row_name(
+                ui,
+                row_rect,
+                row_rect.center().y,
+                text_x,
+                text_x_max,
+                &display,
                 if dir_selected {
                     egui::FontId::proportional(15.0)
                 } else {
                     egui::FontId::proportional(14.0)
                 },
                 text_color,
+                node,
+                row_resp.hovered(),
             );
+            let row_resp = row_resp.on_hover_text(display.clone());
             // Capture this row for the pending-expand scroll decision.
             if tree.state.lock().pending_expand_scroll.as_ref().is_some_and(|p| p == &path_clone) {
                 tree.state.lock().pending_expand_rect = Some(row_rect);

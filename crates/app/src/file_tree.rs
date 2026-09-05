@@ -16,9 +16,17 @@ pub struct TreeNode {
     pub is_dir: bool,
     pub children: Option<Vec<TreeNode>>,
     pub loading: bool,
-    /// Cached rendered text width (logical px) for content-based panel
-    /// sizing. 0 = not measured yet.
+    /// Cached rendered text width (logical px) — debug/trace value.
+    /// No longer drives the panel width (rows clip instead), but kept
+    /// here so the struct shape is unchanged for git-blame stability.
     pub text_w: f32,
+    /// Set on the frame where the user first hovered this row (and the
+    /// text overflows the row). Cleared when hover ends after a brief
+    /// grace window so the scroll position has time to reset before
+    /// the next hover. Drives the hover-scroll animation in
+    /// `draw_tree_node` (frame-rate independent: the animation reads
+    /// `Instant::now() - hover_started_at` instead of an integrated dt).
+    pub hover_started_at: Option<std::time::Instant>,
 }
 
 impl TreeNode {
@@ -30,6 +38,7 @@ impl TreeNode {
             children: Some(Vec::new()),
             loading: false,
             text_w: 0.0,
+            hover_started_at: None,
         }
     }
 }
@@ -142,6 +151,7 @@ impl FileTree {
                 children: Some(Vec::new()),
                 loading: false,
                 text_w: 0.0,
+                hover_started_at: None,
             })
             .collect()
     }
@@ -261,6 +271,7 @@ fn enumerate_subdirs(dir: &Path) -> Vec<TreeNode> {
             children: Some(Vec::new()),
             loading: false,
             text_w: 0.0,
+            hover_started_at: None,
         });
     }
     out.sort_by(|a, b| a.display_name.cmp(&b.display_name));
