@@ -101,12 +101,22 @@ const TREE_SCROLL_END_HOLD_MS: u64 = 900;
 // as the new content-driven `content_min` baseline (the actual content
 // never adds to this; names are clipped instead).
 const TREE_MIN_NAME_PX: f32 = 60.0;
-// Drawer width bounds (logical px). The upper bound is deliberately loose —
-// the drawer is an overlay (never takes layout space, so it can't crowd the
-// viewer), and a wide row (long folder name) should show fully rather than
-// truncate. `drawer_user_width` (user drag) clamps here.
+/// Maximum fraction of the main window's logical width that the tree
+/// panel / edge drawer is allowed to consume. A long folder name used
+/// to push the panel wider through `content_min`; with name clipping
+/// in `render_tree_row_name` that's no longer the issue, but a user
+/// dragging the panel edge to 600 px in an 800 px window still leaves
+/// almost nothing for the viewer. 1/3 keeps the viewer dominant
+/// without being so narrow that deep paths lose readability.
+const TREE_PANEL_MAX_FRAC: f32 = 1.0 / 3.0;
+// Drawer's hard lower bound (logical px) — anything narrower than
+// this can't show a chevron + a few characters of folder name, so
+// the cap helper (`cap_tree_width`) also floors the drawer's width
+// here. The upper bound used to be the now-removed `DRAWER_MAX_W`
+// (= 560 px); with the global 1/3 cap, that ceiling is computed
+// per-frame from the actual window width instead of being a
+// hand-tuned constant.
 const DRAWER_MIN_W: f32 = 170.0;
-const DRAWER_MAX_W: f32 = 560.0;
 // Handle contrast thresholds with hysteresis: luminance > 0.62 → dark
 // handle (light image), < 0.38 → light handle (dark image), between → keep
 // the previous choice (no flicker at a bright/dark boundary).
@@ -354,6 +364,17 @@ pub fn light_palette() -> Palette { Palette {
     }
 }
 
+/// Compute the hard upper bound for the tree panel / drawer's logical
+/// width. The bound is `TREE_PANEL_MAX_FRAC` (1/3) of the main window's
+/// logical width, but never below `min_floor` (the minimum width the
+/// panel needs to be usable — chevron + a few characters of folder
+/// name). Centralised so the PanelWidth tick path, the drawer's width
+/// easing, and the drag handlers all agree on the same ceiling.
+fn cap_tree_width(viewport_w_logical: f32, min_floor: f32) -> f32 {
+    let cap = viewport_w_logical * TREE_PANEL_MAX_FRAC;
+    cap.max(min_floor)
+}
+
 /// Animated, user-resizable side-panel width with a content-driven minimum.
 ///
 /// Replaces egui's built-in resizable SidePanel state: the visible width
@@ -366,6 +387,14 @@ struct PanelWidth {
     user_width: f32,
     anim: f32,
     content_min: f32,
+    /// Fraction of the main window's logical width that this panel is
+    /// allowed to occupy. Default 1.0 = no cap (used by the thumb
+    /// panel, which is narrower than the tree and has no hard cap).
+    /// The tree panel sets this to `TREE_PANEL_MAX_FRAC` (1/3) at
+    /// construction so its animated width can never crowd the viewer
+    /// past that fraction, regardless of `user_width` or
+    /// `content_min`.
+    max_frac: f32,
 }
 
 impl PanelWidth {
@@ -373,7 +402,12 @@ impl PanelWidth {
         // anim starts at 0 so the panel animates open from 0 on launch
         // (rather than being at full width immediately) and closes back
         // to 0 smoothly. user_width is the drag-adjusted target.
-        Self { user_width: default_w, anim: 0.0, content_min: 0.0 }
+        Self {
+            user_width: default_w,
+            anim: 0.0,
+            content_min: 0.0,
+            max_frac: 1.0,
+        }
     }
 
     /// Advance the animation and return the width to draw with this frame.
@@ -381,9 +415,15 @@ impl PanelWidth {
     /// exponentially (~120 ms settle) so the tree/thumb panels slide open
     /// and closed instead of snapping. Snap the LAST few percent so the
     /// fully-collapsed panel isn't left with a sub-pixel sliver.
-    fn tick(&mut self, expanded: bool, dt: f32) -> f32 {
+    ///
+    /// `viewport_w` is the main window's logical width — used to clamp
+    /// the expanded target to `max_frac * viewport_w` so the panel
+    /// can't crowd the viewer past its allowed share (set to 1/3 for
+    /// the tree panel, 1.0 for the thumb panel).
+    fn tick(&mut self, expanded: bool, dt: f32, viewport_w: f32) -> f32 {
         let target = if expanded {
-            self.user_width.max(self.content_min)
+            let desired = self.user_width.max(self.content_min);
+            desired.min(viewport_w * self.max_frac)
         } else {
             0.0
         };
@@ -699,7 +739,14 @@ impl MainWindow {
             viewport_h: last.1.saturating_sub(TOOLBAR_HEIGHT + STATUS_BAR_HEIGHT),
             show_tree,
             show_thumbs,
-            tree_panel: PanelWidth::new(TREE_WIDTH as f32),
+            tree_panel: {
+                // Tree panel: cap at TREE_PANEL_MAX_FRAC (1/3) of the
+                // main window width so the user can't drag the panel
+                // edge past that fraction of the viewer.
+                let mut pw = PanelWidth::new(TREE_WIDTH as f32);
+                pw.max_frac = TREE_PANEL_MAX_FRAC;
+                pw
+            },
             thumb_panel: PanelWidth::new(THUMB_WIDTH as f32),
             last_thumb_idx: 0,
             is_fullscreen: false,
@@ -785,9 +832,13 @@ impl MainWindow {
         // Viewer vertical span in LOGICAL px, from window geometry (not a
         // possibly-stale viewport field). These are current and stable.
         let win_h_px = self.wgpu_state.as_ref().map(|w| w.config.height).unwrap_or(800);
+        let win_w_px = self.wgpu_state.as_ref().map(|w| w.config.width).unwrap_or(1280);
         let top_logical = TOOLBAR_HEIGHT as f32;
         let bottom_logical = (win_h_px as f32 / ppp) - STATUS_BAR_HEIGHT as f32;
         let vh_logical = (bottom_logical - top_logical).max(1.0);
+        // Logical viewport width — used by the cap below to enforce
+        // TREE_PANEL_MAX_FRAC on the drawer's animated width.
+        let viewport_w_logical = (win_w_px as f32 / ppp).max(1.0);
 
         // Handle rect (logical), inset from the window edge, vertically
         // centered in the viewer. THIS is the single source for the handle
@@ -892,7 +943,18 @@ impl MainWindow {
         // base and the content minimum) so widening for a long row and
         // collapsing back are soft transitions (not an instant jump). This
         // eased width is the single source for drawing + hit-test + wheel.
-        let width_target = self.drawer_user_width.max(self.drawer_content_min);
+        let width_target = self
+            .drawer_user_width
+            .max(self.drawer_content_min)
+            // Hard cap so the drawer can never claim more than its
+            // share of the main window (matches the classic tree
+            // panel's `max_frac` clamp in PanelWidth::tick). Without
+            // this, a long folder name's `drawer_content_min` could
+            // widen the drawer past the panel cap and desync the
+            // drawer's right edge from the classic panel's right
+            // edge (the two are intended to visually align when they
+            // swap).
+            .min(cap_tree_width(viewport_w_logical, DRAWER_MIN_W));
         let wk = ((dt * 1000.0) / 150.0).clamp(0.0, 1.0); // ~150ms exponential
         self.drawer_width_anim += (width_target - self.drawer_width_anim) * wk;
         if (self.drawer_width_anim - width_target).abs() < 0.5 {
@@ -1908,8 +1970,13 @@ let window = event_loop.create_window(
         // width left a 1px column of canvas showing between panel
         // and viewer (the gray seam near the bottom bar).
         let ppp_snap = ppp.max(0.1);
-        let tree_anim = self.tree_panel.tick(self.show_tree && !self.is_fullscreen, dt);
-        let thumb_anim = self.thumb_panel.tick(self.show_thumbs && !self.is_fullscreen, dt);
+        // Read the logical viewport width BEFORE the tick() borrows
+        // `self` mutably — the cap on the tree / thumb widths is
+        // `max_frac * viewport_w` so it has to follow the actual
+        // window size, not a cached field.
+        let viewport_w_logical = egui_state.ctx.screen_rect().width().max(1.0);
+        let tree_anim = self.tree_panel.tick(self.show_tree && !self.is_fullscreen, dt, viewport_w_logical);
+        let thumb_anim = self.thumb_panel.tick(self.show_thumbs && !self.is_fullscreen, dt, viewport_w_logical);
         let tree_anim = (tree_anim * ppp_snap).round() / ppp_snap;
         let thumb_anim = (thumb_anim * ppp_snap).round() / ppp_snap;
 
@@ -5136,16 +5203,32 @@ impl ApplicationHandler for MainWindow {
                 if let Some((lx, _)) = prev {
                     let dx = x - lx;
                     let ppp = self.router.pixels_per_point.max(0.1);
+                    // Per-frame viewport cap (logical px) for both the
+                    // tree panel and the drawer so the drag handler
+                    // agrees with the cap applied inside
+                    // `PanelWidth::tick` and `tick_drawer`. Without
+                    // this, the user could drag `user_width` past the
+                    // cap and only see it snap back next frame — not
+                    // actually wrong, but a confusing feel.
+                    let win_w_px = self
+                        .wgpu_state
+                        .as_ref()
+                        .map(|w| w.config.width)
+                        .unwrap_or(1280);
+                    let viewport_w_logical = (win_w_px as f32 / ppp).max(1.0);
+                    let tree_max = cap_tree_width(viewport_w_logical, 170.0);
                     match panel {
                         0 => {
                             if self.show_tree {
-                                self.tree_panel.apply_drag(dx / ppp, 170.0, 420.0);
+                                self.tree_panel.apply_drag(dx / ppp, 170.0, tree_max);
                             } else {
-                                // Drawer active: drag its right edge. Only the
-                                // BASE width is clamped; content can still widen
-                                // it past this via drawer_content_min.
+                                // Drawer active: drag its right edge.
+                                // BASE width is clamped by the cap; the
+                                // width that animates in tick_drawer
+                                // also respects the cap.
+                                let drawer_max = cap_tree_width(viewport_w_logical, DRAWER_MIN_W);
                                 self.drawer_user_width =
-                                    (self.drawer_user_width + dx / ppp).clamp(DRAWER_MIN_W, DRAWER_MAX_W);
+                                    (self.drawer_user_width + dx / ppp).clamp(DRAWER_MIN_W, drawer_max);
                             }
                         }
                         1 => self.thumb_panel.apply_drag(-dx / ppp, 180.0, 560.0),
