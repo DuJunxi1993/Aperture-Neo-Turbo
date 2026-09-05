@@ -81,6 +81,13 @@ pub struct TreeTreeState {
     /// ScrollArea. Written by the wheel branch in window_event;
     /// applied by the ScrollArea builder via vertical_scroll_offset.
     pub scroll_offset_y: f32,
+    /// Current horizontal scroll offset (logical px) of the tree
+    /// ScrollArea. Mirrors `scroll_offset_y` for the new both-axis
+    /// ScrollArea used by the depth-chain tree (see `TREE_MAIN_CHAIN_FRAC`).
+    /// Saved on the frame after draw, applied next frame via
+    /// `horizontal_scroll_offset` so the wheel branch (which only
+    /// sees vertical delta) and the drag-handler can leave it alone.
+    pub scroll_offset_x: f32,
 }
 
 impl FileTree {
@@ -92,6 +99,7 @@ impl FileTree {
             recent_scroll_target: None,
             scroll_to_top: false,
             scroll_offset_y: 0.0,
+            scroll_offset_x: 0.0,
             pending_expand_scroll: None,
             pending_expand_rect: None,
             pending_expand_subtree_h: 0.0,
