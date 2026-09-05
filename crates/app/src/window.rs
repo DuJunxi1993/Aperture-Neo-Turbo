@@ -2875,6 +2875,11 @@ let window = event_loop.create_window(
         // holds it), so it writes to pending_tree_intent; we open the
         // egui context menu here, once the egui borrows are released.
         if let Some(intent) = self.pending_tree_intent.take() {
+            // A new context menu is about to take over. Yield the
+            // settings dropdown / shortcuts popover so they don't
+            // stack behind it (mirrors open_image_context_menu).
+            self.show_settings_menu = false;
+            self.close_shortcut_help();
             let is_fav = self.settings.favorite_folders().iter().any(|f| f == &intent.path);
             // intent.pos_phys holds egui LOGICAL points (the router
             // position is already logical; egui menus want logical).
@@ -4912,6 +4917,13 @@ let window = event_loop.create_window(
     /// x=1100 which is ~2× the logical width — off-screen).
     fn open_image_context_menu(&mut self, cursor: egui::Pos2) {
         if self.nav.lock().current().is_none() { return; }
+        // A context menu is about to take over the chrome. Yield any
+        // other egui popups that are still open so they don't stack
+        // behind the new menu — especially the settings dropdown,
+        // whose outside-click branch doesn't fire on right-click (the
+        // whole reason this method exists in the first place).
+        self.show_settings_menu = false;
+        self.close_shortcut_help();
         let ppp = self.wgpu_state
             .as_ref()
             .map(|w| w.pixels_per_point)
@@ -5461,14 +5473,26 @@ impl ApplicationHandler for MainWindow {
                 }
             }
 
-            // Close the settings dropdown on any left press outside both the
-            // ⚙ button (which toggles it) and the menu's own rect. This
-            // runs before the pan/edge branches consume the click, so a
-            // press on the image/view or anywhere else dismisses the menu
-            // even though those clicks never reach egui.
+            // Close the settings dropdown on any mouse button press outside both
+            // the ⚙ button (which toggles it) and the menu's own rect.
+            // This runs before the pan/edge branches consume the click,
+            // so a press on the image/view or anywhere else dismisses
+            // the menu even though those clicks never reach egui.
+            //
+            // Both Left and Right are handled: Left is the obvious
+            // "click outside to dismiss" case; Right matters because
+            // right-clicking the viewer / tree / thumbs opens a
+            // context menu and the settings dropdown should yield to
+            // that, not stay on screen behind the new popup. (The
+            // explicit closes in open_image_context_menu /
+            // drain_frame_actions are belt-and-braces — this branch
+            // already covers them.)
             if self.show_settings_menu
-                && matches!(button, MouseButton::Left)
                 && matches!(state, ElementState::Pressed)
+                && matches!(
+                    button,
+                    MouseButton::Left | MouseButton::Right | MouseButton::Middle
+                )
             {
                 let ppp = self.wgpu_state.as_ref().map(|w| w.pixels_per_point).unwrap_or(1.0).max(0.1);
                 let clx = cursor.x as f32 / ppp;
