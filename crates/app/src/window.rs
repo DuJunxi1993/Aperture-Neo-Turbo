@@ -3016,32 +3016,6 @@ let window = event_loop.create_window(
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
-        // Phase C: icon-sized nav buttons for the Tiny / Minimum
-        // levels. Same accent treatment as the text variant — the
-        // accent fill carries the "primary action" cue even when
-        // there's no glyph. Unicode arrows (◀ ▶) avoid adding new
-        // vector icons to icons.rs just for two pixels per glyph.
-        let nav_icon_btn = |ui: &mut egui::Ui, glyph: &str, alt: &str| -> bool {
-            let (rect, resp) = ui.allocate_exact_size(
-                egui::vec2(34.0, 30.0),
-                egui::Sense::click(),
-            );
-            if resp.hovered() {
-                ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
-            }
-            let clicked = resp.clicked();
-            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
-            ui.painter().rect_filled(rect.shrink(2.0), 4.0, pal.accent);
-            ui.painter().text(
-                rect.center(),
-                egui::Align2::CENTER_CENTER,
-                glyph,
-                egui::FontId::proportional(14.0),
-                egui::Color32::WHITE,
-            );
-            let _ = alt;
-            clicked || resp.clicked()
-        };
 
         // LEFT GROUP: navigation + view controls. Phase 9 fix: build
         // the row over the FULL bar rect via new_child (same pattern
@@ -3060,15 +3034,18 @@ let window = event_loop.create_window(
         // Phase C: Back/Forward collapse to ◀/▶ at Tiny and below —
         // the text version eats ~120px that the rest of the left
         // group + the right group need when the bar is squeezed.
+        // Reuses nav_btn verbatim (same 13px font, 30px height as the
+        // surrounding Fit / ⏵ / ↻ / ⛶ buttons); the Unicode arrow
+        // glyph is just shorter text, not a separate icon.
         match level {
             ChromeLayoutLevel::Full | ChromeLayoutLevel::Compact => {
                 if nav_btn(&mut left_row, "Back") { actions.push(UiAction::Prev); }
                 if nav_btn(&mut left_row, "Forward") { actions.push(UiAction::Next); }
             }
             ChromeLayoutLevel::Tiny | ChromeLayoutLevel::Minimum => {
-                if nav_icon_btn(&mut left_row, "◀", "Back") { actions.push(UiAction::Prev); }
+                if nav_btn(&mut left_row, "◀") { actions.push(UiAction::Prev); }
                 left_row.add_space(2.0);
-                if nav_icon_btn(&mut left_row, "▶", "Forward") { actions.push(UiAction::Next); }
+                if nav_btn(&mut left_row, "▶") { actions.push(UiAction::Next); }
             }
         }
         left_row.add_space(8.0);
@@ -3231,39 +3208,26 @@ let window = event_loop.create_window(
                         .rounding(6.0),
                 ).clicked()
             };
-            // Phase C: at Full width, "Open Folder" is a text button
-            // (matches the design language of Tree / Thumbs). Once we
-            // demote to Compact and below, the text costs too much
-            // (~70px) — collapse it to a 42x30 icon button that opens
-            // the same dialog. The icon was added to icons.rs for this
-            // purpose.
-            match level {
-                ChromeLayoutLevel::Full => {
-                    if content.add(
-                        egui::Button::new(
-                            egui::RichText::new("Open Folder").size(13.0).strong().color(pal.text_secondary),
-                        )
-                            .fill(pal.button_fill)
-                            .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
-                            .min_size(egui::vec2(0.0, 30.0))
-                            .rounding(6.0),
-                    ).clicked() {
-                        actions.push(UiAction::OpenFolder);
-                    }
-                }
-                _ => {
-                    let (rect, resp) = content.allocate_exact_size(
-                        egui::vec2(42.0, 30.0),
-                        egui::Sense::click(),
-                    );
-                    if resp.hovered() {
-                        content.painter().rect_filled(rect, 4.0, pal.hover_fill);
-                    }
-                    crate::icons::folder(content.painter(), rect, pal.text_secondary);
-                    if resp.clicked() {
-                        actions.push(UiAction::OpenFolder);
-                    }
-                }
+            // Phase C: at Full width the button reads "Open Folder"
+            // (matches the design language of Tree / Thumbs). Below
+            // Full the label shortens to "Open" — same button, same
+            // icon-free style, just less text — reclaiming ~50 px of
+            // horizontal room without introducing a separate icon
+            // widget or a new icons.rs glyph.
+            let label = match level {
+                ChromeLayoutLevel::Full => "Open Folder",
+                _ => "Open",
+            };
+            if content.add(
+                egui::Button::new(
+                    egui::RichText::new(label).size(13.0).strong().color(pal.text_secondary),
+                )
+                    .fill(pal.button_fill)
+                    .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
+                    .min_size(egui::vec2(0.0, 30.0))
+                    .rounding(6.0),
+            ).clicked() {
+                actions.push(UiAction::OpenFolder);
             }
             content.add_space(6.0);
             if toggle_btn(&mut content, "Tree", show_tree) {
