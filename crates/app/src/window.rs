@@ -174,15 +174,30 @@ const HOLD_NAV_RAMP_FULL: std::time::Duration = std::time::Duration::from_millis
 // flags scattered through the draw code.
 //
 // Threshold table (statusbar `bar.width()`, the wider of the two bars):
-//   >= 720 → Full       : everything visible, Open Folder + Tree + Thumbs
-//                         in text, centered title, Back/Forward in text
-//   >= 600 → Compact    : Open Folder becomes a folder icon (saves ~70px);
-//                         statusbar right group narrows by ~40px
-//   >= 520 → Tiny       : centered title hidden (~200px reclaimed);
-//                         theme toggle hidden (~50px); Back/Forward
-//                         collapse to ◀ / ▶ icons
-//    < 520 → Minimum    : settings gear hidden (additional ~50px); filename
-//                         truncates hard; everything else stays compact
+//   >= 720 → Full       : everything visible (including centered title),
+//                         Open Folder + Tree + Thumbs in text, Back/Forward
+//                         in text
+//   >= 608 → Compact    : centered title hidden (~200 px reclaimed — Phase
+//                         D promotes this to the first demotion);
+//                         Open Folder shortens to "Open"; filename strips
+//                         its extension
+//   >= 528 → Tiny       : theme toggle hidden; statusbar filename hidden;
+//                         Back/Forward collapse to ◀ / ▶ icons
+//    < 528 → Minimum    : settings gear hidden; statusbar WxH hidden;
+//                         filename already gone at Tiny
+//
+// Demotion priority (Phase D — "what gets sacrificed first" as the bar
+// gets squeezed):
+//   1. centered title   — hidden at Compact and below (~200 px, biggest
+//                         single budget consumer)
+//   2. Open Folder text — shortens to "Open" at Compact (never hidden;
+//                         Ctrl+O remains the keyboard escape hatch and the
+//                         button must stay discoverable)
+//   3. theme toggle, filename — hidden at Tiny
+//   4. settings gear, statusbar WxH — hidden at Minimum
+//   - Help + window controls are always rendered (closing the window is
+//     non-negotiable; Help is the last-resort shortcut discoverability
+//     hatch when most chrome has fallen off).
 //
 // Per-frame, no caching — the level is recomputed each frame so dragging
 // the window up/down scales smoothly between states.
@@ -200,9 +215,10 @@ impl ChromeLayoutLevel {
         else { ChromeLayoutLevel::Minimum }
     }
     /// Right-edge anchor reserved for the statusbar's right group (filename
-    /// + zoom% + WxH). Pulls in as the level drops so Back/Forward (or ◀/▶)
-    /// have room without colliding. Always ≤ 420 px (the Full bar's right
-    /// group width) and ≥ 200 px (Minimum keeps filename readable).
+    /// + zoom% + WxH). Pulls in as the level drops so Back/Forward (or the
+    /// arrow icons) have room without colliding. Always capped at the Full
+    /// bar's right group width (420 px) and floored at the Minimum's
+    /// readable filename width (200 px).
     fn right_group_max_w(self) -> f32 {
         match self {
             ChromeLayoutLevel::Full    => 420.0,
@@ -210,6 +226,17 @@ impl ChromeLayoutLevel {
             ChromeLayoutLevel::Tiny    => 280.0,
             ChromeLayoutLevel::Minimum => 220.0,
         }
+    }
+}
+
+/// Strip the trailing extension from a basename. Used by the statusbar's
+/// Compact-level filename rendering to reclaim 3-5 chars of horizontal
+/// room. Returns the original string if no extension separator is found
+/// (the dot is treated as part of the name in that case).
+fn strip_ext(name: &str) -> String {
+    match name.rfind('.') {
+        Some(i) if i > 0 => name[..i].to_string(),
+        _ => name.to_string(),
     }
 }
 
@@ -3086,43 +3113,46 @@ let window = event_loop.create_window(
                 .layout(egui::Layout::right_to_left(egui::Align::Center)),
         );
         if let Some(p) = current_path {
+            // Phase D: filename demotes through three stages as the bar
+            // squeezes. The intent is to never let the text land behind
+            // the right-group buttons (the bar-w-720 crash) — at the
+            // narrowest widths the filename disappears entirely and the
+            // zoom% / WxH pair carries the entire "where am I" signal.
+            //   Full    : full basename (e.g. "IMG_3024.jpg")
+            //   Compact : strip extension (saves 3-5 chars; egui's
+            //             .truncate() still ellipsizes if even the
+            //             shortened name doesn't fit)
+            //   Tiny / Minimum : hidden; the trailing add_space is
+            //             skipped too so we don't leave a 12px gap.
             let name = p
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "—".into());
-            // Phase C: at Minimum the right group is 220px and the
-            // zoom% label still wants ~100px, leaving the filename
-            // ~120px. Pre-truncate the basename so the egui Label
-            // can ellipsize cleanly without trying to lay out a
-            // 300-char string first. The full path is still on
-            // hover via on_hover_text.
             let display_name = match level {
-                ChromeLayoutLevel::Minimum => {
-                    let mut n = name;
-                    if n.chars().count() > 14 {
-                        let kept: String = n.chars().take(12).collect();
-                        n = format!("{}…", kept);
-                    }
-                    n
-                }
-                _ => name,
+                ChromeLayoutLevel::Full => name,
+                ChromeLayoutLevel::Compact => strip_ext(&name),
+                ChromeLayoutLevel::Tiny | ChromeLayoutLevel::Minimum => String::new(),
             };
-            right.add(
-                egui::Label::new(
-                    egui::RichText::new(&display_name)
-                        .size(13.0)
-                        .strong()
-                        .color(pal.text_secondary),
-                )
-                .truncate(),
-            );
-            right.add_space(12.0);
+            if level <= ChromeLayoutLevel::Compact {
+                right.add(
+                    egui::Label::new(
+                        egui::RichText::new(&display_name)
+                            .size(13.0)
+                            .strong()
+                            .color(pal.text_secondary),
+                    )
+                    .truncate(),
+                );
+                right.add_space(12.0);
+            }
         }
         if let Some((w, h)) = current_size {
             // Phase C: at Minimum drop the resolution — "3024x4032"
             // is ~70px of low-information text. Zoom% alone still
             // tells the user their scale; full resolution is
             // available in the right-click "Properties" entry.
+            // Phase D: kept this behaviour (Compact + Tiny still show
+            // WxH; only Minimum drops it).
             let text = match level {
                 ChromeLayoutLevel::Minimum => format!("{:.0}%", zoom_pct),
                 _ => format!("{:.0}%  ·  {}x{}", zoom_pct, w, h),
@@ -3353,11 +3383,13 @@ let window = event_loop.create_window(
         }
 
         // Centered app title (absolute painter — never disturbs layout).
-        // Phase C: hidden at Tiny and below — the title eats ~200px of
-        // horizontal budget that the left + right button groups need
-        // when the bar is squeezed, and the window title is already in
-        // the taskbar entry / window manager preview anyway.
-        if level <= ChromeLayoutLevel::Compact {
+        // Phase D: shown only at Full width — promoted to the first demotion.
+        // The title is the cheapest to lose (window title is also in the
+        // taskbar entry / WM preview) but the largest budget consumer
+        // (~200 px), so reclaiming it at Compact returns the most room for
+        // the bar's actual button groups before the next squeeze forces
+        // Open Folder / theme / filename off the row.
+        if level == ChromeLayoutLevel::Full {
             ui.painter().text(
                 bar_rect.center(),
                 egui::Align2::CENTER_CENTER,
