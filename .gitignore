@@ -22,3 +22,9 @@ Thumbs.db
 # Debug captures
 *.png
 *.log
+
+# Local sandbox / ACL repair artifacts (do not commit)
+.acl-report/
+
+# Local benchmark work (not part of the release; ignore the whole tree)
+bench/
