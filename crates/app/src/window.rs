@@ -1631,7 +1631,16 @@ let window = event_loop.create_window(
     /// list, This PC → sibling folders (same parent) that contain images.
     fn handle_cycle_folder(&mut self, dir: i32) {
         let Some(cur) = self.nav.lock().current().map(|i| i.path.clone()) else { return };
-        let folder = cur.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| cur.clone());
+        // The cycle list is "sibling folders of the current folder that
+        // contain images" — i.e. other image libraries under the same
+        // parent directory. `cur.parent()` is the current IMAGE folder
+        // (the current album). `cur.parent().parent()` is the root that
+        // contains all the sibling albums the user wants to jump between.
+        let current_album = cur.parent().map(|p| p.to_path_buf()).unwrap_or_else(|| cur.clone());
+        let folder = current_album
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| current_album.clone());
 
         let active_root = ACTIVE_ROOT.load(std::sync::atomic::Ordering::Relaxed);
         let (list, kind) = match active_root {
@@ -1653,10 +1662,13 @@ let window = event_loop.create_window(
             }
         };
         if list.len() < 2 { return; }
-        let idx = list.iter().position(|f| f == &folder).unwrap_or(0);
+        // Locate the CURRENT album (not its parent) inside the sibling
+        // list. If for any reason it isn't there (filter mismatch), fall
+        // back to 0 — better to cycle somewhere than to no-op.
+        let idx = list.iter().position(|f| f == &current_album).unwrap_or(0);
         let len = list.len() as i32;
         let next = list[((idx as i32 + dir).rem_euclid(len)) as usize].clone();
-        tracing::debug!("cycle_folder({kind}): {} -> {}", folder.display(), next.display());
+        tracing::debug!("cycle_folder({kind}): {} -> {}", current_album.display(), next.display());
         self.navigate_to_folder(next);
     }
 
@@ -5742,25 +5754,39 @@ impl ApplicationHandler for MainWindow {
                         && cursor.y >= hy && cursor.y <= hy + hh;
                     if !in_tree && !in_thumb {
                         if let Some(egui_state) = self.egui_state.as_ref() {
-                            // Egui scrollbar release-outside-zone fix. A
-                            // ScrollArea scrollbar uses Sense::drag()
-                            // internally, and when the cursor is released
-                            // OUTSIDE the tree/thumb rect the release never
-                            // reaches the bar's sense — egui's drag state
-                            // stays set and subsequent mouse_move events
-                            // keep scrolling. We only act when egui still
-                            // believes something is being dragged AND no
-                            // primary button is held (this is a release
-                            // tick); together that uniquely identifies the
-                            // stuck-state case. We then call
-                            // Context::stop_dragging to clear it. No-op
+                            // Egui scrollbar release-outside-zone fix.
+                            //
+                            // When the user drags a ScrollArea scrollbar
+                            // (which uses Sense::click_and_drag() internally)
+                            // and releases the left button OUTSIDE the
+                            // tree/thumb rect, the release event is not
+                            // delivered to that scroll area's sense —
+                            // egui's global `dragged` state and the
+                            // scroll area's internal `scroll_start_offset`
+                            // stay set, so subsequent cursor movements
+                            // continue scrolling.
+                            //
+                            // Trigger: this is a release tick (`primary`
+                            // just went up) AND the cursor is outside our
+                            // two side panels AND egui just ended a drag
+                            // (`drag_stopped_id()`) or still believes
+                            // something is being dragged
+                            // (`dragged_id()`). Any one of those is enough
+                            // to indicate the egui scroll bar is the
+                            // culprit and must be cleared. We call
+                            // `Context::stop_dragging()` to zero both the
+                            // global drag and the scroll area's internal
+                            // `scroll_start_offset_from_top_left`. No-op
                             // when egui wasn't dragging, so the existing
                             // UX is preserved.
                             let ctx = &egui_state.ctx;
-                            let stuck = ctx.drag_started_id().is_some()
-                                && ctx.input(|i| !i.pointer.primary_down());
-                            if stuck {
-                                ctx.stop_dragging();
+                            let released = ctx.input(|i| !i.pointer.primary_down());
+                            if released {
+                                let stuck = ctx.drag_stopped_id().is_some()
+                                    || ctx.dragged_id().is_some();
+                                if stuck {
+                                    ctx.stop_dragging();
+                                }
                             }
                         }
                     }
