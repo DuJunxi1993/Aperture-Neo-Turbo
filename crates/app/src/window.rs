@@ -4772,6 +4772,17 @@ let window = event_loop.create_window(
                 // normal current-folder highlight takes over from there
                 // (no special card — This PC headers don't suit one).
                 self.file_tree.reveal(&p);
+                // Reveal explicitly forces focus to This PC (root 2).
+                // Without this the active_root stays at whatever list
+                // (Favorites=0 / Recent=1) the user last picked from,
+                // and `is_current = node.path == current && root_idx == active_root`
+                // never matches for the revealed This-PC node — so the
+                // highlight vanishes after the first draw frame.
+                // Side effect: handle_cycle_folder's default arm
+                // (`std::fs::read_dir` parent + folder_has_images) is
+                // now reachable, so Ctrl+↑/↓ cycles siblings in the
+                // parent folder of the revealed image directory.
+                ACTIVE_ROOT.store(2, std::sync::atomic::Ordering::Relaxed);
                 self.navigate_to_folder(p);
             }
             UiAction::ExitApp => {
@@ -5709,6 +5720,49 @@ impl ApplicationHandler for MainWindow {
                     self.pan_active = false;
                     if self.drag_panel.take().is_some() {
                         return;
+                    }
+                    // Egui scrollbar release-outside-zone fix: a ScrollArea
+                    // scrollbar uses Sense::drag() internally, and when the
+                    // cursor is released OUTSIDE the tree/thumb rects the
+                    // release never reaches the bar's sense — egui's drag
+                    // state stays set and subsequent mouse_move events keep
+                    // scrolling. Detect that case (cursor outside our two
+                    // side panels while egui thinks something is being
+                    // dragged) and explicitly stop_dragging to clear it.
+                    // No-op when egui wasn't dragging (release inside or
+                    // not the primary button) so the existing UX is
+                    // preserved.
+                    let (tx, ty, tw, th) = self.tree_rect_phys;
+                    let (hx, hy, hw, hh) = self.thumb_rect_phys;
+                    let in_tree = tw > 0.0
+                        && cursor.x >= tx && cursor.x <= tx + tw
+                        && cursor.y >= ty && cursor.y <= ty + th;
+                    let in_thumb = hw > 0.0
+                        && cursor.x >= hx && cursor.x <= hx + hw
+                        && cursor.y >= hy && cursor.y <= hy + hh;
+                    if !in_tree && !in_thumb {
+                        if let Some(egui_state) = self.egui_state.as_ref() {
+                            // Egui scrollbar release-outside-zone fix. A
+                            // ScrollArea scrollbar uses Sense::drag()
+                            // internally, and when the cursor is released
+                            // OUTSIDE the tree/thumb rect the release never
+                            // reaches the bar's sense — egui's drag state
+                            // stays set and subsequent mouse_move events
+                            // keep scrolling. We only act when egui still
+                            // believes something is being dragged AND no
+                            // primary button is held (this is a release
+                            // tick); together that uniquely identifies the
+                            // stuck-state case. We then call
+                            // Context::stop_dragging to clear it. No-op
+                            // when egui wasn't dragging, so the existing
+                            // UX is preserved.
+                            let ctx = &egui_state.ctx;
+                            let stuck = ctx.drag_started_id().is_some()
+                                && ctx.input(|i| !i.pointer.primary_down());
+                            if stuck {
+                                ctx.stop_dragging();
+                            }
+                        }
                     }
                 }
                 if matches!(state, ElementState::Pressed) && !self.is_fullscreen {
