@@ -5513,6 +5513,16 @@ impl ApplicationHandler for MainWindow {
             let prev = self.last_cursor;
             self.last_cursor = Some((x, y));
 
+            // TEMP scrollbar-stuck sweep (m01148): REMOVED in m01272. The user
+            // pointed out that unconditional stop_dragging on every
+            // cursor move outside panels would break the standard
+            // Windows "mouse capture" behaviour where a scrollbar drag
+            // continues while the cursor leaves the bar's hit-rect as
+            // long as the left button is still held. The release handler
+            // alone is sufficient — winit always reports Left release at
+            // some point, and that's when egui's stuck state must be
+            // cleared. Mid-drag cursor excursions are egui's job.
+
             // Image drag-pan (left button held over the viewer).
             if self.pan_active {
                 if let Some(viewer) = &self.viewer {
@@ -5733,17 +5743,27 @@ impl ApplicationHandler for MainWindow {
                     if self.drag_panel.take().is_some() {
                         return;
                     }
-                    // Egui scrollbar release-outside-zone fix: a ScrollArea
-                    // scrollbar uses Sense::drag() internally, and when the
-                    // cursor is released OUTSIDE the tree/thumb rects the
-                    // release never reaches the bar's sense — egui's drag
-                    // state stays set and subsequent mouse_move events keep
-                    // scrolling. Detect that case (cursor outside our two
-                    // side panels while egui thinks something is being
-                    // dragged) and explicitly stop_dragging to clear it.
-                    // No-op when egui wasn't dragging (release inside or
-                    // not the primary button) so the existing UX is
-                    // preserved.
+                    // Egui scrollbar release-outside-zone fix.
+                    //
+                    // Egui's ScrollArea uses Sense::drag() and only ends a
+                    // drag when the release lands on the scrollbar's hit-
+                    // rect. If the user drags the scrollbar and releases
+                    // the left button OUTSIDE the tree or thumb rect, egui
+                    // never sees the release and its drag state stays
+                    // stuck, so subsequent mouse movements keep scrolling.
+                    //
+                    // We can't query egui's pointer state on this tick
+                    // (egui consumes raw input inside `begin_pass` which
+                    // runs later in build_egui_ui — `primary_down()` would
+                    // still read true and `drag_stopped_id()` would be
+                    // None). Trust winit's release signal instead: when
+                    // the OS reports Left release and the cursor is
+                    // outside both side panels, call
+                    // `Context::stop_dragging()` to clear any stuck drag.
+                    // It is a no-op when egui wasn't dragging, so this
+                    // never disrupts a normal click on the image/viewer
+                    // or a legitimate scrollbar drag that ends inside the
+                    // panel (egui's own release handling fires first).
                     let (tx, ty, tw, th) = self.tree_rect_phys;
                     let (hx, hy, hw, hh) = self.thumb_rect_phys;
                     let in_tree = tw > 0.0
@@ -5754,40 +5774,7 @@ impl ApplicationHandler for MainWindow {
                         && cursor.y >= hy && cursor.y <= hy + hh;
                     if !in_tree && !in_thumb {
                         if let Some(egui_state) = self.egui_state.as_ref() {
-                            // Egui scrollbar release-outside-zone fix.
-                            //
-                            // When the user drags a ScrollArea scrollbar
-                            // (which uses Sense::click_and_drag() internally)
-                            // and releases the left button OUTSIDE the
-                            // tree/thumb rect, the release event is not
-                            // delivered to that scroll area's sense —
-                            // egui's global `dragged` state and the
-                            // scroll area's internal `scroll_start_offset`
-                            // stay set, so subsequent cursor movements
-                            // continue scrolling.
-                            //
-                            // Trigger: this is a release tick (`primary`
-                            // just went up) AND the cursor is outside our
-                            // two side panels AND egui just ended a drag
-                            // (`drag_stopped_id()`) or still believes
-                            // something is being dragged
-                            // (`dragged_id()`). Any one of those is enough
-                            // to indicate the egui scroll bar is the
-                            // culprit and must be cleared. We call
-                            // `Context::stop_dragging()` to zero both the
-                            // global drag and the scroll area's internal
-                            // `scroll_start_offset_from_top_left`. No-op
-                            // when egui wasn't dragging, so the existing
-                            // UX is preserved.
-                            let ctx = &egui_state.ctx;
-                            let released = ctx.input(|i| !i.pointer.primary_down());
-                            if released {
-                                let stuck = ctx.drag_stopped_id().is_some()
-                                    || ctx.dragged_id().is_some();
-                                if stuck {
-                                    ctx.stop_dragging();
-                                }
-                            }
+                            egui_state.ctx.stop_dragging();
                         }
                     }
                 }
