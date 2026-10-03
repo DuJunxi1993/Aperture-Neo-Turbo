@@ -87,7 +87,13 @@ const MIN_H: u32 = 320;
 /// - statusbar left: Back (70) + Forward (80) + Fit (50) + ⏵ (30) +
 ///   ↻ (30) + ⛶ (30) + separators ≈ 320 px
 // => ~560 px is the conservative floor (statusbar is the wider one).
-const CHROME_MIN_W: f64 = 560.0;
+// Phase C: bumped 560 -> 620 to absorb the Minimum chrome level's worst-case
+// footprint (statusbar: ◀ ▶ | Fit ⏵ ↻ | ⛶  ≈ 290px + right ≈ 230px +
+// padding ≈ 600px). 60px buffer keeps HiDPI 125% / 150% scaling from
+// forcing the bottom-most state into overlap territory. Anything narrower
+// still works (ChromeLayoutLevel demotes further) but the window itself
+// stops shrinking here so the chrome layout always has its budget.
+const CHROME_MIN_W: f64 = 620.0;
 // Frames to hold a retired (replaced) image texture before releasing its
 // egui handle. With Fifo present + frame-latency-1, the GPU can be at most
 // one frame behind the CPU; holding for a few frames plus the non-blocking
@@ -157,6 +163,57 @@ const HOLD_NAV_THRESHOLD: std::time::Duration = std::time::Duration::from_millis
 /// Hold time (measured from the first press) at which the ramp reaches its
 /// fastest interval. Beyond this the walk runs at a steady `MIN_INTERVAL`.
 const HOLD_NAV_RAMP_FULL: std::time::Duration = std::time::Duration::from_millis(1400);
+
+// ─── Phase C: chrome layout level ───────────────────────────────────────
+// SingleImage launches can land on a window as narrow as the image itself;
+// at small widths the titlebar + statusbar want more horizontal room than
+// they get, and buttons / text start overlapping. Instead of cramming or
+// clipping, we demote the chrome through four discrete presentation levels
+// based on the bar's available logical width. Each level is a complete
+// description of what to draw — no hidden state, no per-element visibility
+// flags scattered through the draw code.
+//
+// Threshold table (statusbar `bar.width()`, the wider of the two bars):
+//   >= 720 → Full       : everything visible, Open Folder + Tree + Thumbs
+//                         in text, centered title, Back/Forward in text
+//   >= 600 → Compact    : Open Folder becomes a folder icon (saves ~70px);
+//                         statusbar right group narrows by ~40px
+//   >= 520 → Tiny       : centered title hidden (~200px reclaimed);
+//                         theme toggle hidden (~50px); Back/Forward
+//                         collapse to ◀ / ▶ icons
+//    < 520 → Minimum    : settings gear hidden (additional ~50px); filename
+//                         truncates hard; everything else stays compact
+//
+// Per-frame, no caching — the level is recomputed each frame so dragging
+// the window up/down scales smoothly between states.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+enum ChromeLayoutLevel { Full, Compact, Tiny, Minimum }
+
+impl ChromeLayoutLevel {
+    /// Pick a level from the statusbar's available width. The 8 px hysteresis
+    /// band keeps a window parked exactly on a threshold from flickering
+    /// between adjacent levels as egui reflows its layout.
+    fn from_bar_width(bar_w: f32) -> Self {
+        if bar_w >= 720.0 { ChromeLayoutLevel::Full }
+        else if bar_w >= 608.0 { ChromeLayoutLevel::Compact }
+        else if bar_w >= 528.0 { ChromeLayoutLevel::Tiny }
+        else { ChromeLayoutLevel::Minimum }
+    }
+    /// Right-edge anchor reserved for the statusbar's right group (filename
+    /// + zoom% + WxH). Pulls in as the level drops so Back/Forward (or ◀/▶)
+    /// have room without colliding. Always ≤ 420 px (the Full bar's right
+    /// group width) and ≥ 200 px (Minimum keeps filename readable).
+    fn right_group_max_w(self) -> f32 {
+        match self {
+            ChromeLayoutLevel::Full    => 420.0,
+            ChromeLayoutLevel::Compact => 360.0,
+            ChromeLayoutLevel::Tiny    => 280.0,
+            ChromeLayoutLevel::Minimum => 220.0,
+        }
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────
 
 #[allow(dead_code)]
 enum UiAction {
@@ -2926,6 +2983,12 @@ let window = event_loop.create_window(
         let _ = nav_idx;
         let _ = fullscreen;
         let bar = ui.max_rect();
+        // Phase C: pick the chrome level from the bar's CURRENT width.
+        // Computed every frame (no caching) so dragging the window in
+        // and out of each threshold demotes / promotes the chrome live.
+        // The statusbar uses the same outer width as the titlebar, so
+        // this level matches the titlebar's choice within ~1px.
+        let level = ChromeLayoutLevel::from_bar_width(bar.width());
         // Accent-filled buttons always use white text (both themes).
         let nav_btn = |ui: &mut egui::Ui, label: &str| -> bool {
             ui.add(
@@ -2953,6 +3016,32 @@ let window = event_loop.create_window(
             .on_hover_cursor(egui::CursorIcon::PointingHand)
             .clicked()
         };
+        // Phase C: icon-sized nav buttons for the Tiny / Minimum
+        // levels. Same accent treatment as the text variant — the
+        // accent fill carries the "primary action" cue even when
+        // there's no glyph. Unicode arrows (◀ ▶) avoid adding new
+        // vector icons to icons.rs just for two pixels per glyph.
+        let nav_icon_btn = |ui: &mut egui::Ui, glyph: &str, alt: &str| -> bool {
+            let (rect, resp) = ui.allocate_exact_size(
+                egui::vec2(34.0, 30.0),
+                egui::Sense::click(),
+            );
+            if resp.hovered() {
+                ui.painter().rect_filled(rect, 4.0, pal.hover_fill);
+            }
+            let clicked = resp.clicked();
+            let resp = resp.on_hover_cursor(egui::CursorIcon::PointingHand);
+            ui.painter().rect_filled(rect.shrink(2.0), 4.0, pal.accent);
+            ui.painter().text(
+                rect.center(),
+                egui::Align2::CENTER_CENTER,
+                glyph,
+                egui::FontId::proportional(14.0),
+                egui::Color32::WHITE,
+            );
+            let _ = alt;
+            clicked || resp.clicked()
+        };
 
         // LEFT GROUP: navigation + view controls. Phase 9 fix: build
         // the row over the FULL bar rect via new_child (same pattern
@@ -2968,8 +3057,20 @@ let window = event_loop.create_window(
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
         left_row.add_space(14.0);
-        if nav_btn(&mut left_row, "Back") { actions.push(UiAction::Prev); }
-        if nav_btn(&mut left_row, "Forward") { actions.push(UiAction::Next); }
+        // Phase C: Back/Forward collapse to ◀/▶ at Tiny and below —
+        // the text version eats ~120px that the rest of the left
+        // group + the right group need when the bar is squeezed.
+        match level {
+            ChromeLayoutLevel::Full | ChromeLayoutLevel::Compact => {
+                if nav_btn(&mut left_row, "Back") { actions.push(UiAction::Prev); }
+                if nav_btn(&mut left_row, "Forward") { actions.push(UiAction::Next); }
+            }
+            ChromeLayoutLevel::Tiny | ChromeLayoutLevel::Minimum => {
+                if nav_icon_btn(&mut left_row, "◀", "Back") { actions.push(UiAction::Prev); }
+                left_row.add_space(2.0);
+                if nav_icon_btn(&mut left_row, "▶", "Forward") { actions.push(UiAction::Next); }
+            }
+        }
         left_row.add_space(8.0);
         left_row.add(egui::Separator::default().vertical().spacing(8.0));
         left_row.add_space(8.0);
@@ -2988,8 +3089,17 @@ let window = event_loop.create_window(
         // zoom% · resolution. Right-aligned, fixed at the right
         // edge of the bar. Uses a separate horizontal layout with
         // a max_rect anchored to the right side.
+        //
+        // Phase C: right_rect.width was hardcoded to 360px, which is
+        // what crashed the chrome layout at small window widths (the
+        // left group wanted ~340px, the right wanted 360, and any
+        // window narrower than ~720px had the two groups stepping on
+        // each other). Now the width is per-level (420/360/280/220),
+        // with the smaller values reclaiming space for the left group
+        // when the window is squeezed.
+        let right_w = level.right_group_max_w();
         let right_rect = egui::Rect::from_min_max(
-            egui::pos2(bar.right() - 360.0, bar.top()),
+            egui::pos2(bar.right() - right_w, bar.top()),
             egui::pos2(bar.right() - 14.0, bar.bottom()),
         );
         let mut right = ui.new_child(
@@ -3003,9 +3113,26 @@ let window = event_loop.create_window(
                 .file_name()
                 .map(|n| n.to_string_lossy().into_owned())
                 .unwrap_or_else(|| "—".into());
+            // Phase C: at Minimum the right group is 220px and the
+            // zoom% label still wants ~100px, leaving the filename
+            // ~120px. Pre-truncate the basename so the egui Label
+            // can ellipsize cleanly without trying to lay out a
+            // 300-char string first. The full path is still on
+            // hover via on_hover_text.
+            let display_name = match level {
+                ChromeLayoutLevel::Minimum => {
+                    let mut n = name;
+                    if n.chars().count() > 14 {
+                        let kept: String = n.chars().take(12).collect();
+                        n = format!("{}…", kept);
+                    }
+                    n
+                }
+                _ => name,
+            };
             right.add(
                 egui::Label::new(
-                    egui::RichText::new(name)
+                    egui::RichText::new(&display_name)
                         .size(13.0)
                         .strong()
                         .color(pal.text_secondary),
@@ -3015,8 +3142,16 @@ let window = event_loop.create_window(
             right.add_space(12.0);
         }
         if let Some((w, h)) = current_size {
+            // Phase C: at Minimum drop the resolution — "3024x4032"
+            // is ~70px of low-information text. Zoom% alone still
+            // tells the user their scale; full resolution is
+            // available in the right-click "Properties" entry.
+            let text = match level {
+                ChromeLayoutLevel::Minimum => format!("{:.0}%", zoom_pct),
+                _ => format!("{:.0}%  ·  {}x{}", zoom_pct, w, h),
+            };
             right.label(
-                egui::RichText::new(format!("{:.0}%  ·  {}x{}", zoom_pct, w, h))
+                egui::RichText::new(text)
                     .size(12.5)
                     .color(pal.text_tertiary),
             );
@@ -3064,6 +3199,14 @@ let window = event_loop.create_window(
                 .id_salt("titlebar_content")
                 .layout(egui::Layout::left_to_right(egui::Align::Center)),
         );
+        // Phase C: pick a chrome level from the bar's CURRENT width.
+        // Computed every frame (no caching) so dragging the window in
+        // and out of each threshold demotes / promotes the chrome live.
+        // titlebar and statusbar share the same outer width, so the
+        // value computed here matches the one used by draw_fullscreen_bar
+        // within ~1px of horizontal padding — close enough that the
+        // visual state never desyncs between the two bars.
+        let level = ChromeLayoutLevel::from_bar_width(bar_rect.width());
         {
             content.add_space(12.0);
 
@@ -3088,16 +3231,39 @@ let window = event_loop.create_window(
                         .rounding(6.0),
                 ).clicked()
             };
-            if content.add(
-                egui::Button::new(
-                    egui::RichText::new("Open Folder").size(13.0).strong().color(pal.text_secondary),
-                )
-                    .fill(pal.button_fill)
-                    .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
-                    .min_size(egui::vec2(0.0, 30.0))
-                    .rounding(6.0),
-            ).clicked() {
-                actions.push(UiAction::OpenFolder);
+            // Phase C: at Full width, "Open Folder" is a text button
+            // (matches the design language of Tree / Thumbs). Once we
+            // demote to Compact and below, the text costs too much
+            // (~70px) — collapse it to a 42x30 icon button that opens
+            // the same dialog. The icon was added to icons.rs for this
+            // purpose.
+            match level {
+                ChromeLayoutLevel::Full => {
+                    if content.add(
+                        egui::Button::new(
+                            egui::RichText::new("Open Folder").size(13.0).strong().color(pal.text_secondary),
+                        )
+                            .fill(pal.button_fill)
+                            .stroke(egui::Stroke::new(1.0_f32, pal.card_stroke))
+                            .min_size(egui::vec2(0.0, 30.0))
+                            .rounding(6.0),
+                    ).clicked() {
+                        actions.push(UiAction::OpenFolder);
+                    }
+                }
+                _ => {
+                    let (rect, resp) = content.allocate_exact_size(
+                        egui::vec2(42.0, 30.0),
+                        egui::Sense::click(),
+                    );
+                    if resp.hovered() {
+                        content.painter().rect_filled(rect, 4.0, pal.hover_fill);
+                    }
+                    crate::icons::folder(content.painter(), rect, pal.text_secondary);
+                    if resp.clicked() {
+                        actions.push(UiAction::OpenFolder);
+                    }
+                }
             }
             content.add_space(6.0);
             if toggle_btn(&mut content, "Tree", show_tree) {
@@ -3112,6 +3278,15 @@ let window = event_loop.create_window(
             // height (benchmark = the Tree/Thumbs buttons). Even spacing
             // within each group; a slightly larger gap separates the window
             // controls (close/max/min) from the utility buttons (gear/theme/help).
+            //
+            // Phase C demotion table (per level.right_group_max_w budget):
+            //   Full    : [?] [theme] [⚙] | gap | [─][❐][✕]
+            //   Compact : [?] [theme] [⚙] | gap | [─][❐][✕]
+            //   Tiny    : [?]         [⚙] | gap | [─][❐][✕]   ← theme hidden
+            //   Minimum : [?]             | gap | [─][❐][✕]   ← gear hidden
+            // Close/Max/Min/Help are always reachable: closing the window
+            // is non-negotiable, and Help is the last "where's the
+            // shortcut" escape hatch when the bar is at its narrowest.
             content.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.add_space(10.0);
                 if Self::window_control(ui, "close-btn", WindowGlyph::Close, true, pal) {
@@ -3130,19 +3305,27 @@ let window = event_loop.create_window(
                 // menu anchored below it for global prefs: clear recents,
                 // clear favorites, follow-system theme, and sidebar-on-
                 // launch toggle.
-                let (srect, sresp) = ui.allocate_exact_size(
-                    egui::vec2(42.0, 30.0),
-                    egui::Sense::click(),
-                );
-                if sresp.hovered() {
-                    ui.painter().rect_filled(srect, 4.0, pal.hover_fill);
+                //
+                // Phase C: hidden at Minimum (the gear costs ~50px and is
+                // the lowest-priority utility on the bar — Help is the
+                // last-resort surface for shortcut discovery, and the
+                // settings menu items are also reachable via the right-
+                // click context menu on the file tree / viewer).
+                if level != ChromeLayoutLevel::Minimum {
+                    let (srect, sresp) = ui.allocate_exact_size(
+                        egui::vec2(42.0, 30.0),
+                        egui::Sense::click(),
+                    );
+                    if sresp.hovered() {
+                        ui.painter().rect_filled(srect, 4.0, pal.hover_fill);
+                    }
+                    SETTINGS_ANCHOR.with(|c| c.set(srect));
+                    if sresp.clicked() {
+                        actions.push(UiAction::ToggleSettings);
+                    }
+                    crate::icons::gear(ui.painter(), srect, pal.text_secondary);
+                    ui.add_space(2.0);
                 }
-                SETTINGS_ANCHOR.with(|c| c.set(srect));
-                if sresp.clicked() {
-                    actions.push(UiAction::ToggleSettings);
-                }
-                crate::icons::gear(ui.painter(), srect, pal.text_secondary);
-                ui.add_space(2.0);
                 // Phase 4: theme toggle — modernised "circle + offset
                 // dot" glyph (was the half-moon painter-drawn in
                 // earlier commits). Renders as a small filled disc
@@ -3150,25 +3333,33 @@ let window = event_loop.create_window(
                 // crescent — reads as a sun/moon icon without the
                 // heavy outline of the previous half-moon, fitting
                 // the Linear minimal language. Behaviour unchanged.
-                let (trect, tresp) = ui.allocate_exact_size(
-                    egui::vec2(42.0, 30.0),
-                    egui::Sense::click(),
-                );
-                if tresp.hovered() {
-                    ui.painter().rect_filled(trect, 4.0, pal.hover_fill);
+                //
+                // Phase C: hidden at Tiny and below (the toggle is a
+                // presentation nicety; the follow-system-theme setting
+                // in the gear menu is still reachable, and the bar
+                // already sheds enough pixels at Tiny that a 50px
+                // glyph needs to come off).
+                if level <= ChromeLayoutLevel::Compact {
+                    let (trect, tresp) = ui.allocate_exact_size(
+                        egui::vec2(42.0, 30.0),
+                        egui::Sense::click(),
+                    );
+                    if tresp.hovered() {
+                        ui.painter().rect_filled(trect, 4.0, pal.hover_fill);
+                    }
+                    let tc = trect.center();
+                    let p = ui.painter();
+                    p.circle_filled(tc, 7.0, pal.text_secondary);
+                    p.circle_filled(
+                        tc + egui::vec2(3.5, -3.5),
+                        6.0,
+                        pal.panel_bg,
+                    );
+                    if tresp.clicked() {
+                        actions.push(UiAction::ToggleTheme);
+                    }
+                    ui.add_space(2.0);
                 }
-                let tc = trect.center();
-                let p = ui.painter();
-                p.circle_filled(tc, 7.0, pal.text_secondary);
-                p.circle_filled(
-                    tc + egui::vec2(3.5, -3.5),
-                    6.0,
-                    pal.panel_bg,
-                );
-                if tresp.clicked() {
-                    actions.push(UiAction::ToggleTheme);
-                }
-                ui.add_space(2.0);
                 // Phase 4: `?` keyboard-shortcuts button. Lives in
                 // the title bar (next to the theme toggle) per the
                 // spec — always reachable regardless of whether
@@ -3198,13 +3389,19 @@ let window = event_loop.create_window(
         }
 
         // Centered app title (absolute painter — never disturbs layout).
-        ui.painter().text(
-            bar_rect.center(),
-            egui::Align2::CENTER_CENTER,
-            "Aperture Neo Turbo",
-            egui::FontId::proportional(15.0),
-            pal.text_tertiary,
-        );
+        // Phase C: hidden at Tiny and below — the title eats ~200px of
+        // horizontal budget that the left + right button groups need
+        // when the bar is squeezed, and the window title is already in
+        // the taskbar entry / window manager preview anyway.
+        if level <= ChromeLayoutLevel::Compact {
+            ui.painter().text(
+                bar_rect.center(),
+                egui::Align2::CENTER_CENTER,
+                "Aperture Neo Turbo",
+                egui::FontId::proportional(15.0),
+                pal.text_tertiary,
+            );
+        }
     }
 
     /// One caption button with a vector-drawn glyph (immune to font

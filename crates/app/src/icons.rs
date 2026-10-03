@@ -120,6 +120,34 @@ pub fn help(painter: &Painter, rect: Rect, color: Color32) {
     painter.circle_filled(Pos2::new(stem_bot.x, stem_bot.y + qw * 0.38), qw * 0.27, color);
 }
 
+/// Draw the folder glyph: a stroked, rounded folder outline (tab on the
+/// top-left, body curving down to a flat base). Used by the titlebar's
+/// "Open Folder" button when ChromeLayoutLevel demotes it from text to icon
+/// (saves ~70px of horizontal room for the titlebar's other content).
+pub fn folder(painter: &Painter, rect: Rect, color: Color32) {
+    let u = icon_side(rect);
+    let stroke = Stroke::new(u / 15.0, color);
+    let r = rect.shrink(u * 0.05);
+    // Tab + body outline. Drawn as a single closed rounded polyline so the
+    // strokes meet cleanly at the corners (egui path joins are miter by
+    // default; rounded polyline corners avoid the corner-pop spike).
+    let tab_w = r.width() * 0.42;
+    let tab_h = u * 0.18;
+    let verts = [
+        Vec2::new(r.left() - rect.left(), r.top() - rect.top()),         // 0 top-left of body
+        Vec2::new(r.left() + tab_w - rect.left(), r.top() - rect.top()),  // 1 tab top-right
+        Vec2::new(r.left() + tab_w - rect.left() + u * 0.06, r.top() + tab_h - rect.top()), // 2 step down
+        Vec2::new(r.right() - rect.left(), r.top() + tab_h - rect.top()), // 3 fold to body top
+        Vec2::new(r.right() - rect.left(), r.bottom() - rect.top()),     // 4 bottom-right
+        Vec2::new(r.left() - rect.left(), r.bottom() - rect.top()),       // 5 bottom-left
+    ];
+    let pts: Vec<Pos2> = rounded_closed(&verts, 0.10, 7)
+        .iter()
+        .map(|p| Pos2::new(rect.left() + p.x, rect.top() + p.y))
+        .collect();
+    painter.add(Shape::closed_line(pts, stroke));
+}
+
 /// Draw the home glyph: a stroked house outline (pitched rounded roof, square
 /// body) with a short rounded horizontal door bar inside.
 pub fn home(painter: &Painter, rect: Rect, color: Color32) {
