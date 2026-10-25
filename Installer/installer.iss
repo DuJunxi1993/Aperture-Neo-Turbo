@@ -17,7 +17,7 @@
 ;     uninstalls it (after user confirmation) before installing the new
 ;     version. User settings/cache are preserved by the app (they live
 ;     under %APPDATA%\ApertureNeoTurbo and %LOCALAPPDATA%\ApertureNeoTurbo).
-;   - Kills any running aperture-neo-turbo.exe before uninstalling.
+;   - Kills any running Aperture-Neo-Turbo.exe before uninstalling.
 ;
 ; v1.0.0 features:
 ;   - Registers the app as the default image viewer via per-user file
@@ -35,7 +35,7 @@
 
 #define MyAppName "Aperture Neo Turbo"
 #define MyAppPublisher "DuJunxi1993"
-#define MyAppExeName "aperture-neo-turbo.exe"
+#define MyAppExeName "Aperture-Neo-Turbo.exe"
 #define MyAppURL "https://github.com/DuJunxi1993/Aperture-Neo-Turbo"
 
 [Setup]
@@ -126,7 +126,7 @@ Run_Launch_Description=启动 {#MyAppName}; Languages: chinesesimp
 
 [Files]
 ; Release binary — set via /dReleaseDir="<abs>" at compile time (e.g.
-; ISCC /dReleaseDir="D:\...\aperture-neo-turbo\target\release").
+; ISCC /dReleaseDir="D:\...\Aperture-Neo-Turbo\target\release").
 Source: "{#ReleaseDir}\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 
@@ -175,13 +175,21 @@ procedure KillAppProcess();
 var
   ResultCode: Integer;
 begin
-  Exec('taskkill.exe', '/F /IM aperture-neo-turbo.exe /T', '', SW_HIDE,
+  // Current name.
+  Exec('taskkill.exe', '/F /IM Aperture-Neo-Turbo.exe /T', '', SW_HIDE,
        ewWaitUntilTerminated, ResultCode);
   if ResultCode = 0 then
-    Log('Killed running aperture-neo-turbo.exe processes.')
+    Log('Killed running Aperture-Neo-Turbo.exe processes.')
   else
     Log('taskkill.exe returned ' + IntToStr(ResultCode) +
         ' (process was likely not running).');
+  // Legacy name (pre-rename builds) — the old install may still be running
+  // under the lowercase exe name, and the uninstaller runs before the new
+  // binary is copied in, so it must be killed explicitly.
+  Exec('taskkill.exe', '/F /IM aperture-neo-turbo.exe /T', '', SW_HIDE,
+       ewWaitUntilTerminated, ResultCode);
+  if ResultCode = 0 then
+    Log('Killed running legacy aperture-neo-turbo.exe processes.');
 end;
 
 function RemovePreviousVersion(): Boolean;

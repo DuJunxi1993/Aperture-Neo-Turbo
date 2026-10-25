@@ -7,8 +7,8 @@ cargo build --release
 cargo run --release -- "C:\path\to\image.jpg"   # open a file/folder at startup
 ```
 
-- Workspace root: `D:\Development\aperture-neo-turbo` (run `cargo` from here)
-- Output: `target/release/aperture-neo-turbo.exe` (~10 MB, statically linked)
+- Workspace root: `D:\Development\Aperture-Neo-Turbo` (run `cargo` from here)
+- Output: `target/release/Aperture-Neo-Turbo.exe` (~10 MB, statically linked)
 - Windows-only (`net10.0-windows` equivalent: winit 0.30 + wgpu/DX12 + Direct2D + WIC)
 - The exe embeds an icon + version resource via `crates/app/build.rs` (winresource) reading `assets/apertureneo_turbo.ico`; version comes from `crates/app/Cargo.toml` `[package] version`.
 - Release profile: `opt-level=3`, `lto="fat"`, `codegen-units=1`, `panic="abort"`, `strip="symbols"`. Console (release) is suppressed via `windows_subsystem = "windows"` in `main.rs`.

@@ -4,7 +4,7 @@
 
 Rust rewrite of [Aperture Neo](https://github.com/DuJunxi1993/Aperture-Neo) focused on maximum decode + render throughput. All GPU paths (decode → upload → composite → animate) stay on the GPU; CPU only handles transform parameters and I/O.
 
-> v1.0.0 — independent project (code and repo), ships its own Inno Setup installer. No runtime dependencies to install (statically linked exe).
+> v1.1.2 — independent project (code and repo), ships its own Inno Setup installer. No runtime dependencies to install (statically linked exe).
 
 ## Goals
 
@@ -20,32 +20,33 @@ Rust rewrite of [Aperture Neo](https://github.com/DuJunxi1993/Aperture-Neo) focu
 ## Architecture
 
 ```
-┌─ Main Window (winit + wgpu + egui) ─────────────────┐
-│ ┌──────────┐ ┌─────────────┐ ┌─────────────────────┐ │
-│ │ Tree     │ │ Thumbnails  │ │ Viewer Child HWND  │ │
-│ │ (egui)   │ │ (egui)      │ │ (Direct2D)         │ │
-│ │          │ │             │ │   ↓               │ │
-│ └──────────┘ └─────────────┘ │ IDXGISwapChain1   │ │
-│ ┌─────────────────────────────────────────┐ │   ↓          │ │
-│ │ FloatingBar / TitleBar (egui)            │ │ Direct2D    │ │
-│ └─────────────────────────────────────────┘ │ (GPU only) │ │
-└──────────────────────────────────────────────────────────────┘
+┌─ Main Window (winit + wgpu + egui, single egui pass) ─────┐
+│ ┌──────────┐ ┌─────────────┐ ┌─────────────────────────┐ │
+│ │ Tree     │ │ Thumbnails  │ │        Viewer           │ │
+│ │ (egui)   │ │ (egui)      │ │  textured egui::Mesh    │ │
+│ │          │ │             │ │  in the same pass as    │ │
+│ │          │ │             │ │  the chrome             │ │
+│ └──────────┘ └─────────────┘ └─────────────────────────┘ │
+│ ┌─────────────────────────────────────────┐               │
+│ │ FloatingBar / TitleBar / StatusBar      │               │
+│ └─────────────────────────────────────────┘               │
+└───────────────────────────────────────────────────────────┘
 ```
 
 **Key design decisions:**
-1. **Independent swapchain** for the viewer — no GPU context overlap with egui/wgpu, zero synchronization cost
-3. **WIC DXVA primary** decoder — hardware-accelerated JPEG/HEIC/AVIF decode
-4. **D2D1_INTERPOLATION_MODE_HIGH_QUALITY_CUBIC** — GPU texture sampling, no CPU scaling
-5. **GPU-driven animations** — `SetTransform` + `DrawBitmap` per frame, all on GPU
+1. **Single egui pass** — the viewer image is drawn as a textured `egui::Mesh` inside the same pass as the chrome; no separate image-quad pass and no Direct2D child HWND
+2. **DX12-only backend** (`wgpu::Backends::DX12`) — relies solely on OS-built-in D3D12/DXGI/WIC DLLs, no third-party GPU runtime
+3. **WIC primary decoder** — `IWICBitmapSourceTransform::SetTargetDimensions` decodes straight to the target resolution, with no full-size intermediate
+4. **Two-tier pre-decode cache** — neighbours ±1 decode at up to 4096 px (full tier), neighbours ±2 at 640 px (low tier); a low hit shows immediately and upgrades asynchronously
+5. **Rotation-aware transforms** — per-quadrant affine matrices; fit, zoom and pan all account for quarter-turn rotations
 
 ## Workspace Layout
 
 ```
 crates/
-├── core/    # Platform-agnostic: decode trait, nav, cache, fs
-├── gpu/     # D3D11 + Direct2D rendering engine
-├── ui/      # egui-based chrome (title bar, panels, settings)
-└── app/     # Main binary: winit window + child HWND orchestration
+├── core/    # Platform-agnostic: decode trait, nav, SQLite cache, fs
+├── gpu/     # WIC decode, viewer state machine, animator, decode coordinator
+└── app/     # Main binary: winit window, egui chrome, Win32 integrations
 ```
 
 ## Build
@@ -58,7 +59,7 @@ cargo build
 cargo build --release
 ```
 
-Output: `target/release/aperture-neo-turbo.exe`
+Output: `target/release/Aperture-Neo-Turbo.exe`
 
 ## Run
 
@@ -73,7 +74,7 @@ cargo run --release -- "C:\Users\you\Pictures"
 ## Requirements
 
 - Windows 10 1809+ or later (WIC DXVA, DXGI 1.2+)
-- GPU with DirectX 11.1+ support
+- GPU with DirectX 12 support (feature level 11_0+)
 - ~30MB disk space
 
 ## Phase Plan
@@ -81,11 +82,11 @@ cargo run --release -- "C:\Users\you\Pictures"
 | Phase | Deliverable | Status |
 |-------|-------------|--------|
 | P1 | winit + DXGI swapchain + D2D init | ✅ Done |
-| P2 | WIC DXVA primary + skia-safe fallback | ✅ Compiles (GPU code live) |
-| P3 | Direct2D viewer + transform | ✅ Compiles |
-| P4 | Slide/zoom GPU animations | ✅ Compiles (animator done) |
-| P5 | winit + egui chrome integration | Skeleton ✅ |
-| P6 | SQLite thumbnail cache | Skeleton ✅ |
+| P2 | WIC DXVA primary decoder | ✅ Live (skia-safe fallback removed) |
+| P3 | Viewer transform + rendering | ✅ Live (egui-native textured mesh) |
+| P4 | Slide/zoom GPU animations | ✅ Live (`Animator`, ease curves) |
+| P5 | winit + egui chrome integration | ✅ Live |
+| P6 | SQLite thumbnail cache | ✅ Live |
 | P7 | File system watch + navigation | ✅ Done |
 | P8 | HiDPI, multi-monitor, fullscreen, rotation, slide show | ✅ Done |
 | P9 | Inno Setup installer + default image viewer | ✅ v1.0.0 |

@@ -54,7 +54,7 @@ Inno Setup script in `installer/installer.iss`:
 ## Current binary status
 
 ```
-$ target\release\aperture-neo-turbo.exe = 9.7 MB
+$ target\release\Aperture-Neo-Turbo.exe = 9.7 MB
 $ Window opens (1400×900), stays running
 $ Direct2D child HWND created (1080×872 viewer area)
 $ Direct2D swapchain created on child HWND

@@ -4,8 +4,8 @@ fn main() {
         res.set_icon("../../assets/apertureneo_turbo.ico");
         res.set("ProductName", "Aperture Neo Turbo");
         res.set("FileDescription", "Aperture Neo Turbo");
-        res.set("FileVersion", "1.1.0");
-        res.set("ProductVersion", "1.1.0");
+        res.set("FileVersion", env!("CARGO_PKG_VERSION"));
+        res.set("ProductVersion", env!("CARGO_PKG_VERSION"));
         res.set("LegalCopyright", "DuJunxi1993");
         if let Err(e) = res.compile() {
             println!("cargo:warning=winresource embed failed: {e}");
