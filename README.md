@@ -1,6 +1,7 @@
 # Aperture Neo Turbo
 
 **High-performance GPU-native image viewer for Windows.**
+或许是性能最好的Windows图片查看器之一，没有为了兼容性牺牲渲染和响应速度。
 
 Rust rewrite of [Aperture Neo](https://github.com/DuJunxi1993/Aperture-Neo) focused on maximum decode + render throughput. All GPU paths (decode → upload → composite → animate) stay on the GPU; CPU only handles transform parameters and I/O.
 
